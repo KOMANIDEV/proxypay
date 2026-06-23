@@ -535,16 +535,10 @@ async function processTransaction(
       log.error({ subErr }, "Failed to record subscription retry info");
     }
 
-    // TODO: commented out because I couldn't find the job variable so to clear `rebase/merge` error
-    // if (job) {
-    //   capturePersistentFailure(job).catch(err => console.error('[DLQ] Error capturing failure:', err));
-    // }
+    // Re-throw so the consumer wrapper can capture to DLQ
+    throw error;
   }
-  // );
-
-  // throw error;
 }
-// }
 
 // Start consuming
 const consumerLabel = NATS_QUEUE_ENABLED ? "NATS JetStream" : "RabbitMQ";
@@ -565,7 +559,21 @@ if (NATS_QUEUE_ENABLED) {
   rabbitMQManager.consume<TransactionJobData>(
     QUEUES.TRANSACTION_PROCESSING,
     async (data) => {
-      await processTransaction(data);
+      try {
+        await processTransaction(data);
+      } catch (err) {
+        // processTransaction exhausted all retries — capture to DLQ
+        await capturePersistentFailure({
+          originalJobId: data.transactionId,
+          queueName: QUEUES.TRANSACTION_PROCESSING,
+          jobName: "process-transaction",
+          jobData: data as unknown as Record<string, unknown>,
+          failureReason: getErrorMessage(err),
+          attemptsMade: parseInt(process.env.MAX_RETRY_ATTEMPTS || "3", 10),
+        });
+        // Re-throw so RabbitMQ nacks the message (no requeue)
+        throw err;
+      }
     },
     CONCURRENCY,
   ).catch((err) => logger.error({ err }, "RabbitMQ Consumer error"));
