@@ -55,7 +55,8 @@ export {
 } from "./queueDepthMetrics";
 
 export { queueOptions } from "./config";
-export { deadLetterQueue, DLQ_NAME, capturePersistentFailure } from "./dlq";
+export { capturePersistentFailure, queryDLQ, replayDLQEntry } from "./dlq";
+export type { DLQEntry, CaptureOptions, DLQQueryOptions } from "./dlq";
 export { startProviderBalanceAlertWorker, scheduleProviderBalanceAlertJob };
 
 // Account Merge Queue Exports
