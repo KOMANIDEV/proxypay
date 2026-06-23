@@ -12,8 +12,6 @@ sdk/.gradle/
 gradle-temp/
 
 # Environment and secrets
-.env
-.env.local
 .env.*.local
 certs/
 .orange-session/
@@ -31,7 +29,6 @@ pact.log
 # OS files
 .DS_Store
 .idea
-.vscode/settings.json
 
 # Kiro
 .kiro/
@@ -48,3 +45,7 @@ benchmarks/results/*.json
 .cache/
 
 secret.yaml
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
