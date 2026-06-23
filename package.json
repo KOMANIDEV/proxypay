@@ -1,7 +1,7 @@
 {
   "name": "proxypay",
   "version": "1.0.0",
-  "description": "ProxyPay — Mobile Money to Stellar backend service",
+  "description": "ProxyPay \u2014 Mobile Money to Stellar backend service",
   "main": "dist/index.js",
   "scripts": {
     "momo-cli": "tsx src/scripts/momo-cli.ts",
@@ -10,13 +10,13 @@
     "snyk:test:high": "snyk test --severity-threshold=high",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "dev": "tsx watch src/index.ts",
+    "dev": "node init && tsx watch src/index.ts",
     "docker:dev": "docker-compose -f docker-compose.dev.yml up",
     "docker:dev:down": "docker-compose -f docker-compose.dev.yml down",
     "provider-mock:dev": "tsx scripts/provider-mock-server.ts",
-    "build": "tsc",
+    "build": "node init && tsc",
     "check-cert": "tsx scripts/cert_check.ts",
-    "start": "node dist/index.js",
+    "start": "node init && node dist/index.js",
     "lint": "eslint src",
     "test": "jest --forceExit --testPathIgnorePatterns=tests/pact",
     "test:pact": "jest --config jest.pact.config.js --forceExit",
@@ -53,7 +53,6 @@
     "sdk:build": "cd sdk && ./gradlew build",
     "sdk:generate:ts": "openapi-generator-cli generate -i http://localhost:3000/docs/openapi.json -c sdk-config-ts.yaml -o sdk-ts",
     "sdk:build:ts": "cd sdk-ts && npm install && npm run build",
-
     "test:load:ingestion-10k": "k6 run --vus-max 12000 -e SCENARIO=ingestion_10k tests/load/api.js",
     "test:load:spike-10k": "k6 run --vus-max 12000 -e SCENARIO=spike_10k tests/load/api.js",
     "test:load:traffic-spike": "k6 run --vus-max 6000 -e SCENARIO=traffic_spike tests/load/api.js",

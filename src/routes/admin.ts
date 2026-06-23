@@ -34,7 +34,7 @@ import {
   getTransactionResolutionTrends,
   getDisputeResolutionTrends,
 } from "../services/metrics";
-import { dlqInspectorHandler } from "../queue/dlq";
+import { queryDLQ, replayDLQEntry } from "../queue/dlq";
 import {
   triggerManualTransfer,
   getLiquidityTransfers,
@@ -1482,11 +1482,36 @@ router.post(
  */
 
 // GET /api/admin/queues/dlq
+// Query params: queueName, failureReason, from, to, limit, offset
 router.get(
   "/queues/dlq",
   requireAdmin,
   logAdminAction("VIEW_DLQ"),
-  dlqInspectorHandler,
+  async (req: Request, res: Response) => {
+    const { queueName, failureReason, from, to } = req.query as Record<string, string | undefined>;
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    const { items, total } = await queryDLQ({ queueName, failureReason, from, to, limit, offset });
+    res.json({ success: true, total, limit, offset, items });
+  },
+);
+
+// POST /api/admin/dlq/:jobId/replay
+router.post(
+  "/dlq/:jobId/replay",
+  requireAdmin,
+  logAdminAction("REPLAY_DLQ_ENTRY"),
+  async (req: Request, res: Response) => {
+    const { jobId } = req.params;
+    const admin = (req as AuthRequest).user;
+    if (!admin) {
+      throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+    }
+
+    const entry = await replayDLQEntry(jobId, admin.id);
+    res.json({ success: true, entry });
+  },
 );
 
 /**
