@@ -220,6 +220,7 @@ GET  /api/transactions/:id            # Transaction details
 GET  /api/transactions/:id/invoice    # Download completed transaction invoice
 POST /api/transactions/:id/cancel     # Cancel pending transaction
 POST /api/transactions/:id/dispute    # Open dispute
+GET  /api/transactions/search         # Search by phone (merchant_id/merchantIds filter, paginated)
 POST /api/transactions/bulk           # Bulk operations
 
 # Auth

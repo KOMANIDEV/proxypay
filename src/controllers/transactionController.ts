@@ -925,7 +925,10 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
     if (process.env.WEBHOOK_URL) {
       try {
         const webhookService = new WebhookService();
-        await webhookService.sendTransactionEvent("transaction.cancelled", updatedTransaction);
+        await webhookService.sendTransactionEvent(
+          "transaction.cancelled",
+          updatedTransaction,
+        );
       } catch (webhookError) {
         console.error("Webhook notification failed", webhookError);
       }
@@ -1008,7 +1011,8 @@ export const refundTransactionHandler = async (req: Request, res: Response) => {
     });
   } catch (err) {
     if (err && (err as any).code) throw err;
-    const message = err instanceof Error ? err.message : "Failed to process refund";
+    const message =
+      err instanceof Error ? err.message : "Failed to process refund";
     const code = message.includes("not found")
       ? ERROR_CODES.NOT_FOUND
       : message.includes("Cannot reverse") || message.includes("No ledger")
@@ -1054,6 +1058,72 @@ export const updateAdminNotesHandler = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * Query parameter names accepted for the merchant filter. `merchantIds` and
+ * `merchant_ids` are the canonical forms; the singular names are kept for
+ * convenience when only one merchant is searched for (issue #621).
+ */
+const MERCHANT_FILTER_QUERY_KEYS = [
+  "merchantIds",
+  "merchant_ids",
+  "merchantId",
+  "merchant_id",
+];
+
+/**
+ * Normalize the merchant filter query params.
+ *
+ * Each accepted key may be a single id, a comma-separated list, or a repeated
+ * query parameter, so one request can search several merchants in bulk.
+ */
+const parseMerchantIds = (query: Record<string, unknown>): string[] => {
+  const raw = MERCHANT_FILTER_QUERY_KEYS.flatMap((key) => {
+    const value = query[key];
+    if (typeof value === "string") return [value];
+    if (Array.isArray(value)) {
+      return value.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+    }
+    return [];
+  });
+
+  const ids = raw
+    .flatMap((value) => value.split(","))
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+
+  return Array.from(new Set(ids));
+};
+
+/**
+ * Enforce that non-admin callers can only search their own merchant's
+ * transactions. A request naming any other merchant is rejected with 403 so the
+ * filter cannot be used to enumerate other merchants' data (issue #621).
+ */
+const enforceMerchantScope = (req: Request, merchantIds: string[]): void => {
+  if (merchantIds.length === 0) return;
+
+  const user = (req as any).user as
+    | { id?: string; userId?: string; role?: string }
+    | undefined;
+
+  if (user?.role === "admin" || user?.role === "super-admin") return;
+
+  const ownMerchantId = user?.userId ?? user?.id;
+  if (!ownMerchantId) {
+    throw createError(ERROR_CODES.UNAUTHORIZED, null, {
+      error: "Authentication required",
+    });
+  }
+
+  if (merchantIds.some((id) => id !== ownMerchantId)) {
+    throw createError(ERROR_CODES.FORBIDDEN, null, {
+      error: "Merchants may only search their own transactions",
+    });
+  }
+};
+
 export const searchTransactionsHandler = async (
   req: Request,
   res: Response,
@@ -1076,6 +1146,9 @@ export const searchTransactionsHandler = async (
       });
     }
 
+    const merchantIds = parseMerchantIds(req.query as Record<string, unknown>);
+    enforceMerchantScope(req, merchantIds);
+
     const pageNum = Math.max(1, parseInt(page as string) || 1);
     const limitNum = Math.max(
       1,
@@ -1083,11 +1156,19 @@ export const searchTransactionsHandler = async (
     );
     const offset = (pageNum - 1) * limitNum;
 
-    const { transactions, total } = await transactionModel.searchByPhoneNumber(
-      sanitized,
-      limitNum,
-      offset,
-    );
+    const { transactions, total } =
+      merchantIds.length > 0
+        ? await transactionModel.searchByPhoneNumber(
+            sanitized,
+            limitNum,
+            offset,
+            merchantIds,
+          )
+        : await transactionModel.searchByPhoneNumber(
+            sanitized,
+            limitNum,
+            offset,
+          );
 
     const masked = transactions.map((tx: any) => ({
       ...tx,
@@ -1104,6 +1185,7 @@ export const searchTransactionsHandler = async (
         totalPages: Math.ceil(total / limitNum),
       },
       data: masked,
+      ...(merchantIds.length > 0 ? { filters: { merchantIds } } : {}),
     };
 
     return res.json(body);

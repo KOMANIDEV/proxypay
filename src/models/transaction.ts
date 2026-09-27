@@ -114,6 +114,7 @@ const TRANSACTION_SELECT_COLUMNS = `
   COALESCE(metadata, '{}') AS metadata,
   location_metadata AS "locationMetadata",
   user_id AS "userId",
+  merchant_id AS "merchantId",
   idempotency_key AS "idempotencyKey",
   idempotency_expires_at AS "idempotencyExpiresAt",
   created_at AS "createdAt",
@@ -822,22 +823,45 @@ export class TransactionModel {
     return result.rows.map(mapTransactionRow).filter((t: any) => t !== null);
   }
 
+  /**
+   * Search transactions by phone number.
+   *
+   * @param phoneNumber          Phone number the client searched for.
+   * @param limit                Page size (clamped to 1..100).
+   * @param offset               Row offset.
+   * @param merchantIds          Optional merchant filter — matches any of the
+   *                             supplied merchant ids (issue #621).
+   */
   async searchByPhoneNumber(
     phoneNumber: string,
     limit = 50,
     offset = 0,
+    merchantIds: string[] = [],
   ): Promise<{ transactions: Transaction[]; total: number }> {
     const capped = Math.min(Math.max(limit, 1), 100);
     const off = Math.max(offset, 0);
 
     const normalized = phoneNumber.replace(/^\+/, "");
+    const params: unknown[] = [hashSearchValue(normalized)];
+
+    let merchantClause = "";
+    if (merchantIds.length > 0) {
+      params.push(merchantIds);
+      merchantClause = `AND merchant_id = ANY($${params.length}::uuid[])`;
+    }
+
+    params.push(capped, off);
+    const limitParam = params.length - 1;
+    const offsetParam = params.length;
+
     const result = await queryRead(
       `SELECT ${TRANSACTION_SELECT_COLUMNS}, COUNT(*) OVER()::int AS "total"
         FROM transactions
         WHERE phone_search_tokens @> ARRAY[$1]::text[]
+          ${merchantClause}
         ORDER BY created_at DESC, id DESC
-        LIMIT $2 OFFSET $3`,
-      [hashSearchValue(normalized), capped, off],
+        LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      params,
     );
 
     const mapped = result.rows
