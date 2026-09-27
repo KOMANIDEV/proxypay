@@ -6,6 +6,7 @@ import { DiscrepancyType } from "../models/reconciliation";
 export interface ProviderCSVRow {
   reference_number?: string;
   reference_id?: string;
+  provider_reference?: string;
   amount?: string;
   status?: string;
   phone_number?: string;
@@ -23,6 +24,7 @@ export interface ReconciliationMatch {
   db_record?: {
     id: string;
     reference_number: string;
+    provider_reference?: string;
     amount: string;
     status: string;
     phone_number: string;
@@ -311,6 +313,7 @@ export async function reconcileTransactions(
     SELECT 
       id, 
       reference_number, 
+      provider_reference,
       amount::text as amount, 
       status, 
       phone_number, 
@@ -336,14 +339,20 @@ export async function reconcileTransactions(
   const dbResult = await queryRead(query, params);
   const dbRecords = dbResult.rows;
 
-  // Create lookup maps
-  const dbByReference = new Map(
-    dbRecords.map((r) => [normalizeReferenceNumber(r.reference_number), r]),
-  );
+  // Create lookup maps – index by internal reference_number and provider_reference (#643)
+  const dbByReference = new Map<string, any>();
+  for (const r of dbRecords) {
+    const ref = normalizeReferenceNumber(r.reference_number);
+    if (ref) dbByReference.set(ref, r);
+    const provRef = normalizeReferenceNumber(r.provider_reference);
+    if (provRef) dbByReference.set(provRef, r);
+  }
 
   const providerByReference = new Map(
     providerRows.map((r) => [
-      normalizeReferenceNumber(r.reference_number || r.reference_id),
+      normalizeReferenceNumber(
+        r.provider_reference || r.reference_number || r.reference_id,
+      ),
       r,
     ]),
   );
@@ -353,14 +362,19 @@ export async function reconcileTransactions(
   const matchedDbRefs = new Set<string>();
   const matchedProviderRefs = new Set<string>();
 
-  // Match by reference number
+  // Match by reference number or provider reference
   for (const [refNum, providerRow] of providerByReference.entries()) {
     if (!refNum) continue;
 
     const dbRecord = dbByReference.get(refNum);
 
     if (dbRecord) {
-      matchedDbRefs.add(refNum);
+      if (dbRecord.reference_number) {
+        matchedDbRefs.add(normalizeReferenceNumber(dbRecord.reference_number)!);
+      }
+      if (dbRecord.provider_reference) {
+        matchedDbRefs.add(normalizeReferenceNumber(dbRecord.provider_reference)!);
+      }
       matchedProviderRefs.add(refNum);
 
       const dbAmount = normalizeAmount(dbRecord.amount);
@@ -397,7 +411,7 @@ export async function reconcileTransactions(
   // Find orphaned provider records (in CSV but not in DB)
   const orphaned_provider = providerRows.filter((row) => {
     const refNum = normalizeReferenceNumber(
-      row.reference_number || row.reference_id,
+      row.provider_reference || row.reference_number || row.reference_id,
     );
     return refNum && !matchedProviderRefs.has(refNum);
   });
@@ -405,7 +419,11 @@ export async function reconcileTransactions(
   // Find orphaned DB records (in DB but not in CSV)
   const orphaned_db = dbRecords.filter((record) => {
     const refNum = normalizeReferenceNumber(record.reference_number);
-    return refNum && !matchedDbRefs.has(refNum);
+    const provRef = normalizeReferenceNumber(record.provider_reference);
+    const isMatched =
+      (refNum && matchedDbRefs.has(refNum)) ||
+      (provRef && matchedDbRefs.has(provRef));
+    return !isMatched;
   });
 
   const totalMatched = matched.length;

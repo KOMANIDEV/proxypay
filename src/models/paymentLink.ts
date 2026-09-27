@@ -13,6 +13,15 @@ export interface PaymentLink {
   redirectSuccessUrl?: string;
   redirectFailUrl?: string;
   expiresAt?: Date;
+  /**
+   * IANA timezone name supplied by the merchant (e.g. "Africa/Lagos").
+   * When present, `expiresAt` was calculated in this timezone so clients can
+   * display the expiry in the correct local time.
+   *
+   * Issue #644 – without storing the timezone, expiration timestamps were
+   * ambiguous and payers saw "midnight UTC" instead of midnight in their zone.
+   */
+  timezone?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -31,13 +40,13 @@ export class PaymentLinkModel {
   ): Promise<PaymentLink> {
     const result = await pool.query(
       `INSERT INTO payment_links (
-        merchant_id, amount, currency, description, token, is_one_time, stellar_address, redirect_success_url, redirect_fail_url, expires_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        merchant_id, amount, currency, description, token, is_one_time, stellar_address, redirect_success_url, redirect_fail_url, expires_at, timezone
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING 
         id, merchant_id as "merchantId", amount, currency, description, token, 
         is_one_time as "isOneTime", is_used as "isUsed", stellar_address as "stellarAddress", 
         redirect_success_url as "redirectSuccessUrl", redirect_fail_url as "redirectFailUrl", 
-        expires_at as "expiresAt", created_at as "createdAt", updated_at as "updatedAt"`,
+        expires_at as "expiresAt", timezone, created_at as "createdAt", updated_at as "updatedAt"`,
       [
         link.merchantId,
         link.amount,
@@ -49,6 +58,7 @@ export class PaymentLinkModel {
         link.redirectSuccessUrl ?? null,
         link.redirectFailUrl ?? null,
         link.expiresAt ?? null,
+        link.timezone ?? null,
       ],
     );
     return result.rows[0];
@@ -60,7 +70,7 @@ export class PaymentLinkModel {
         id, merchant_id as "merchantId", amount, currency, description, token, 
         is_one_time as "isOneTime", is_used as "isUsed", stellar_address as "stellarAddress", 
         redirect_success_url as "redirectSuccessUrl", redirect_fail_url as "redirectFailUrl", 
-        expires_at as "expiresAt", created_at as "createdAt", updated_at as "updatedAt"
+        expires_at as "expiresAt", timezone, created_at as "createdAt", updated_at as "updatedAt"
       FROM payment_links
       WHERE token = $1`,
       [token],
@@ -87,7 +97,7 @@ export class PaymentLinkModel {
         id, merchant_id as "merchantId", amount, currency, description, token, 
         is_one_time as "isOneTime", is_used as "isUsed", stellar_address as "stellarAddress", 
         redirect_success_url as "redirectSuccessUrl", redirect_fail_url as "redirectFailUrl", 
-        expires_at as "expiresAt", created_at as "createdAt", updated_at as "updatedAt"
+        expires_at as "expiresAt", timezone, created_at as "createdAt", updated_at as "updatedAt"
       FROM payment_links
       WHERE expires_at IS NOT NULL
         AND expires_at > NOW()
@@ -107,7 +117,7 @@ export class PaymentLinkModel {
         id, merchant_id as "merchantId", amount, currency, description, token, 
         is_one_time as "isOneTime", is_used as "isUsed", stellar_address as "stellarAddress", 
         redirect_success_url as "redirectSuccessUrl", redirect_fail_url as "redirectFailUrl", 
-        expires_at as "expiresAt", created_at as "createdAt", updated_at as "updatedAt"
+        expires_at as "expiresAt", timezone, created_at as "createdAt", updated_at as "updatedAt"
       FROM payment_links
       WHERE expires_at IS NOT NULL
         AND expires_at < NOW()

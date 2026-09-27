@@ -247,5 +247,39 @@ TXN-20260327-00002,250.00,pending,+0987654321`;
         expect.arrayContaining(["2026-03-27", "2026-03-28"]),
       );
     });
+
+    it("should match transactions by provider_reference (#643)", async () => {
+      const providerRows: ProviderCSVRow[] = [
+        {
+          provider_reference: "FIN-TXN-123456",
+          amount: "500.00",
+          status: "completed",
+        },
+      ];
+
+      const dbRecords = [
+        {
+          id: "uuid-p1",
+          reference_number: "PP-REF-001",
+          provider_reference: "FIN-TXN-123456",
+          amount: "500.00",
+          status: "completed",
+          phone_number: "+237670000000",
+          provider: "mtn",
+          created_at: "2026-03-27T10:00:00Z",
+        },
+      ];
+
+      (queryRead as jest.Mock).mockResolvedValue({ rows: dbRecords });
+
+      const result = await reconcileTransactions(providerRows);
+
+      expect(result.matched).toHaveLength(1);
+      expect(result.matched[0].reference_number).toBe("PP-REF-001");
+      expect(result.matched[0].matched).toBe(true);
+      expect(result.orphaned_provider).toHaveLength(0);
+      expect(result.orphaned_db).toHaveLength(0);
+      expect(result.summary.total_matched).toBe(1);
+    });
   });
 });

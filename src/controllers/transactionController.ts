@@ -13,6 +13,7 @@ import {
   TransactionListFilters,
   TransactionModel,
   TransactionStatus,
+  validateMetadataSchema,
 } from "../models/transaction";
 import {
   getFilterTemplate,
@@ -1380,6 +1381,17 @@ export const updateMetadataHandler = async (req: Request, res: Response) => {
       );
     }
 
+    // Issue #645 – validate against the Zod schema before writing.
+    try {
+      validateMetadataSchema(metadata);
+    } catch (schemaErr) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        schemaErr instanceof Error ? schemaErr.message : "Invalid metadata",
+        { error: schemaErr instanceof Error ? schemaErr.message : "Invalid metadata" },
+      );
+    }
+
     const transaction = await transactionModel.updateMetadata(id, metadata);
     if (!transaction) {
       throw createError(ERROR_CODES.NOT_FOUND, "Transaction not found", {
@@ -1427,6 +1439,17 @@ export const patchMetadataHandler = async (req: Request, res: Response) => {
         {
           error: "metadata must be a JSON object",
         },
+      );
+    }
+
+    // Issue #645 – validate patch against the Zod schema before writing.
+    try {
+      validateMetadataSchema(metadata);
+    } catch (schemaErr) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        schemaErr instanceof Error ? schemaErr.message : "Invalid metadata",
+        { error: schemaErr instanceof Error ? schemaErr.message : "Invalid metadata" },
       );
     }
 
