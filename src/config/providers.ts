@@ -85,6 +85,88 @@ export function validateProviderLimits(
   return { valid: true };
 }
 
+export type DepositLimitErrorCode =
+  | "PROVIDER_MIN_AMOUNT"
+  | "PROVIDER_MAX_AMOUNT"
+  | "UNKNOWN_PROVIDER"
+  | "INVALID_AMOUNT";
+
+export interface DepositAmountValidationResult {
+  valid: boolean;
+  provider: string;
+  amount: number;
+  limits?: ProviderLimits;
+  code?: DepositLimitErrorCode;
+  error?: string;
+}
+
+/**
+ * Validate a deposit amount against the provider-specific per-transaction
+ * limits loaded from configuration.
+ *
+ * Global and KYC-level limits are enforced separately by
+ * `transactionLimitService`; this check only applies the destination
+ * provider's own min/max (e.g. MTN vs Airtel) so a deposit outside the
+ * provider's accepted range fails fast with a provider-specific message.
+ */
+export function validateDepositAmount(
+  provider: MobileMoneyProvider | string,
+  amount: number,
+): DepositAmountValidationResult {
+  const normalizedProvider = String(provider ?? "").toLowerCase();
+  const limits = PROVIDER_LIMITS[normalizedProvider as MobileMoneyProvider];
+
+  if (!limits) {
+    return {
+      valid: false,
+      provider: normalizedProvider,
+      amount,
+      code: "UNKNOWN_PROVIDER",
+      error: `Unsupported mobile money provider: ${provider}`,
+    };
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return {
+      valid: false,
+      provider: normalizedProvider,
+      amount,
+      limits,
+      code: "INVALID_AMOUNT",
+      error: "Amount must be a positive number",
+    };
+  }
+
+  if (amount < limits.minAmount) {
+    return {
+      valid: false,
+      provider: normalizedProvider,
+      amount,
+      limits,
+      code: "PROVIDER_MIN_AMOUNT",
+      error: `${normalizedProvider.toUpperCase()} deposits must be at least ${limits.minAmount} XAF. You provided ${amount} XAF.`,
+    };
+  }
+
+  if (amount > limits.maxAmount) {
+    return {
+      valid: false,
+      provider: normalizedProvider,
+      amount,
+      limits,
+      code: "PROVIDER_MAX_AMOUNT",
+      error: `${normalizedProvider.toUpperCase()} deposits are limited to a maximum of ${limits.maxAmount} XAF per transaction. You provided ${amount} XAF.`,
+    };
+  }
+
+  return {
+    valid: true,
+    provider: normalizedProvider,
+    amount,
+    limits,
+  };
+}
+
 function validateLimitsConfig(): void {
   const providers = [
     MobileMoneyProvider.MTN,

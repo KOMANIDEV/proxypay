@@ -13,6 +13,7 @@ import { KYCLevel, TRANSACTION_LIMITS } from "../config/limits";
 import { EmailService } from "./email";
 import { pushNotificationService } from "./push";
 import { sanctionService } from "./sanctionService";
+import { logKycTierOverride } from "./complianceAuditService";
 
 // Fraction of the daily limit that triggers an upgrade flag (80%)
 const UPGRADE_THRESHOLD_PCT = parseFloat(
@@ -346,16 +347,20 @@ export async function approveKycUpgrade(
   try {
     await client.query("BEGIN");
 
-    // Fetch and lock the request row
+    // Fetch and lock the request row (plus the user's current KYC tier so the
+    // override can be recorded with before/after values).
     const reqResult = await client.query<{
       id: string;
       user_id: string;
       requested_level: string;
       status: string;
+      previous_level: string | null;
     }>(
-      `SELECT id, user_id, requested_level, status
-       FROM kyc_tier_upgrade_requests
-       WHERE id = $1
+      `SELECT r.id, r.user_id, r.requested_level, r.status,
+              u.kyc_level AS previous_level
+       FROM kyc_tier_upgrade_requests r
+       JOIN users u ON u.id = r.user_id
+       WHERE r.id = $1
        FOR UPDATE`,
       [requestId],
     );
@@ -428,6 +433,18 @@ export async function approveKycUpgrade(
        WHERE id = $3`,
       [reviewedBy, notes ?? null, requestId],
     );
+
+    // Compliance audit trail for the admin KYC tier override (#640). Written
+    // with the same client so the audit row commits atomically with the change.
+    await logKycTierOverride({
+      userId: req.user_id,
+      previousLevel: req.previous_level,
+      newLevel: newKycLevel,
+      adminId: reviewedBy,
+      reason: notes ?? null,
+      source: "admin",
+      client,
+    });
 
     await client.query("COMMIT");
 

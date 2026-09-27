@@ -24,6 +24,7 @@ import { KYCService } from "../services/kyc/kycService";
 import {
   MobileMoneyProvider,
   validateProviderLimits,
+  validateDepositAmount,
 } from "../config/providers";
 import type { TransactionJobData } from "../queue/transactionQueue";
 import { amlService } from "../services/aml";
@@ -592,12 +593,23 @@ async function processTransactionRequest(
 
     const idempotencyKey = getIdempotencyKey(req);
 
-    const providerLimitCheck = validateProviderLimits(
-      provider as MobileMoneyProvider,
-      parseFloat(amount),
-    );
+    const parsedAmount = parseFloat(amount);
+
+    // Deposits enforce the destination provider's own per-transaction limits
+    // (e.g. MTN vs Airtel); withdrawals keep the generic provider check.
+    const providerLimitCheck =
+      type === "deposit"
+        ? validateDepositAmount(provider, parsedAmount)
+        : validateProviderLimits(provider as MobileMoneyProvider, parsedAmount);
+
     if (!providerLimitCheck.valid) {
-      return res.status(400).json({ error: providerLimitCheck.error });
+      const limitCode =
+        "code" in providerLimitCheck ? providerLimitCheck.code : undefined;
+
+      return res.status(400).json({
+        error: providerLimitCheck.error,
+        ...(limitCode ? { code: limitCode } : {}),
+      });
     }
 
     const limitCheck = await transactionLimitService.checkTransactionLimit(
