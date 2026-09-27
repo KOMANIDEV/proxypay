@@ -1,8 +1,14 @@
 import { Router } from "express";
 import { AssetWizardController } from "../../controllers/admin/assetWizardController";
 import { assetWorkflowService } from "../../services/assetWorkflowService";
+import {
+  AssetConfigurationError,
+  AssetCreationRateLimitError,
+} from "../../services/assetWorkflowValidation";
 import { requireAdmin, logAdminAction } from "../admin";
-import { createError, ERROR_CODES } from "../../middleware/errorHandler";
+import { createError } from "../../middleware/errorHandler";
+import { ERROR_CODES } from "../../constants/errorCodes";
+import { assetIssuanceRateLimiter } from "../../middleware/rateLimit";
 
 const router = Router();
 const controller = new AssetWizardController();
@@ -44,7 +50,10 @@ router.get("/", controller.listAssets);
  *       201:
  *         description: Asset issued successfully
  */
-router.post("/issue", controller.issueAsset);
+// The direct issuance endpoint, which creates a real on-chain asset rather
+// than a request for one. It is the most privileged route in this file and was
+// the only write path with no limit at all.
+router.post("/issue", assetIssuanceRateLimiter, controller.issueAsset);
 
 /**
  * @openapi
@@ -65,17 +74,31 @@ router.post("/issue", controller.issueAsset);
  *               description: { type: string }
  *               limit: { type: string }
  *               requestedBy: { type: string }
+ *               issuer:
+ *                 type: string
+ *                 description: >
+ *                   Stellar issuer account (G...). Must be a valid account and,
+ *                   when ASSET_ISSUER_WHITELIST is configured, must appear on it.
+ *                 example: "GB7IAH7O45YTUK5RYMREWBIEYV2W47H2EL7N4AU4J5Q5QK4T2QK5JFH"
  *     responses:
  *       201:
  *         description: Request created
  */
-router.post("/workflow/requests", async (req, res) => {
+router.post("/workflow/requests", assetIssuanceRateLimiter, async (req, res, next) => {
   try {
-    const { assetCode, name, description, limit, requestedBy, trustlineConfig } = req.body;
-    const request = await assetWorkflowService.createRequest({ assetCode, name, description, limit, requestedBy, trustlineConfig });
+    const { assetCode, name, description, limit, requestedBy, issuer, trustlineConfig } = req.body;
+    const request = await assetWorkflowService.createRequest({
+      assetCode,
+      name,
+      description,
+      limit,
+      requestedBy,
+      issuer,
+      trustlineConfig,
+    });
     res.status(201).json({ success: true, data: request });
   } catch (error) {
-    throw createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to create request");
+    return next(createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to create request");
   }
 });
 
@@ -89,13 +112,13 @@ router.post("/workflow/requests", async (req, res) => {
  *       200:
  *         description: List of requests
  */
-router.get("/workflow/requests", async (req, res) => {
+router.get("/workflow/requests", async (req, res, next) => {
   try {
     const { status } = req.query;
     const requests = await assetWorkflowService["requestModel"].findAll(status as any);
     res.json({ success: true, data: requests });
   } catch (error) {
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch requests");
+    return next(createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch requests");
   }
 });
 
@@ -115,12 +138,12 @@ router.get("/workflow/requests", async (req, res) => {
  *       200:
  *         description: Request submitted
  */
-router.post("/workflow/requests/:id/submit", async (req, res) => {
+router.post("/workflow/requests/:id/submit", assetIssuanceRateLimiter, async (req, res, next) => {
   try {
     const request = await assetWorkflowService.submitForApproval(req.params.id);
     res.json({ success: true, data: request });
   } catch (error) {
-    throw createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to submit request");
+    return next(createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to submit request");
   }
 });
 
@@ -155,13 +178,13 @@ router.post("/workflow/requests/:id/submit", async (req, res) => {
  *       200:
  *         description: Request updated
  */
-router.post("/workflow/requests/:id/approve", async (req, res) => {
+router.post("/workflow/requests/:id/approve", assetIssuanceRateLimiter, async (req, res, next) => {
   try {
     const { action, approverId, notes } = req.body;
     const request = await assetWorkflowService.approveRequest(req.params.id, approverId, action, notes);
     res.json({ success: true, data: request });
   } catch (error) {
-    throw createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to process approval");
+    return next(createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to process approval");
   }
 });
 
@@ -195,13 +218,13 @@ router.post("/workflow/requests/:id/approve", async (req, res) => {
  *       200:
  *         description: Trustline configured
  */
-router.post("/workflow/requests/:id/trustline", async (req, res) => {
+router.post("/workflow/requests/:id/trustline", assetIssuanceRateLimiter, async (req, res, next) => {
   try {
     const { destinationAccount, limit, autoSetup } = req.body;
     const request = await assetWorkflowService.configureTrustline(req.params.id, { destinationAccount, limit, autoSetup });
     res.json({ success: true, data: request });
   } catch (error) {
-    throw createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to configure trustline");
+    return next(createError(ERROR_CODES.INVALID_INPUT, error instanceof Error ? error.message : "Failed to configure trustline");
   }
 });
 
@@ -222,13 +245,13 @@ router.post("/workflow/requests/:id/trustline", async (req, res) => {
  *       200:
  *         description: Validation result
  */
-router.post("/workflow/validate", async (req, res) => {
+router.post("/workflow/validate", assetIssuanceRateLimiter, async (req, res, next) => {
   try {
     const { assetCode, name, limit } = req.body;
     const validation = assetWorkflowService.validateConfiguration({ assetCode, name, limit });
     res.json({ success: true, data: validation });
   } catch (error) {
-    throw createError(ERROR_CODES.INVALID_INPUT, "Validation failed");
+    return next(createError(ERROR_CODES.INVALID_INPUT, "Validation failed");
   }
 });
 

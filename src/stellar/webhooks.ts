@@ -5,6 +5,7 @@ import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { notifyTransactionWebhook, WebhookEvent } from "../services/webhook";
 import { enqueueSepWebhook } from "../services/stellar/webhooks";
 import { ingestRateLimiter } from "../middleware/ingestRateLimit";
+import { redisClient } from "../config/redis";
 
 const router = Router();
 const transactionModel = new TransactionModel();
@@ -27,6 +28,8 @@ const stellarWebhookSchema = z.object({
   status: z.enum(["success", "failed"]),
   ledger: z.number().int().positive().optional(),
   timestamp: z.string(),
+  // Unique per delivery — used to reject replayed webhooks.
+  nonce: z.string().min(8).max(128),
   source_account: z.string().optional(),
   destination_account: z.string().optional(),
   amount: z.string().optional(),
@@ -64,6 +67,86 @@ function verifyWebhookSignature(
   );
 }
 
+// ─── Replay protection ───────────────────────────────────────────────────────
+//
+// Providers must include a `timestamp` (ISO-8601) and a unique `nonce` in the
+// webhook payload. Timestamps outside the acceptance window are rejected, and
+// every nonce is remembered for the length of that window so an identical
+// delivery cannot be replayed. Nonces are stored in Redis when available so the
+// protection holds across instances, with an in-memory fallback.
+
+export const WEBHOOK_MAX_AGE_MS = parseInt(
+  process.env.STELLAR_WEBHOOK_MAX_AGE_MS || String(5 * 60 * 1000),
+  10,
+);
+export const WEBHOOK_NONCE_TTL_MS = parseInt(
+  process.env.STELLAR_WEBHOOK_NONCE_TTL_MS || String(WEBHOOK_MAX_AGE_MS),
+  10,
+);
+
+const nonceCache = new Map<string, number>(); // nonce -> expiry (epoch ms)
+
+function purgeExpiredNonces(now: number): void {
+  for (const [nonce, expiry] of nonceCache) {
+    if (expiry <= now) nonceCache.delete(nonce);
+  }
+}
+
+/** Clears the in-memory nonce cache — used by tests. */
+export function resetNonceStore(): void {
+  nonceCache.clear();
+}
+
+/**
+ * True when the payload timestamp sits inside the replay window. Both stale and
+ * far-future timestamps are rejected, so a forged clock cannot bypass the check.
+ */
+export function isTimestampFresh(
+  timestamp: string,
+  now: number = Date.now(),
+  maxAgeMs: number = WEBHOOK_MAX_AGE_MS,
+): boolean {
+  const value = Date.parse(timestamp);
+  if (Number.isNaN(value)) return false;
+  return Math.abs(now - value) <= maxAgeMs;
+}
+
+/**
+ * Atomically records a nonce for the replay window. Returns `accepted: false`
+ * when the nonce was already seen, which means the delivery is a replay.
+ */
+export async function consumeNonce(
+  nonce: string,
+  now: number = Date.now(),
+): Promise<{ accepted: boolean }> {
+  purgeExpiredNonces(now);
+
+  if (nonceCache.has(nonce)) {
+    return { accepted: false };
+  }
+
+  try {
+    if (redisClient.isOpen) {
+      const stored = await redisClient.set(
+        `stellar-webhook:nonce:${nonce}`,
+        "1",
+        { NX: true, PX: WEBHOOK_NONCE_TTL_MS },
+      );
+      if (stored !== "OK") return { accepted: false };
+      nonceCache.set(nonce, now + WEBHOOK_NONCE_TTL_MS);
+      return { accepted: true };
+    }
+  } catch (err) {
+    console.warn(
+      "[stellar-webhook] Nonce store unavailable, using in-memory fallback",
+      err,
+    );
+  }
+
+  nonceCache.set(nonce, now + WEBHOOK_NONCE_TTL_MS);
+  return { accepted: true };
+}
+
 router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
   const webhookSecret = process.env.STELLAR_WEBHOOK_SECRET;
 
@@ -90,6 +173,31 @@ router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
   }
 
   const payload = parseResult.data;
+
+  if (!isTimestampFresh(payload.timestamp)) {
+    console.warn(
+      "[stellar-webhook] Stale or future timestamp, possible replay",
+      {
+        timestamp: payload.timestamp,
+        windowMs: WEBHOOK_MAX_AGE_MS,
+      },
+    );
+    return res.status(401).json({
+      error: "Stale webhook timestamp",
+      code: "STALE_TIMESTAMP",
+    });
+  }
+
+  const nonceResult = await consumeNonce(payload.nonce);
+  if (!nonceResult.accepted) {
+    console.warn("[stellar-webhook] Replay detected for nonce", {
+      nonce: payload.nonce,
+    });
+    return res.status(409).json({
+      error: "Duplicate webhook delivery",
+      code: "REPLAY_DETECTED",
+    });
+  }
 
   const newStatus =
     payload.status === "success"

@@ -41,6 +41,7 @@ import { reportsRoutes } from "./routes/reports";
 import feesRoutes from "./routes/fees";
 import { createKYCRoutes } from "./routes/kycRoutes";
 import { adminRoutes } from "./routes/admin";
+import webhookCircuitBreakerRoutes from "./routes/webhookCircuitBreaker";
 import kycTierUpgradeRoutes from "./routes/kycTierUpgradeRoutes";
 import { userRoutes } from "./routes/users";
 import { createError, errorHandler } from "./middleware/errorHandler";
@@ -112,9 +113,13 @@ import providerHealthRouter from "./routes/providerHealthRoutes";
 import kycWebhookRouter from "./routes/kycWebhookRoutes";
 import twoFactorRouter from "./routes/twoFactorRoutes";
 import { transactionMetadataRouter } from "./routes/transactionMetadataRoutes";
+import transactionFilterRouter from "./routes/transactionFilters";
+import notificationHealthRouter from "./routes/notificationHealth";
+import complianceTrainingRouter from "./routes/complianceTraining";
 import healthProvidersRouter from "./routes/healthProviders";
 import adminReplicasRouter from "./routes/adminReplicas";
 import connectionDashboardRouter from "./routes/connectionDashboard";
+import maintenanceRoutes from "./routes/maintenanceRoutes";
 import { transactionStreamRoutes } from "./routes/stream";
 import { batchOperationRoutes } from "./routes/batchOperations";
 import {
@@ -448,6 +453,12 @@ app.use(validateVersionMiddleware);
 app.use(deprecationMiddleware);
 app.use("/oauth", createOAuthRouter());
 
+// #480 – Advanced transaction filtering (saved filter templates, filter AST).
+// Mounted *before* the version-negotiated transaction router on purpose: that
+// router serves GET /:id, which would otherwise capture
+// GET /api/transactions/filters and answer "transaction not found".
+app.use("/api/transactions/filters", transactionFilterRouter);
+
 // Replay retried mutations instead of processing them twice (Idempotency-Key)
 app.use("/api/v1/transactions", idempotency());
 app.use("/api/transactions", idempotency());
@@ -514,6 +525,9 @@ app.use("/", paymentLinkRoutes);
 app.use("/api/gdpr", privacyRoutes);
 app.use("/api/developer", developerDashboardRoutes);
 app.use("/api/admin", requireAuth, adminRoutes);
+// #573 – webhook circuit breaker state and manual reset. The router applies
+// requireAuth and requireAdmin itself, since it is also useful on its own.
+app.use("/api/admin/webhooks", webhookCircuitBreakerRoutes);
 app.use("/api/admin/providers/status", requireAuth, providerStatusRouter);
 // #405 – Provider Health Dashboard
 app.use("/api/admin/providers/health", requireAuth, providerHealthRouter);
@@ -526,6 +540,10 @@ app.use("/api/admin/auth", createAdminSep10Router());
 app.use("/api/kyc/webhooks", kycWebhookRouter);
 // #403 – Transaction Metadata Search
 app.use("/api/transactions/metadata", transactionMetadataRouter);
+// #479 – real-time notification system status
+app.use("/api/notifications", notificationHealthRouter);
+// #481 – compliance training dashboard, assignments and certifications
+app.use("/api/compliance/training", complianceTrainingRouter);
 // #404 – Fraud Detection Logging
 app.use("/api/fraud", fraudRoutes);
 // #404 – 2FA Multi-method
@@ -538,6 +556,9 @@ app.use("/api/health", healthProvidersRouter);
 app.use("/api/admin/replicas", requireAuth, adminReplicasRouter);
 // #355 – Connection Pool Dashboard
 app.use("/api/admin/connections", requireAuth, connectionDashboardRouter);
+// #482/#484/#483/#485 – Automatic database optimization, provider contract
+// version management, transaction reversal audit and ML fraud detection
+app.use("/api/admin/maintenance", requireAuth, maintenanceRoutes);
 app.use("/api/receipt-templates", receiptTemplateRoutes);
 app.use("/sep10", createSep10Router());
 app.use("/sep31", sep31Router);

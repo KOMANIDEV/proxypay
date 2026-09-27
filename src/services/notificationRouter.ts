@@ -9,6 +9,7 @@ import {
 } from "./notificationDeduplicator";
 import { UserModel } from "../models/users";
 import { Transaction } from "../models/transaction";
+import { recordDeliveryAsync } from "./notificationHealthService";
 
 export type NotificationSeverity = "low" | "medium" | "high" | "critical";
 
@@ -204,6 +205,14 @@ export class NotificationRouter {
     channel: NotificationChannel,
     context: NotificationContext,
   ): Promise<void> {
+    // #479 – every channel attempt is recorded so notification health can be
+    // observed. Without this, a misconfigured provider is indistinguishable
+    // from a healthy one because errors are deliberately swallowed below.
+    const startedAt = Date.now();
+    const notificationKey =
+      context.dedupKey ??
+      `${context.category}:${context.transactionId ?? context.userId ?? "system"}`;
+
     try {
       switch (channel) {
         case "email":
@@ -222,8 +231,32 @@ export class NotificationRouter {
           await this.sendPagerDutyNotification(context);
           break;
       }
+
+      recordDeliveryAsync({
+        notificationKey,
+        channel,
+        status: "delivered",
+        durationMs: Date.now() - startedAt,
+        category: context.category,
+        severity: context.severity,
+        userId: context.userId ?? null,
+        transactionId: context.transactionId ?? null,
+      });
     } catch (error) {
       console.error(`Failed to send ${channel} notification:`, error);
+
+      recordDeliveryAsync({
+        notificationKey,
+        channel,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        category: context.category,
+        severity: context.severity,
+        userId: context.userId ?? null,
+        transactionId: context.transactionId ?? null,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+
       // Don't throw - we don't want one channel failure to stop others
     }
   }

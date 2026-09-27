@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { pool } from "../config/database";
+import { isTokenRevoked, revokeToken } from "./tokenRevocationService";
 
 // ---------------------------------------------------------------------------
 // Merchant Portal URL Generation (#460)
@@ -42,7 +43,7 @@ function signPayload(payload: PortalTokenPayload): string {
   return Buffer.from(data).toString("base64url") + "." + signature;
 }
 
-export function verifyPortalToken(token: string): PortalTokenPayload | null {
+export async function verifyPortalToken(token: string): Promise<PortalTokenPayload | null> {
   try {
     const [dataB64, signature] = token.split(".");
     if (!dataB64 || !signature) return null;
@@ -58,6 +59,13 @@ export function verifyPortalToken(token: string): PortalTokenPayload | null {
 
     const payload: PortalTokenPayload = JSON.parse(data);
     if (payload.exp * 1000 < Date.now()) return null;
+
+    // Check if token has been revoked
+    const revoked = await isTokenRevoked(payload.jti);
+    if (revoked) {
+      console.warn(`[MerchantPortal] Token verification failed: token revoked (jti=${payload.jti})`);
+      return null;
+    }
 
     return payload;
   } catch {
@@ -159,4 +167,27 @@ export async function consumePortalToken(
     phone: m.phone_number,
     status: m.status,
   };
+}
+
+/**
+ * Rotate a merchant's portal token.
+ * Generates a new token and revokes the old one.
+ */
+export async function rotatePortalToken(
+  merchantId: string,
+  oldTokenJti: string,
+  oldTokenExp: number,
+  options?: { expirySeconds?: number },
+): Promise<PortalUrlResult> {
+  // Revoke the old token immediately
+  await revokeToken(
+    oldTokenJti,
+    merchantId,
+    oldTokenExp,
+    "rotation",
+    "portal",
+  );
+
+  // Generate a new token
+  return generatePortalUrl(merchantId, options);
 }

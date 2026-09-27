@@ -26,14 +26,92 @@ interface GenerateTokenOptions {
   expiresIn?: string | number;
   sessionId?: string;
   binding?: string;
+  /** Override which key id to use when signing (defaults to current active key). */
+  keyId?: string;
 }
 
-function getJwtSecret(): string {
-  const secret = process.env.JWT_SECRET;
-  if (!secret) {
-    throw new Error("JWT_SECRET is not defined in environment variables");
+// ---------------------------------------------------------------------------
+// Key rotation support (#628)
+//
+// Tokens are signed with a versioned key identified by a `kid` (key id) header
+// claim.  During rotation a NEW key is promoted to "active"; the previous key
+// remains in the keystore for GRACE_PERIOD_MS (7 days) so that tokens issued
+// before the rotation continue to verify.  After the grace period the old key
+// is automatically evicted.
+//
+// Environment variables:
+//   JWT_SECRET              — The current active signing secret (always required)
+//   JWT_KEY_ID              — Identifier for JWT_SECRET (defaults to "v1")
+//   JWT_PREVIOUS_SECRET     — The previous secret still accepted during rotation
+//   JWT_PREVIOUS_KEY_ID     — Identifier for JWT_PREVIOUS_SECRET
+//   JWT_PREVIOUS_KEY_ISSUED_AT — Unix epoch (seconds) when the old key was superseded;
+//                               used to enforce the 7-day grace window
+// ---------------------------------------------------------------------------
+
+/** Grace period during which a superseded key remains valid (7 days in ms). */
+export const KEY_ROTATION_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface JwtKeyEntry {
+  keyId: string;
+  secret: string;
+  /** Unix epoch (ms) from which this key is the active signing key. */
+  activeSince: number;
+  /** Unix epoch (ms) after which this key should be rejected (for old keys). */
+  expiresAt?: number;
+}
+
+/**
+ * Returns the live keystore: `[activeKey, ...previousKeys]`.
+ * Keys are derived from environment variables so they rotate without a redeploy
+ * (assuming the environment is updated before old tokens expire).
+ *
+ * Exported so tests can inspect the keystore without reaching into internals.
+ */
+export function buildKeyStore(): JwtKeyEntry[] {
+  const activeSecret = process.env.JWT_SECRET;
+  if (!activeSecret) throw new Error("JWT_SECRET is not defined in environment variables");
+
+  const activeKeyId = process.env.JWT_KEY_ID ?? "v1";
+  const store: JwtKeyEntry[] = [
+    { keyId: activeKeyId, secret: activeSecret, activeSince: 0 },
+  ];
+
+  const prevSecret = process.env.JWT_PREVIOUS_SECRET;
+  const prevKeyId = process.env.JWT_PREVIOUS_KEY_ID;
+  const prevIssuedAt = process.env.JWT_PREVIOUS_KEY_ISSUED_AT;
+
+  if (prevSecret && prevKeyId) {
+    const supersededAt = prevIssuedAt ? parseInt(prevIssuedAt, 10) * 1000 : Date.now();
+    const expiresAt = supersededAt + KEY_ROTATION_GRACE_PERIOD_MS;
+
+    // Only include the old key if we are still within the grace period.
+    if (Date.now() < expiresAt) {
+      store.push({ keyId: prevKeyId, secret: prevSecret, activeSince: 0, expiresAt });
+    }
   }
-  return secret;
+
+  return store;
+}
+
+/**
+ * Returns the active signing key entry (always the first entry in the store).
+ */
+function getActiveKey(): JwtKeyEntry {
+  return buildKeyStore()[0];
+}
+
+/**
+ * Looks up a key by its `kid` identifier.  Returns `undefined` if the key is
+ * not in the store or its grace period has expired.
+ */
+export function findKeyById(keyId: string): JwtKeyEntry | undefined {
+  return buildKeyStore().find((k) => k.keyId === keyId);
+}
+
+// Keep a thin backward-compat helper so internal code that still calls
+// getJwtSecret() continues to work.
+function getJwtSecret(): string {
+  return getActiveKey().secret;
 }
 
 export interface JWTPayload {
@@ -61,7 +139,11 @@ export interface RefreshTokenPayload {
 
 
 /**
- * Generates a JWT token for the given user payload
+ * Generates a JWT token for the given user payload.
+ *
+ * The token header will include the `kid` of the active signing key, enabling
+ * verifyToken() to select the correct key during a rotation window.
+ *
  * @param payload - User data to include in the token
  * @returns Signed JWT token
  */
@@ -70,12 +152,24 @@ export function generateToken(
   options?: GenerateTokenOptions,
 ): string {
   const expiresIn = options?.expiresIn ?? JWT_EXPIRES_IN;
+
+  // Select the signing key — allow callers to override (useful in tests)
+  let signingKey: JwtKeyEntry;
+  if (options?.keyId) {
+    const found = findKeyById(options.keyId);
+    if (!found) throw new Error(`Unknown keyId: ${options.keyId}`);
+    signingKey = found;
+  } else {
+    signingKey = getActiveKey();
+  }
+
   return jwt.sign({
     ...payload,
     ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
     ...(options?.binding ? { binding: options.binding } : {}),
-  }, getJwtSecret(), {
+  }, signingKey.secret, {
     expiresIn: typeof expiresIn === 'string' ? expiresIn : expiresIn,
+    keyid: signingKey.keyId,
   } as jwt.SignOptions);
 }
 
@@ -130,8 +224,10 @@ export async function generateRefreshToken(
     parentTokenId,
     ...session,
   };
-  const token = jwt.sign(payload, getJwtSecret(), {
+  const signingKey = getActiveKey();
+  const token = jwt.sign(payload, signingKey.secret, {
     expiresIn: REFRESH_TOKEN_EXPIRES_IN,
+    keyid: signingKey.keyId,
   });
   await refreshTokenFamilyModel.create({ user_id: userId, family_id: famId, token, parent_token: parentTokenId });
   return token;
@@ -139,13 +235,35 @@ export async function generateRefreshToken(
 
 
 /**
- * Verifies a JWT token and returns the decoded payload
+ * Verifies a JWT token and returns the decoded payload.
+ *
+ * Key rotation is supported: the `kid` header is read from the token and used
+ * to look up the matching secret in the keystore.  During a rotation window
+ * both the new and the previous key are accepted.  Tokens signed with an
+ * expired or unknown key are rejected.
+ *
  * @param token - JWT token to verify
  * @returns Decoded token payload
- * @throws Error if token is invalid or expired
+ * @throws Error if token is invalid, expired, or signed with an unknown/expired key
  */
 export function verifyToken(token: string): JWTPayload {
-  const secret = getJwtSecret();
+  // Decode without verification first to read the `kid` header.
+  const unverified = jwt.decode(token, { complete: true });
+  const kid = (unverified?.header as any)?.kid as string | undefined;
+
+  // Select the correct secret for this key id.
+  let secret: string;
+  if (kid) {
+    const entry = findKeyById(kid);
+    if (!entry) {
+      throw new Error(`Invalid token: unknown key id '${kid}'`);
+    }
+    secret = entry.secret;
+  } else {
+    // Tokens issued before key rotation support (no kid) fall back to the active secret.
+    secret = getJwtSecret();
+  }
+
   try {
     const decoded = jwt.verify(token, secret, { clockTolerance: 60 }) as JWTPayload;
     return decoded;
@@ -167,7 +285,19 @@ export function verifyToken(token: string): JWTPayload {
  * @throws Error if token is invalid, expired, or reused
  */
 export async function verifyRefreshToken(token: string): Promise<RefreshTokenPayload> {
-  const secret = getJwtSecret();
+  // Decode without verification first to read the `kid` header.
+  const unverified = jwt.decode(token, { complete: true });
+  const kid = (unverified?.header as any)?.kid as string | undefined;
+
+  let secret: string;
+  if (kid) {
+    const entry = findKeyById(kid);
+    if (!entry) throw new Error(`Invalid refresh token: unknown key id '${kid}'`);
+    secret = entry.secret;
+  } else {
+    secret = getJwtSecret();
+  }
+
   let decoded: RefreshTokenPayload;
   try {
     decoded = jwt.verify(token, secret) as RefreshTokenPayload;

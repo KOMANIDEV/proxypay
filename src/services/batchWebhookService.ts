@@ -20,6 +20,9 @@ interface BatchWebhookPayload {
   failedItems: number;
   pendingItems: number;
   timestamp: string;
+  event_type?: string;
+  processedCount?: number;
+  percentageComplete?: number;
 }
 
 interface BatchItemWebhookPayload {
@@ -36,6 +39,53 @@ interface BatchItemWebhookPayload {
 export class BatchWebhookService {
   private readonly maxRetries = 3;
   private readonly retryDelayMs = 1000;
+
+  /**
+   * Send an intermediate progress webhook for a batch operation.
+   * Called periodically during processing to report progress to the webhook consumer.
+   *
+   * @param batchOperationId  UUID of the batch operation.
+   * @param processedCount    Number of items processed so far.
+   * @param totalCount        Total number of items in the batch.
+   */
+  async sendBatchIntermediateProgressWebhook(
+    batchOperationId: string,
+    processedCount: number,
+    totalCount: number,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const operation = await batchOperationModel.findById(batchOperationId);
+      if (!operation || !operation.webhookUrl) {
+        return { success: true }; // No webhook configured, consider it successful
+      }
+
+      const percentageComplete = totalCount > 0
+        ? Math.round((processedCount / totalCount) * 100)
+        : 0;
+
+      const payload: BatchWebhookPayload = {
+        batchReference: operation.batchReference,
+        batchId: operation.id,
+        status: operation.status,
+        provider: operation.provider,
+        operationType: operation.operationType,
+        totalItems: operation.totalItems,
+        completedItems: operation.completedItems,
+        failedItems: operation.failedItems,
+        pendingItems: totalCount - processedCount,
+        timestamp: new Date().toISOString(),
+        event_type: 'batch_progress',
+        processedCount,
+        percentageComplete,
+      };
+
+      await this.sendWebhookWithRetry(operation.webhookUrl, payload);
+
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: "Webhook failed after retries" };
+    }
+  }
 
   /**
    * Send batch operation progress webhook

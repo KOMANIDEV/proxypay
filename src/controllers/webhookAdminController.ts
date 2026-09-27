@@ -7,6 +7,7 @@ import {
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import logger from "../utils/logger";
+import { WebhookCircuitBreakerRegistry } from "../services/webhookCircuitBreaker";
 
 const retryPolicyService = new WebhookRetryPolicyService();
 
@@ -160,4 +161,44 @@ export async function getOrCreateDefaultsForMerchant(req: Request, res: Response
 
   const policy = await retryPolicyService.getOrCreateDefaults(merchantId);
   res.json({ policy });
+}
+
+export async function getWebhookCircuitBreakerState(req: Request, res: Response): Promise<void> {
+  requireAdminRole(req);
+
+  const url = typeof req.query.url === "string" ? req.query.url : "";
+  if (!url) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "url query parameter is required", {
+      message: "url query parameter is required",
+    });
+  }
+
+  const breaker = WebhookCircuitBreakerRegistry.get(url);
+  res.json({ url, ...breaker.snapshot() });
+}
+
+export async function resetWebhookCircuitBreaker(req: Request, res: Response): Promise<void> {
+  requireAdminRole(req);
+
+  const body = req.body as Record<string, unknown>;
+  const url = typeof body.url === "string" ? body.url.trim() : "";
+  if (!url) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "url is required", {
+      message: "url must be a non-empty string",
+    });
+  }
+
+  const breaker = WebhookCircuitBreakerRegistry.reset(url);
+  if (!breaker) {
+    throw createError(ERROR_CODES.NOT_FOUND, "Circuit breaker not found for this webhook URL", {
+      message: "No circuit breaker registered for the given webhook URL",
+    });
+  }
+
+  logger.info(
+    { adminId: (req as AuthRequest).user?.id, webhookUrl: url },
+    "Webhook circuit breaker manually reset via admin",
+  );
+
+  res.json({ reset: true, url, ...breaker.snapshot() });
 }

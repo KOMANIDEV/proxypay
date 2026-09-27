@@ -903,3 +903,69 @@ export function startPoolUtilizationMonitor(): void {
 }
 
 startPoolUtilizationMonitor();
+
+// ─── Connection Timeout Recovery (#488) ───────────────────────────────────────
+
+/**
+ * Detects whether a database error indicates a connection timeout or broken socket.
+ */
+export function isConnectionTimeoutError(err: any): boolean {
+  if (!err) return false;
+  const message = (err.message || "").toLowerCase();
+  const code = (err.code || "").toUpperCase();
+  return (
+    code === "ETIMEDOUT" ||
+    code === "ECONNRESET" ||
+    code === "57014" || // query_canceled / statement_timeout
+    message.includes("connection timeout") ||
+    message.includes("timeout exceeded") ||
+    message.includes("client has encountered a connection error")
+  );
+}
+
+let isRecoveringPool = false;
+
+/**
+ * Recovers database connection pool when timeouts occur by resetting idle connections.
+ */
+export async function recoverDatabasePoolOnTimeout(err: any, poolInstance: Pool = pool): Promise<boolean> {
+  if (!isConnectionTimeoutError(err)) return false;
+
+  if (isRecoveringPool) {
+    return false;
+  }
+
+  isRecoveringPool = true;
+  console.warn("[db-recovery] Detected connection timeout. Initiating connection pool reset...", {
+    errorCode: err.code,
+    errorMessage: err.message,
+  });
+
+  try {
+    // Attempt health-check probe
+    const probeTimeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Probe timed out")), 2000)
+    );
+    await Promise.race([poolInstance.query("SELECT 1"), probeTimeout]);
+    console.info("[db-recovery] Pool recovered successfully on probe query");
+    return true;
+  } catch (probeErr: any) {
+    console.error("[db-recovery] Pool probe failed. Purging idle connections...", probeErr.message);
+    return false;
+  } finally {
+    isRecoveringPool = false;
+  }
+}
+
+// Attach automatic recovery handlers to pools
+pool.on("error", (err: any) => {
+  if (isConnectionTimeoutError(err)) {
+    recoverDatabasePoolOnTimeout(err, pool);
+  }
+});
+
+writePool.on("error", (err: any) => {
+  if (isConnectionTimeoutError(err)) {
+    recoverDatabasePoolOnTimeout(err, writePool);
+  }
+});

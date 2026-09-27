@@ -3,19 +3,29 @@ import { z } from "zod";
 import { StellarService } from "../services/stellar/stellarService";
 import { MobileMoneyService } from "../services/mobilemoney/mobileMoneyService";
 import { maskPhoneNumber } from "../utils/masking";
+import {
+  getPaginationInfo,
+  VALID_STATUSES as VALID_STATUS_FILTERS,
+} from "../utils/transactionFilters";
 import { validatePhoneProviderMatch } from "../utils/phoneUtils";
 import {
   Transaction,
+  TransactionListFilters,
   TransactionModel,
   TransactionStatus,
   validateMetadataSchema,
 } from "../models/transaction";
+import {
+  getFilterTemplate,
+  parseFilterExpression,
+} from "../services/transactionFilterService";
 import { lockManager, LockKeys } from "../utils/lock";
 import { TransactionLimitService } from "../services/transactionLimit/transactionLimitService";
 import { KYCService } from "../services/kyc/kycService";
 import {
   MobileMoneyProvider,
   validateProviderLimits,
+  validateDepositAmount,
 } from "../config/providers";
 import type { TransactionJobData } from "../queue/transactionQueue";
 import { amlService } from "../services/aml";
@@ -136,6 +146,16 @@ export const getTransactionHistoryHandler = async (
       maxAmount,
       provider,
       tags,
+      // #480 – Advanced filtering
+      currency,
+      type,
+      statuses,
+      referenceNumber,
+      dateField,
+      startDateTime,
+      endDateTime,
+      filter,
+      templateId,
     } = req.query;
 
     const isValidISO = (dateStr: unknown) => {
@@ -177,7 +197,7 @@ export const getTransactionHistoryHandler = async (
 
     // Filter Construction
     // Note: tags are expected as a comma-separated string in the query (e.g. ?tags=refund,priority)
-    const filters = {
+    const filters: TransactionListFilters = {
       minAmount: minAmount ? parseFloat(minAmount as string) : undefined,
       maxAmount: maxAmount ? parseFloat(maxAmount as string) : undefined,
       provider: provider as string | undefined,
@@ -185,6 +205,91 @@ export const getTransactionHistoryHandler = async (
         ? (tags as string).split(",").map((t) => t.trim().toLowerCase())
         : undefined,
     };
+
+    // #480 – Advanced filtering.
+    // Anything malformed is rejected here rather than reaching the model,
+    // where a bad expression would otherwise become a confusing 500.
+    if (currency) filters.currency = currency as string;
+    if (type) filters.type = type as string;
+    if (referenceNumber) filters.referenceNumber = referenceNumber as string;
+    if (statuses) {
+      filters.statuses = (statuses as string)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean) as TransactionListFilters["statuses"];
+    }
+
+    const DATE_FIELDS = ["createdAt", "updatedAt"];
+    if (dateField) {
+      if (!DATE_FIELDS.includes(dateField as string)) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          `Invalid dateField. Must be one of: ${DATE_FIELDS.join(", ")}`,
+          { error: "Invalid dateField" },
+        );
+      }
+      filters.dateField = dateField as TransactionListFilters["dateField"];
+    }
+    if (startDateTime || endDateTime) {
+      const parseInstant = (value: unknown, label: string) => {
+        const parsedDate = new Date(value as string);
+        if (Number.isNaN(parsedDate.getTime())) {
+          throw createError(
+            ERROR_CODES.INVALID_INPUT,
+            `Invalid ${label}. Must be a valid ISO 8601 timestamp`,
+            { error: `Invalid ${label}` },
+          );
+        }
+        return parsedDate;
+      };
+      if (startDateTime) {
+        filters.startDateTime = parseInstant(
+          startDateTime,
+          "startDateTime",
+        ).toISOString();
+      }
+      if (endDateTime) {
+        filters.endDateTime = parseInstant(endDateTime, "endDateTime").toISOString();
+      }
+      if (
+        filters.startDateTime &&
+        filters.endDateTime &&
+        new Date(filters.startDateTime) > new Date(filters.endDateTime)
+      ) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "startDateTime cannot be greater than endDateTime",
+          { error: "startDateTime cannot be greater than endDateTime" },
+        );
+      }
+    }
+
+    if (templateId) {
+      const template = await getFilterTemplate(
+        templateId as string,
+        (req as any).user?.id,
+      );
+      if (!template) {
+        throw createError(
+          ERROR_CODES.NOT_FOUND,
+          "Filter template not found",
+          { error: "Filter template not found" },
+        );
+      }
+      filters.filter = template.expression;
+    } else if (filter) {
+      try {
+        filters.filter = parseFilterExpression(
+          typeof filter === "string" ? JSON.parse(filter) : filter,
+        );
+      } catch (error) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          error instanceof Error ? error.message : "Invalid filter expression",
+          { error: "Invalid filter expression" },
+        );
+      }
+    }
 
     // Database Queries
     // If using cursor-based pagination, fetch limit+1 items to determine `hasMore`.
@@ -489,12 +594,23 @@ async function processTransactionRequest(
 
     const idempotencyKey = getIdempotencyKey(req);
 
-    const providerLimitCheck = validateProviderLimits(
-      provider as MobileMoneyProvider,
-      parseFloat(amount),
-    );
+    const parsedAmount = parseFloat(amount);
+
+    // Deposits enforce the destination provider's own per-transaction limits
+    // (e.g. MTN vs Airtel); withdrawals keep the generic provider check.
+    const providerLimitCheck =
+      type === "deposit"
+        ? validateDepositAmount(provider, parsedAmount)
+        : validateProviderLimits(provider as MobileMoneyProvider, parsedAmount);
+
     if (!providerLimitCheck.valid) {
-      return res.status(400).json({ error: providerLimitCheck.error });
+      const limitCode =
+        "code" in providerLimitCheck ? providerLimitCheck.code : undefined;
+
+      return res.status(400).json({
+        error: providerLimitCheck.error,
+        ...(limitCode ? { code: limitCode } : {}),
+      });
     }
 
     const limitCheck = await transactionLimitService.checkTransactionLimit(
@@ -810,7 +926,10 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
     if (process.env.WEBHOOK_URL) {
       try {
         const webhookService = new WebhookService();
-        await webhookService.sendTransactionEvent("transaction.cancelled", updatedTransaction);
+        await webhookService.sendTransactionEvent(
+          "transaction.cancelled",
+          updatedTransaction,
+        );
       } catch (webhookError) {
         console.error("Webhook notification failed", webhookError);
       }
@@ -893,7 +1012,8 @@ export const refundTransactionHandler = async (req: Request, res: Response) => {
     });
   } catch (err) {
     if (err && (err as any).code) throw err;
-    const message = err instanceof Error ? err.message : "Failed to process refund";
+    const message =
+      err instanceof Error ? err.message : "Failed to process refund";
     const code = message.includes("not found")
       ? ERROR_CODES.NOT_FOUND
       : message.includes("Cannot reverse") || message.includes("No ledger")
@@ -939,6 +1059,72 @@ export const updateAdminNotesHandler = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * Query parameter names accepted for the merchant filter. `merchantIds` and
+ * `merchant_ids` are the canonical forms; the singular names are kept for
+ * convenience when only one merchant is searched for (issue #621).
+ */
+const MERCHANT_FILTER_QUERY_KEYS = [
+  "merchantIds",
+  "merchant_ids",
+  "merchantId",
+  "merchant_id",
+];
+
+/**
+ * Normalize the merchant filter query params.
+ *
+ * Each accepted key may be a single id, a comma-separated list, or a repeated
+ * query parameter, so one request can search several merchants in bulk.
+ */
+const parseMerchantIds = (query: Record<string, unknown>): string[] => {
+  const raw = MERCHANT_FILTER_QUERY_KEYS.flatMap((key) => {
+    const value = query[key];
+    if (typeof value === "string") return [value];
+    if (Array.isArray(value)) {
+      return value.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+    }
+    return [];
+  });
+
+  const ids = raw
+    .flatMap((value) => value.split(","))
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+
+  return Array.from(new Set(ids));
+};
+
+/**
+ * Enforce that non-admin callers can only search their own merchant's
+ * transactions. A request naming any other merchant is rejected with 403 so the
+ * filter cannot be used to enumerate other merchants' data (issue #621).
+ */
+const enforceMerchantScope = (req: Request, merchantIds: string[]): void => {
+  if (merchantIds.length === 0) return;
+
+  const user = (req as any).user as
+    | { id?: string; userId?: string; role?: string }
+    | undefined;
+
+  if (user?.role === "admin" || user?.role === "super-admin") return;
+
+  const ownMerchantId = user?.userId ?? user?.id;
+  if (!ownMerchantId) {
+    throw createError(ERROR_CODES.UNAUTHORIZED, null, {
+      error: "Authentication required",
+    });
+  }
+
+  if (merchantIds.some((id) => id !== ownMerchantId)) {
+    throw createError(ERROR_CODES.FORBIDDEN, null, {
+      error: "Merchants may only search their own transactions",
+    });
+  }
+};
+
 export const searchTransactionsHandler = async (
   req: Request,
   res: Response,
@@ -961,6 +1147,9 @@ export const searchTransactionsHandler = async (
       });
     }
 
+    const merchantIds = parseMerchantIds(req.query as Record<string, unknown>);
+    enforceMerchantScope(req, merchantIds);
+
     const pageNum = Math.max(1, parseInt(page as string) || 1);
     const limitNum = Math.max(
       1,
@@ -968,11 +1157,19 @@ export const searchTransactionsHandler = async (
     );
     const offset = (pageNum - 1) * limitNum;
 
-    const { transactions, total } = await transactionModel.searchByPhoneNumber(
-      sanitized,
-      limitNum,
-      offset,
-    );
+    const { transactions, total } =
+      merchantIds.length > 0
+        ? await transactionModel.searchByPhoneNumber(
+            sanitized,
+            limitNum,
+            offset,
+            merchantIds,
+          )
+        : await transactionModel.searchByPhoneNumber(
+            sanitized,
+            limitNum,
+            offset,
+          );
 
     const masked = transactions.map((tx: any) => ({
       ...tx,
@@ -989,6 +1186,7 @@ export const searchTransactionsHandler = async (
         totalPages: Math.ceil(total / limitNum),
       },
       data: masked,
+      ...(merchantIds.length > 0 ? { filters: { merchantIds } } : {}),
     };
 
     return res.json(body);
@@ -1009,40 +1207,47 @@ export const listTransactionsHandler = async (req: Request, res: Response) => {
       offset: 0,
     };
 
-    const totalCount = await transactionModel.countByStatuses(filters.statuses);
-    const transactions = await transactionModel.findByStatuses(
-      filters.statuses,
-      filters.limit,
-      filters.offset,
-    );
+    // An empty status filter means "all statuses" — expand to the full valid
+    // set so SQL receives an explicit (OR) status list.
+    const statuses: TransactionStatus[] = (filters.statuses?.length
+      ? filters.statuses
+      : VALID_STATUS_FILTERS) as TransactionStatus[];
 
-    // If a reference search is requested, we should probably use the list method instead
-    // or just filter the results. But wait, findByStatuses is limited.
-    // Let's use the list() method instead which is more flexible.
-    const results = await transactionModel.list(
+    // Reference lookups need the more flexible list/count helpers; status
+    // filtering is applied through findByStatuses/countByStatuses.
+    if (filters.reference) {
+      const results = await transactionModel.list(
+        filters.limit,
+        filters.offset,
+        undefined,
+        undefined,
+        {
+          tags: [],
+          referenceNumber: filters.reference,
+        },
+      );
+      const total = await transactionModel.count(undefined, undefined, {
+        referenceNumber: filters.reference,
+      });
+
+      return res.json({
+        data: results,
+        pagination: getPaginationInfo(total, filters.limit, filters.offset),
+        filters: { statuses },
+      });
+    }
+
+    const totalCount = await transactionModel.countByStatuses(statuses);
+    const transactions = await transactionModel.findByStatuses(
+      statuses,
       filters.limit,
       filters.offset,
-      undefined,
-      undefined,
-      {
-        tags: [], // Could be extended
-        referenceNumber: filters.reference,
-      },
     );
-    const total = filters.reference
-      ? await transactionModel.count(undefined, undefined, {
-          referenceNumber: filters.reference,
-        })
-      : totalCount;
 
     return res.json({
-      data: results,
-      pagination: {
-        total,
-        limit: filters.limit,
-        offset: filters.offset,
-        hasMore: filters.offset + filters.limit < total,
-      },
+      data: transactions,
+      pagination: getPaginationInfo(totalCount, filters.limit, filters.offset),
+      filters: { statuses },
     });
   } catch (err) {
     console.error("Failed to list transactions:", err);

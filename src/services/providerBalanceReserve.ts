@@ -16,6 +16,7 @@ import {
   type ProviderReserveConfig,
 } from "../config/balanceReserve";
 import { notifySlackAlert } from "./loggers";
+import { providerBalanceCache } from "./providerBalanceCache";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,6 +30,14 @@ export interface ProviderBalanceSnapshot {
   alertThreshold: number;
   status: "ok" | "approaching" | "critical";
   percentageOfReserve: number;
+  /** Epoch ms at which the balance value was fetched (Issue #634). */
+  balanceFetchedAt?: number;
+  /** Age of the balance value in ms at report time (Issue #634). */
+  balanceAgeMs?: number;
+  /** True when the balance was served from a stale cache entry (Issue #634). */
+  balanceStale?: boolean;
+  /** Warning message when stale balance data was used (Issue #634). */
+  balanceWarning?: string;
 }
 
 export interface BalanceForecast {
@@ -104,6 +113,12 @@ function buildSnapshot(
   provider: ProviderName,
   currentBalance: number,
   cfg: ProviderReserveConfig,
+  balanceMeta?: {
+    fetchedAt: number;
+    ageMs: number;
+    stale: boolean;
+    warning?: string;
+  },
 ): ProviderBalanceSnapshot {
   const alertThreshold = cfg.minimumReserve * cfg.alertThresholdFraction;
   const percentageOfReserve =
@@ -126,6 +141,14 @@ function buildSnapshot(
     alertThreshold,
     status,
     percentageOfReserve,
+    ...(balanceMeta
+      ? {
+          balanceFetchedAt: balanceMeta.fetchedAt,
+          balanceAgeMs: balanceMeta.ageMs,
+          balanceStale: balanceMeta.stale,
+          balanceWarning: balanceMeta.warning,
+        }
+      : {}),
   };
 }
 
@@ -233,9 +256,37 @@ export class ProviderBalanceReserveService {
         const cfg = config.providers[provider];
         let currentBalance = 0;
         let avgOutflow = 0;
+        let balanceMeta:
+          | {
+              fetchedAt: number;
+              ageMs: number;
+              stale: boolean;
+              warning?: string;
+            }
+          | undefined;
 
         try {
-          currentBalance = await fetchCurrentBalanceFromDb(provider);
+          // Balances are served through the age-aware cache so stale data is
+          // detected, reported and refreshed automatically (Issue #634).
+          const cached = await providerBalanceCache.get(provider, async () => ({
+            availableBalance: await fetchCurrentBalanceFromDb(provider),
+            currency: cfg.currency,
+          }));
+
+          currentBalance = cached.availableBalance;
+          balanceMeta = {
+            fetchedAt: cached.fetchedAt,
+            ageMs: cached.ageMs,
+            stale: cached.stale,
+            warning: cached.warning,
+          };
+
+          if (cached.stale) {
+            console.warn(
+              `[provider-balance-reserve] ${provider} balance cache is stale ` +
+                `(${cached.ageMs}ms old)${cached.warning ? ` — ${cached.warning}` : ""}`,
+            );
+          }
         } catch (err) {
           console.error(
             `[provider-balance-reserve] Could not fetch balance for ${provider}: ${toErrorMessage(err)}`,
@@ -253,7 +304,7 @@ export class ProviderBalanceReserveService {
           );
         }
 
-        const snapshot = buildSnapshot(provider, currentBalance, cfg);
+        const snapshot = buildSnapshot(provider, currentBalance, cfg, balanceMeta);
         const forecast = buildForecast(provider, currentBalance, avgOutflow, cfg);
 
         snaps.push(snapshot);

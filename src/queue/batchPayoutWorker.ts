@@ -39,6 +39,7 @@ const PARALLEL_CONCURRENCY = parseInt(process.env.BATCH_PAYOUT_CONCURRENCY || "5
 const RATE_LIMIT_PER_SECOND = parseInt(process.env.BATCH_PAYOUT_RATE_LIMIT || "50", 10);
 const CIRCUIT_BREAKER_THRESHOLD = parseInt(process.env.BATCH_PAYOUT_CB_THRESHOLD || "10", 10);
 const CIRCUIT_BREAKER_RESET_MS = parseInt(process.env.BATCH_PAYOUT_CB_RESET_MS || "60000", 10);
+const PROGRESS_WEBHOOK_INTERVAL = parseInt(process.env.BATCH_PROGRESS_WEBHOOK_INTERVAL || "100", 10);
 
 interface PendingPayout {
   transactionId: string;
@@ -296,6 +297,8 @@ async function processBatchResults(
   batchOperationId: string,
 ): Promise<void> {
   const resultMap = new Map(results.map(r => [r.referenceId, r]));
+  const totalCount = payouts.length;
+  let processedCount = 0;
 
   const processor = new ParallelBatchProcessor({
     concurrency: PARALLEL_CONCURRENCY,
@@ -314,6 +317,20 @@ async function processBatchResults(
     const payout = item.payload;
     const result = resultMap.get(payout.transactionId);
     await processSinglePayoutResult(payout, result, batchOperationId);
+
+    processedCount++;
+
+    // Fire an intermediate progress webhook every PROGRESS_WEBHOOK_INTERVAL items
+    if (processedCount % PROGRESS_WEBHOOK_INTERVAL === 0 && processedCount < totalCount) {
+      await batchWebhookService.sendBatchIntermediateProgressWebhook(
+        batchOperationId,
+        processedCount,
+        totalCount,
+      ).catch(err => {
+        console.error(`[BatchPayoutWorker] Failed to send progress webhook at ${processedCount}/${totalCount}:`, err);
+      });
+    }
+
     return { transactionId: payout.transactionId };
   });
 
