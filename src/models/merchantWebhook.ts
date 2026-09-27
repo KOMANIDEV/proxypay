@@ -48,6 +48,10 @@ const ALLOWED_EVENTS = new Set([
   "transaction.failed",
   "transaction.pending",
   "transaction.cancelled",
+  // Batch operation events (Issue #626) — let merchant portals track batch progress.
+  "batch_started",
+  "batch_completed",
+  "batch_failed",
 ]);
 
 const MAX_WEBHOOKS_PER_USER = 10;

@@ -118,6 +118,36 @@ export interface FeeCalculationResult {
     appliedMinimum?: number;
     appliedMaximum?: number;
   };
+  /** Outcome of the post-calculation safety validation (Issue #623). */
+  validation: FeeValidationResult;
+}
+
+export interface FeeValidationResult {
+  /** Upper bound that was enforced for this calculation. */
+  appliedFeeCap: number;
+  /** True when the applied fee was reduced because it exceeded the cap. */
+  capped: boolean;
+  /** True when the raw fee was negative, non-finite or otherwise invalid. */
+  invalid: boolean;
+  /** Human readable explanations for every adjustment that was made. */
+  warnings: string[];
+}
+
+/**
+ * Global safety ceiling applied to calculated fees when a strategy does not
+ * declare its own `feeMaximum`. Expressed as a fraction of the transaction
+ * amount — the default is 1% (`0.01`).
+ *
+ * Overridable via `FEE_STRATEGY_MAX_FEE_RATE` for tenants with a different
+ * regulatory cap. Strategies that explicitly declare a `feeMaximum` are treated
+ * as pre-authorised bounds and keep their configured ceiling.
+ */
+export const DEFAULT_MAX_FEE_RATE = 0.01;
+
+export function getMaxFeeRate(): number {
+  const configured = Number(process.env.FEE_STRATEGY_MAX_FEE_RATE);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return DEFAULT_MAX_FEE_RATE;
 }
 
 export interface CreateFeeStrategyRequest {
@@ -535,9 +565,36 @@ export class FeeStrategyEngine {
     for (const strategy of candidates) {
       const result = this.applyStrategy(strategy, ctx.amount, evaluationTime);
       if (result !== null) {
-        const calcResult: FeeCalculationResult = {
-          fee: parseFloat(result.clampedFee.toFixed(2)),
-          total: parseFloat((ctx.amount + result.clampedFee).toFixed(2)),
+        const validation = this.validateCalculatedFee(
+          result.clampedFee,
+          ctx.amount,
+          strategy,
+        );
+        const fee = parseFloat(validation.fee.toFixed(2));
+
+        // Audit trail — every applied fee is logged with its provenance.
+        logger.info(
+          {
+            event: "fee_calculation",
+            amount: ctx.amount,
+            fee,
+            strategyId: strategy.id,
+            strategyName: strategy.name,
+            strategyType: strategy.strategyType,
+            scope: strategy.scope,
+            userId: ctx.userId,
+            provider: ctx.provider,
+            appliedFeeCap: validation.validation.appliedFeeCap,
+            capped: validation.validation.capped,
+            invalid: validation.validation.invalid,
+            warnings: validation.validation.warnings,
+          },
+          "[FeeStrategyEngine] fee calculation",
+        );
+
+        return {
+          fee,
+          total: parseFloat((ctx.amount + fee).toFixed(2)),
           strategyUsed: strategy.name,
           scopeUsed: strategy.scope,
           timeOverrideActive: strategy.strategyType === "time_based",
@@ -549,6 +606,7 @@ export class FeeStrategyEngine {
             appliedMinimum: result.appliedMinimum,
             appliedMaximum: result.appliedMaximum,
           },
+          validation: validation.validation,
         };
 
         // Persist audit record (non-fatal)
@@ -587,6 +645,85 @@ export class FeeStrategyEngine {
         strategyType: "flat",
         rawFee: 0,
         clampedFee: 0,
+      },
+      validation: {
+        appliedFeeCap: parseFloat((ctx.amount * getMaxFeeRate()).toFixed(2)),
+        capped: false,
+        invalid: false,
+        warnings: [],
+      },
+    };
+  }
+
+  /**
+   * Verify that a strategy's calculated fee is within acceptable bounds
+   * (Issue #623).
+   *
+   * Rules:
+   *   1. Fees must be finite and `>= 0` — invalid values fall back to `0`.
+   *   2. Fees must not exceed the effective cap:
+   *      - `strategy.feeMaximum` when the strategy declares one (an
+   *        operator-authored bound), otherwise
+   *      - `DEFAULT_MAX_FEE_RATE` of the transaction amount (1% by default).
+   *
+   * The raw fee is never mutated — the corrections are returned alongside the
+   * warnings so callers (and the audit log) can see exactly what happened.
+   */
+  private validateCalculatedFee(
+    fee: number,
+    amount: number,
+    strategy: FeeStrategy,
+  ): { fee: number; validation: FeeValidationResult } {
+    const warnings: string[] = [];
+    let validated = fee;
+    let invalid = false;
+    let capped = false;
+
+    const safetyCap = Math.max(0, amount) * getMaxFeeRate();
+    const appliedFeeCap =
+      strategy.feeMaximum !== undefined
+        ? Math.max(strategy.feeMaximum, 0)
+        : safetyCap;
+
+    if (!Number.isFinite(validated) || validated < 0) {
+      warnings.push(
+        `Calculated fee (${fee}) is invalid — negative or non-finite fees are not permitted; falling back to 0`,
+      );
+      validated = 0;
+      invalid = true;
+    }
+
+    if (validated > appliedFeeCap) {
+      warnings.push(
+        `Calculated fee (${validated}) exceeds the maximum allowed fee cap (${appliedFeeCap}); clamping to the cap`,
+      );
+      validated = appliedFeeCap;
+      capped = true;
+    }
+
+    if (warnings.length > 0) {
+      logger.warn(
+        {
+          event: "fee_calculation_validation",
+          amount,
+          strategyId: strategy.id,
+          strategyName: strategy.name,
+          requestedFee: fee,
+          appliedFee: validated,
+          appliedFeeCap,
+          warnings,
+        },
+        "[FeeStrategyEngine] fee calculation failed validation and was adjusted",
+      );
+    }
+
+    return {
+      fee: validated,
+      validation: {
+        appliedFeeCap: parseFloat(appliedFeeCap.toFixed(2)),
+        capped,
+        invalid,
+        warnings,
       },
     };
 

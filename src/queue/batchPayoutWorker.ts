@@ -345,7 +345,7 @@ async function processBatchResults(
   );
 
   // Send progress webhook if configured
-  await batchWebhookService.sendBatchCompletionWebhook(batchOperationId).catch(err => {
+  await batchWebhookService.sendBatchCompletedWebhook(batchOperationId).catch(err => {
     console.error(`[BatchPayoutWorker] Failed to send completion webhook:`, err);
   });
 }
@@ -376,6 +376,11 @@ async function processBatch(provider: string): Promise<void> {
   // Update batch operation status to processing
   await batchOperationModel.updateStatus(batchOperation.id, BatchOperationStatus.Processing);
 
+  // Notify merchants that the batch has started (Issue #626)
+  await batchWebhookService.sendBatchStartedWebhook(batchOperation.id).catch(err => {
+    console.error(`[BatchPayoutWorker] Failed to send batch_started webhook:`, err);
+  });
+
   // Create batch item records
   for (const payout of payouts) {
     await batchItemModel.create({
@@ -394,7 +399,22 @@ async function processBatch(provider: string): Promise<void> {
   }));
 
   const startTime = Date.now();
-  const result = await mobileMoneyService.sendBatchPayout(provider, batchItems);
+  let result: BatchPayoutResult;
+  try {
+    result = await mobileMoneyService.sendBatchPayout(provider, batchItems);
+  } catch (error) {
+    const errorMsg = getErrorMessage(error);
+    await batchOperationModel
+      .updateStatus(batchOperation.id, BatchOperationStatus.Failed)
+      .catch(() => undefined);
+    // Surface batch failure details to merchants (Issue #626)
+    await batchWebhookService
+      .sendBatchFailedWebhook(batchOperation.id, errorMsg)
+      .catch(err => {
+        console.error(`[BatchPayoutWorker] Failed to send batch_failed webhook:`, err);
+      });
+    throw error;
+  }
   const durationMs = Date.now() - startTime;
 
   // Record metrics
