@@ -255,6 +255,8 @@ POST /sep31/transactions              # SEP-31 cross-border
 
 # Admin
 GET  /api/admin/*                     # Admin dashboard endpoints
+GET  /api/admin/audit-logs            # Audit trail (filters: adminId, action, resource, from, to)
+GET  /api/admin/audit-logs/view       # Audit trail HTML viewer
 GET  /api/stats                       # Transaction statistics
 GET  /api/reconciliation              # Provider reconciliation
 GET  /metrics                         # Prometheus metrics
