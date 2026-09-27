@@ -24,6 +24,75 @@ export interface TrustlineResult {
 /** Stellar's maximum trustline limit string. */
 const MAX_TRUSTLINE_LIMIT = "922337203685.4775807";
 
+/**
+ * Minimum XLM balance required before a trustline can be created.
+ *
+ * Stellar charges 0.5 XLM reserve per new trustline.  We require the account
+ * to have at least 1 XLM available (above existing reserves) so the trustline
+ * reserve is covered with headroom for transaction fees.
+ *
+ * Issue #646 – accounts with insufficient balance caused on-chain failures.
+ */
+export const MINIMUM_XLM_FOR_TRUSTLINE = 1; // XLM
+
+/**
+ * Thrown when an account does not have enough XLM to cover the trustline
+ * reserve requirement.
+ */
+export class InsufficientBalanceError extends Error {
+  constructor(
+    public readonly publicKey: string,
+    public readonly availableXlm: number,
+    public readonly requiredXlm: number,
+  ) {
+    super(
+      `Insufficient XLM balance: ${availableXlm.toFixed(7)} XLM available, ` +
+        `${requiredXlm} XLM required to create a trustline`,
+    );
+    this.name = "InsufficientBalanceError";
+  }
+}
+
+/**
+ * Returns the available XLM balance for an account after deducting existing
+ * Stellar reserves (2 × base_reserve + 0.5 XLM × subentry_count).
+ */
+async function getAvailableXlmBalance(publicKey: string): Promise<number> {
+  const server = getStellarServer();
+  const account = await server.loadAccount(publicKey);
+
+  const nativeLine = account.balances.find((b) => b.asset_type === "native") as
+    | StellarSdk.Horizon.HorizonApi.BalanceLine<"native">
+    | undefined;
+
+  const nativeBalance = nativeLine ? parseFloat(nativeLine.balance) : 0;
+
+  // Stellar base reserve = 1 XLM (2 × 0.5 XLM for account + signing key)
+  const baseReserveXlm = 1;
+  // 0.5 XLM per existing sub-entry (trustlines, offers, data entries, signers)
+  const subentryCount = (account as any).subentry_count ?? 0;
+  const subentryReserveXlm = subentryCount * 0.5;
+
+  return nativeBalance - baseReserveXlm - subentryReserveXlm;
+}
+
+/**
+ * Asserts that `publicKey` has at least `minimumXlm` XLM available above its
+ * existing reserve obligations.  Throws {@link InsufficientBalanceError} when
+ * the check fails.
+ *
+ * @throws {InsufficientBalanceError} when available balance < minimumXlm
+ */
+export async function assertSufficientXlmBalance(
+  publicKey: string,
+  minimumXlm: number = MINIMUM_XLM_FOR_TRUSTLINE,
+): Promise<void> {
+  const available = await getAvailableXlmBalance(publicKey);
+  if (available < minimumXlm) {
+    throw new InsufficientBalanceError(publicKey, available, minimumXlm);
+  }
+}
+
 export async function hasTrustline(
   account: string,
   asset: StellarSdk.Asset,
@@ -59,6 +128,11 @@ export async function createTrustline(
   const { accountKeypair, asset, limit = MAX_TRUSTLINE_LIMIT } = params;
 
   const server = getStellarServer();
+
+  // Issue #646 – verify the account has enough XLM to cover the new trustline
+  // reserve (0.5 XLM) plus a headroom buffer before submitting on-chain.
+  await assertSufficientXlmBalance(accountKeypair.publicKey());
+
   const account = await server.loadAccount(accountKeypair.publicKey());
 
   const tx = new StellarSdk.TransactionBuilder(account, {
@@ -91,9 +165,13 @@ export async function createSponsoredTrustline(
   } = params;
 
   const server = getStellarServer();
+
+  // Issue #646 – for sponsored trustlines the reserve is paid by the sponsor,
+  // so we check the sponsor's available balance (not the user's account).
+  await assertSufficientXlmBalance(sponsorKeypair.publicKey());
+
   const sponsorAccount = await server.loadAccount(sponsorKeypair.publicKey());
   const userPublicKey = accountKeypair.publicKey();
-  const sponsorPublicKey = sponsorKeypair.publicKey();
 
   const tx = new StellarSdk.TransactionBuilder(sponsorAccount, {
     fee: StellarSdk.BASE_FEE,

@@ -44,12 +44,59 @@ worker:
     maxReplicas: 20
     cooldownPeriod: 60
     pollingInterval: 30
+    advanced:
+      restoreToOriginalReplicaCount: false
+      horizontalPodAutoscalerConfig:
+        behavior:
+          scaleUp:
+            stabilizationWindowSeconds: 60
+            policies:
+              - type: Percent
+                value: 100
+                periodSeconds: 60
+              - type: Pods
+                value: 4
+                periodSeconds: 60
+            selectPolicy: Max
+          scaleDown:
+            stabilizationWindowSeconds: 300
+            policies:
+              - type: Percent
+                value: 10
+                periodSeconds: 120
+            selectPolicy: Min
     triggers:
+      # Primary: Queue Depth
       prometheus:
         enabled: true
         serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: transaction_queue_depth_total
         query: sum(bullmq_queue_waiting{queue=~"transaction|webhook|notification"})
         threshold: "20"
+        activationThreshold: "5"
+      # Secondary: Transaction Processing Rate
+      processingRate:
+        enabled: true
+        serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: transaction_processing_rate
+        query: sum(rate(transaction_total{status="completed"}[5m]))
+        threshold: "10"
+        activationThreshold: "2"
+      # Tertiary: Worker Utilization
+      workerUtilization:
+        enabled: true
+        serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: worker_utilization_ratio
+        query: worker_utilization_ratio
+        threshold: "0.8"
+        activationThreshold: "0.5"
+      # Fallback: HTTP Queue Depth API
+      metricsApi:
+        enabled: true
+        url: "http://proxypay-service.default.svc.cluster.local:3000/health/queue/depth"
+        valueLocation: "total_depth"
+        targetValue: "20"
+        activationThreshold: "5"
       redis:
         enabled: false
         address: redis-service.default.svc.cluster.local:6379
@@ -85,6 +132,36 @@ hpa:
   minReplicas: 2
   maxReplicas: 10
   targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 120
+      selectPolicy: Min
+  customMetrics:
+    enabled: true
+    metrics:
+      - name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"
+      - name: http_request_duration_seconds_p95
+        target:
+          type: AverageValue
+          averageValue: "1"
 
 config:
   nodeEnv: production

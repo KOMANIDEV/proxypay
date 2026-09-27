@@ -20,6 +20,13 @@ db_instance_class    = "db.t3.micro"
 db_allocated_storage = 20
 db_multi_az          = false
 
+# Cross-region replication — off by default in staging to keep costs down.
+# Flip to true to exercise the DR replica in us-west-2.
+enable_cross_region_replica = false
+dr_region                   = "us-west-2"
+dr_db_instance_class        = "db.t3.micro"
+dr_db_allocated_storage     = 20
+
 # Redis — single node
 redis_node_type          = "cache.t3.micro"
 redis_num_cache_clusters = 1

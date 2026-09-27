@@ -67,4 +67,67 @@ describe("AirtelService", () => {
       payee: { msisdn: "670000002" },
     });
   });
+
+  describe("checkAuth", () => {
+    function createClient(postImpl: jest.Mock): any {
+      const client: any = {
+        post: postImpl,
+        get: jest.fn(),
+      };
+      mockedAxios.create.mockReturnValue(client as any);
+      return client;
+    }
+
+    it("reports success when a fresh OAuth token is obtained", async () => {
+      const client = createClient(jest.fn());
+      client.post.mockImplementation((url: string) => {
+        if (url === "/auth/oauth2/token") {
+          return Promise.resolve({
+            data: { access_token: "token-123", expires_in: 3600 },
+          });
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      });
+
+      const service = new AirtelService();
+
+      await expect(service.checkAuth()).resolves.toEqual({ success: true });
+    });
+
+    it("flags plain-error 401 messages as invalid credentials", async () => {
+      const client = createClient(jest.fn());
+      client.post.mockImplementation((url: string) => {
+        if (url === "/auth/oauth2/token") {
+          return Promise.reject(
+            new Error("Airtel direct auth failed with status 401"),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      });
+
+      const service = new AirtelService();
+
+      await expect(service.checkAuth()).resolves.toMatchObject({
+        success: false,
+        invalidCredentials: true,
+      });
+    });
+
+    it("does not flag network errors as invalid credentials", async () => {
+      const client = createClient(jest.fn());
+      client.post.mockImplementation((url: string) => {
+        if (url === "/auth/oauth2/token") {
+          return Promise.reject(new Error("ECONNREFUSED"));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      });
+
+      const service = new AirtelService();
+
+      await expect(service.checkAuth()).resolves.toMatchObject({
+        success: false,
+        invalidCredentials: false,
+      });
+    });
+  });
 });

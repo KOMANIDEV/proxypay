@@ -138,6 +138,11 @@ curl https://api.example.com/api/version
 
 ## Migration Guide: v1 to v2
 
+> 📖 **Full guide:** see [`API_V1_TO_V2_MIGRATION.md`](./API_V1_TO_V2_MIGRATION.md)
+> for the complete migration guide — every breaking change with before/after
+> examples, a step-by-step checklist, and the deprecation timeline. The summary
+> below is a quick reference.
+
 ### Breaking Changes in v2
 
 - Request/response structure changes

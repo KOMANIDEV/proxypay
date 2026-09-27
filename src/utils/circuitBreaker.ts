@@ -10,15 +10,30 @@ export interface CircuitBreakerActionResult<T> {
   data?: T;
   error?: unknown;
   provider?: string;
+  statusCode?: number;
+  failureType?: CircuitBreakerFailureType;
+  retryable?: boolean;
 }
 
-interface ExecuteWithCircuitBreakerOptions<T> {
+export type CircuitBreakerFailureType =
+  | "timeout"
+  | "network"
+  | "rate_limit"
+  | "server"
+  | "authentication"
+  | "client"
+  | "business"
+  | "unknown";
+
+export interface ExecuteWithCircuitBreakerOptions<T> {
   provider: string;
   operation: string;
   execute: () => Promise<CircuitBreakerActionResult<T>>;
   fallback?: (
     error: unknown,
   ) => Promise<CircuitBreakerActionResult<T>> | CircuitBreakerActionResult<T>;
+  failureDetector?: (result: CircuitBreakerActionResult<T>) => boolean;
+  healthCheck?: () => Promise<boolean>;
 }
 
 type BreakerInvocation<T> = () => Promise<CircuitBreakerActionResult<T>>;
@@ -43,8 +58,9 @@ function getCircuitKey(provider: string, operation: string): string {
   return `${provider}:${operation}`;
 }
 
+import { providerSettingsService } from "../services/providerSettingsService";
+
 async function getBreakerOptions(name: string, provider: string): Promise<CircuitBreakerOptions> {
-  const { providerSettingsService } = await import("../services/providerSettingsService.js");
   const settings = await providerSettingsService.getProviderSettings(provider);
 
   const timeoutMs = settings ? settings.timeout_ms : Number(process.env.PROVIDER_CIRCUIT_BREAKER_TIMEOUT_MS ?? 5_000);
@@ -99,19 +115,60 @@ function toExecutionError(error: unknown): Error {
   return new Error(typeof error === "string" ? error : "Provider call failed");
 }
 
+export function classifyCircuitBreakerFailure(
+  error: unknown,
+): CircuitBreakerFailureType {
+  const statusCode =
+    typeof error === "object" && error !== null && "statusCode" in error
+      ? Number((error as { statusCode?: unknown }).statusCode)
+      : undefined;
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+
+  if (/timeout|timed out|ETIMEDOUT|ECONNABORTED/i.test(`${code} ${message}`)) {
+    return "timeout";
+  }
+  if (/ECONNRESET|ECONNREFUSED|ENOTFOUND|network|socket|fetch failed/i.test(`${code} ${message}`)) {
+    return "network";
+  }
+  if (statusCode === 429) return "rate_limit";
+  if (statusCode !== undefined && statusCode >= 500) return "server";
+  if (statusCode === 401 || statusCode === 403) return "authentication";
+  if (statusCode !== undefined && statusCode >= 400) return "client";
+  return "unknown";
+}
+
+function shouldCountFailure<T>(
+  result: CircuitBreakerActionResult<T>,
+  detector?: (result: CircuitBreakerActionResult<T>) => boolean,
+): boolean {
+  if (detector) return detector(result);
+  if (result.success || result.retryable === false) return false;
+  return result.failureType !== "business" && result.failureType !== "client" && result.failureType !== "authentication";
+}
+
 function normalizeResult<T>(
   result: CircuitBreakerActionResult<T>,
+  detector?: (result: CircuitBreakerActionResult<T>) => boolean,
 ): CircuitBreakerActionResult<T> {
-  if (result.success) {
+  if (!shouldCountFailure(result, detector)) {
     return result;
   }
 
-  throw toExecutionError(result.error);
+  const error = toExecutionError(result.error);
+  if (!result.failureType) {
+    result.failureType = classifyCircuitBreakerFailure(result.error);
+  }
+  throw error;
 }
 
 async function getOrCreateCircuitBreaker<T>(
   provider: string,
   operation: string,
+  failureDetector?: (result: CircuitBreakerActionResult<T>) => boolean,
 ): Promise<ProviderCircuitBreaker<T>> {
   const key = getCircuitKey(provider, operation);
   const existing = circuitBreakers.get(key);
@@ -124,14 +181,20 @@ async function getOrCreateCircuitBreaker<T>(
   const breaker = new CircuitBreaker<
     [BreakerInvocation<T>, BreakerFallback<T> | undefined],
     CircuitBreakerActionResult<T>
-  >(async (execute) => normalizeResult(await execute()), options);
+  >(async (execute) => normalizeResult(await execute(), failureDetector), {
+    ...options,
+    errorFilter: (error) => {
+      const result = error as CircuitBreakerActionResult<T>;
+      return result?.failureType === "business" || result?.retryable === false;
+    },
+  });
 
   breaker.fallback(async (_execute, fallback, error) => {
     if (!fallback) {
       throw toExecutionError(error);
     }
 
-    return normalizeResult(await fallback(error));
+    return normalizeResult(await fallback(error), failureDetector);
   });
 
   breaker.on("open", () => {
@@ -158,6 +221,7 @@ export async function executeWithCircuitBreaker<T>(
   const breaker = await getOrCreateCircuitBreaker<T>(
     options.provider,
     options.operation,
+    options.failureDetector,
   );
 
   return breaker.fire(options.execute, options.fallback);
@@ -187,7 +251,15 @@ export function resetCircuitBreakerForProvider(provider: string): void {
   }
 }
 
-export async function checkAndResetCircuitBreaker(provider: string, operation: string): Promise<boolean> {
+export async function checkAndResetCircuitBreaker(
+  provider: string,
+  operation: string,
+  healthCheck: () => Promise<boolean> = async () => {
+    const healthResult = await checkMobileMoneyHealth();
+    const providerHealth = healthResult.providers[provider as keyof typeof healthResult.providers];
+    return providerHealth?.status === "up";
+  },
+): Promise<boolean> {
   const key = getCircuitKey(provider, operation);
   const breaker = circuitBreakers.get(key);
   if (!breaker) {
@@ -195,12 +267,10 @@ export async function checkAndResetCircuitBreaker(provider: string, operation: s
   }
 
   // Only reset if open
-  if ((breaker as any).opened) {
+  if (breaker.opened) {
     try {
-      const healthResult = await checkMobileMoneyHealth();
-      const providerHealth = healthResult.providers[provider as keyof typeof healthResult.providers];
-      if (providerHealth && providerHealth.status === "up") {
-        (breaker as any).close();
+      if (await healthCheck()) {
+        breaker.close();
         console.log(`Circuit breaker for ${provider}:${operation} reset due to health check`);
         return true;
       }
@@ -213,4 +283,26 @@ export async function checkAndResetCircuitBreaker(provider: string, operation: s
 
 export function getCircuitBreakerCount(): number {
   return circuitBreakers.size;
+}
+
+export type CircuitBreakerState = "closed" | "half_open" | "open";
+
+export function getCircuitBreakerState(
+  provider: string,
+  operation: string,
+): CircuitBreakerState | "not_found" {
+  const breaker = circuitBreakers.get(getCircuitKey(provider, operation));
+  if (!breaker) return "not_found";
+  if (breaker.opened) return "open";
+  if (breaker.halfOpen) return "half_open";
+  return "closed";
+}
+
+export function resetCircuitBreaker(provider: string, operation: string): boolean {
+  const key = getCircuitKey(provider, operation);
+  const breaker = circuitBreakers.get(key);
+  if (!breaker) return false;
+  breaker.shutdown();
+  circuitBreakers.delete(key);
+  return true;
 }

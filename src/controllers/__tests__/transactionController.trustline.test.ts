@@ -80,6 +80,7 @@ jest.mock("../../services/twoFactorWithdrawalService", () => ({
 jest.mock("../../config/providers", () => ({
   MobileMoneyProvider: {},
   validateProviderLimits: jest.fn().mockReturnValue({ valid: true }),
+  validateDepositAmount: jest.fn().mockReturnValue({ valid: true }),
 }));
 
 jest.mock("../../utils/phoneUtils", () => ({

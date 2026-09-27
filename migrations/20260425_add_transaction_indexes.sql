@@ -58,12 +58,17 @@ CREATE INDEX IF NOT EXISTS idx_transactions_status_created_covering
            stellar_address, user_id, updated_at);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 6. Partial unique index on idempotency_key (non-NULL rows only)
+-- 6. Partial index on idempotency_key (non-NULL rows only)
 --    Speeds up: TransactionModel.findActiveByIdempotencyKey() and
 --               releaseExpiredIdempotencyKey() — both filter by idempotency_key.
 --    Partial index keeps it small (only rows with an active key are indexed).
+--    NOTE: intentionally NOT UNIQUE — since 009_partition_transactions,
+--    transactions is partitioned and PostgreSQL requires a UNIQUE index on a
+--    partitioned table to include the partition key (created_at). The index
+--    was already created (non-unique) by 009 with the same name; uniqueness
+--    of idempotency_key is enforced by the application layer.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_idempotency_key
+CREATE INDEX IF NOT EXISTS idx_transactions_idempotency_key
   ON transactions (idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 
@@ -77,33 +82,47 @@ CREATE INDEX IF NOT EXISTS idx_transactions_idempotency_expires_at
 --    were never added to the migrations/ folder used by migrate:up.
 --    AMLAlertModel.list() filters by status, user_id, severity, created_at.
 --    AMLAlertModel.getAlertsByTransaction() filters by transaction_id.
+--    Guarded with to_regclass(): on a fresh database the table does not exist
+--    (it is created by a legacy script), so the chain must not fail here.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_aml_alerts_status
-  ON aml_alerts (status);
+DO $$
+BEGIN
+  IF to_regclass('aml_alerts') IS NOT NULL THEN
+    CREATE INDEX IF NOT EXISTS idx_aml_alerts_status
+      ON aml_alerts (status);
 
-CREATE INDEX IF NOT EXISTS idx_aml_alerts_user_id
-  ON aml_alerts (user_id);
+    CREATE INDEX IF NOT EXISTS idx_aml_alerts_user_id
+      ON aml_alerts (user_id);
 
-CREATE INDEX IF NOT EXISTS idx_aml_alerts_transaction_id
-  ON aml_alerts (transaction_id);
+    CREATE INDEX IF NOT EXISTS idx_aml_alerts_transaction_id
+      ON aml_alerts (transaction_id);
 
-CREATE INDEX IF NOT EXISTS idx_aml_alerts_severity
-  ON aml_alerts (severity);
+    CREATE INDEX IF NOT EXISTS idx_aml_alerts_severity
+      ON aml_alerts (severity);
 
--- Composite: list() most common filter — status + date range, newest first
-CREATE INDEX IF NOT EXISTS idx_aml_alerts_status_created
-  ON aml_alerts (status, created_at DESC);
+    -- Composite: list() most common filter — status + date range, newest first
+    CREATE INDEX IF NOT EXISTS idx_aml_alerts_status_created
+      ON aml_alerts (status, created_at DESC);
 
--- Composite: list() filter by user + status (AML review dashboard)
-CREATE INDEX IF NOT EXISTS idx_aml_alerts_user_status
-  ON aml_alerts (user_id, status);
+    -- Composite: list() filter by user + status (AML review dashboard)
+    CREATE INDEX IF NOT EXISTS idx_aml_alerts_user_status
+      ON aml_alerts (user_id, status);
+  END IF;
+END
+$$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 8. AML alert review history index
 --    getReviewHistory() queries by alert_id ORDER BY created_at DESC.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_aml_review_history_alert_id
-  ON aml_alert_review_history (alert_id);
+DO $$
+BEGIN
+  IF to_regclass('aml_alert_review_history') IS NOT NULL THEN
+    CREATE INDEX IF NOT EXISTS idx_aml_review_history_alert_id
+      ON aml_alert_review_history (alert_id);
 
-CREATE INDEX IF NOT EXISTS idx_aml_review_history_created_at
-  ON aml_alert_review_history (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_aml_review_history_created_at
+      ON aml_alert_review_history (created_at DESC);
+  END IF;
+END
+$$;

@@ -1,0 +1,66 @@
+# Cloud Run service YAML (managed platform).
+#
+# This is the declarative equivalent of the `gcloud run deploy` step in
+# cloudbuild.yaml. Apply it after building/pushing the image:
+#
+#   gcloud run services replace cloud-run/service.yaml --region=us-central1
+#
+# Secrets (DATABASE_URL etc.) are intentionally NOT inlined here. The
+# recommended path is to pass them as environment variables / secret refs via
+# the deployment script (scripts/deploy-cloud-run.sh) or the Cloud Console.
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: proxypay
+  labels:
+    app: proxypay
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "3"
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      containers:
+        - image: us-central1-docker.pkg.dev/PROJECT_ID/proxypay/proxypay:latest
+          name: proxypay
+          ports:
+            - name: http1
+              containerPort: 3000
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3000"
+            - name: STELLAR_NETWORK
+              value: "testnet"
+            - name: STELLAR_HORIZON_URL
+              value: "https://horizon-testnet.stellar.org"
+            - name: GRAPHQL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: proxypay-secrets
+                  key: GRAPHQL_API_KEY
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120

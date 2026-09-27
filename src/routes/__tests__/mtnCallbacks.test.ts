@@ -11,6 +11,7 @@ jest.mock("../../config/appConfig", () => ({
 const request = require("supertest");
 const express = require("express");
 import mtnCallbacksRouter from "../mtnCallbacks";
+import { errorHandler } from "../../middleware/errorHandler";
 import { createHmac } from "crypto";
 
 function buildSignature(payload: string, secret: string): string {
@@ -30,6 +31,7 @@ describe("MTN Callback Signature Verification", () => {
       }),
     );
     app.use("/api/mtn", mtnCallbacksRouter);
+    app.use(errorHandler);
   });
 
   it("accepts a valid MTN callback signature", async () => {
@@ -52,7 +54,11 @@ describe("MTN Callback Signature Verification", () => {
       .send({ status: "incoming" })
       .expect(401);
 
-    expect(response.body).toEqual({ error: "Unauthorized callback" });
+    expect(response.body).toMatchObject({
+      error: "Unauthorized callback",
+      code: "UNAUTHORIZED",
+      statusCode: 401,
+    });
   });
 
   it("rejects a callback with an invalid signature", async () => {
@@ -65,6 +71,10 @@ describe("MTN Callback Signature Verification", () => {
       .send(payload)
       .expect(401);
 
-    expect(response.body).toEqual({ error: "Unauthorized callback" });
+    expect(response.body).toMatchObject({
+      error: "Unauthorized callback",
+      code: "UNAUTHORIZED",
+      statusCode: 401,
+    });
   });
 });

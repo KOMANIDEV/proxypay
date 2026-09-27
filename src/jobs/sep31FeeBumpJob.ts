@@ -4,11 +4,20 @@ import { Sep31Status, mapToSep31Status, isValidTransition } from "../stellar/sep
 import { getStellarServer, getNetworkPassphrase } from "../config/stellar";
 import * as StellarSdk from "stellar-sdk";
 import { getConfiguredPaymentAsset } from "../services/stellar/assetService";
+import {
+  createFeeBumpAttempt,
+  submitFeeBumpWithRetry,
+  manualRetryFeeBump,
+  getFeeBumpRecoveryStats,
+} from "../services/feeBumpRecoveryService";
 
 /**
  * SEP-31 Fee Bump Job
  * Schedule: Every 30 seconds
  * Monitors SEP-31 transactions stuck in pending_stellar and bumps fees if needed.
+ *
+ * Uses feeBumpRecoveryService for exponential-backoff retries, dead-letter
+ * queue routing, and audit logging so failures no longer go silently unnoticed.
  */
 export async function runSep31FeeBumpJob(): Promise<void> {
   const transactionModel = new TransactionModel();
@@ -39,28 +48,85 @@ export async function runSep31FeeBumpJob(): Promise<void> {
         const isConfirmed = await checkTransactionConfirmed(server, transactionHash);
         if (isConfirmed) {
           console.log(`[sep31-fee-bump] Transaction ${row.id} (${transactionHash}) is now confirmed`);
-          // Update status to pending_receiver
           await updateSep31Status(row.id, Sep31Status.PendingReceiver, metadata);
           continue;
         }
 
-        // Transaction is still pending, attempt fee bump
-        const feeBumpCount = sep31Meta.feeBumps?.length || 0;
-        if (feeBumpCount >= 3) { // Max 3 fee bumps
-          console.warn(`[sep31-fee-bump] Transaction ${row.id} reached max fee bumps, marking as error`);
-          await updateSep31Status(row.id, Sep31Status.Error, metadata);
-          continue;
-        }
+        // Use feeBumpRecoveryService to attempt fee bump with exponential backoff,
+        // dead-letter routing, and structured audit logging.
+        const feeBumpAttempt = await createFeeBumpAttempt({
+          transactionId: row.id,
+          originalHash: transactionHash,
+          feeAmount: StellarSdk.BASE_FEE,
+        });
 
-        await performSep31FeeBump(row.id, row.stellar_address, row.amount, metadata, server);
-        console.log(`[sep31-fee-bump] Performed fee bump for SEP-31 transaction ${row.id}`);
+        const feeAccount = process.env.STELLAR_FEE_BUMP_SECRET
+          ? StellarSdk.Keypair.fromSecret(process.env.STELLAR_FEE_BUMP_SECRET).publicKey()
+          : "";
+
+        const recoveryResult = await submitFeeBumpWithRetry(feeBumpAttempt.id, feeAccount);
+
+        if (recoveryResult.status === "confirmed") {
+          console.log(
+            `[sep31-fee-bump] Fee bump confirmed for ${row.id} via recovery service (hash: ${recoveryResult.fee_bump_hash})`,
+          );
+          const updatedMetadata = {
+            ...metadata,
+            sep31: {
+              ...sep31Meta,
+              transactionHash: recoveryResult.fee_bump_hash ?? transactionHash,
+              submittedAt: new Date().toISOString(),
+              feeBumps: [
+                ...(sep31Meta.feeBumps || []),
+                {
+                  previousHash: transactionHash,
+                  newHash: recoveryResult.fee_bump_hash,
+                  bumpedAt: new Date().toISOString(),
+                },
+              ],
+            },
+          };
+          await transactionModel.updateMetadata(row.id, updatedMetadata);
+        } else if (recoveryResult.status === "dead_letter") {
+          console.error(
+            `[sep31-fee-bump] Transaction ${row.id} moved to dead-letter queue after max retries`,
+          );
+          await updateSep31Status(row.id, Sep31Status.Error, metadata);
+        } else {
+          console.log(
+            `[sep31-fee-bump] Fee bump for ${row.id} scheduled for retry (status: ${recoveryResult.status})`,
+          );
+        }
       } catch (error) {
         console.error(`[sep31-fee-bump] Error processing SEP-31 transaction ${row.id}:`, error);
       }
     }
+
+    // Log aggregate recovery stats for observability
+    try {
+      const stats = await getFeeBumpRecoveryStats();
+      console.log(
+        `[sep31-fee-bump] Recovery stats — total: ${stats.total}, confirmed: ${stats.confirmed}, ` +
+          `failed: ${stats.failed}, dead_letter: ${stats.dead_letter}, success_rate: ${(stats.success_rate * 100).toFixed(1)}%`,
+      );
+    } catch (statsErr) {
+      console.warn("[sep31-fee-bump] Could not fetch recovery stats:", statsErr);
+    }
   } catch (error) {
     console.error("[sep31-fee-bump] Job failed:", error);
   }
+}
+
+/**
+ * Manually retry a dead-lettered fee bump attempt.
+ * Exposed for use by admin endpoints.
+ */
+export async function retryDeadLetteredFeeBump(attemptId: string): Promise<void> {
+  const feeAccount = process.env.STELLAR_FEE_BUMP_SECRET
+    ? StellarSdk.Keypair.fromSecret(process.env.STELLAR_FEE_BUMP_SECRET).publicKey()
+    : "";
+  await manualRetryFeeBump(attemptId, feeAccount);
+  console.log(`[sep31-fee-bump] Manual retry triggered for dead-letter attempt ${attemptId}`);
 }
 
 async function checkTransactionConfirmed(server: StellarSdk.Horizon.Server, hash: string): Promise<boolean> {

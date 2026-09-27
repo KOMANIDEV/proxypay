@@ -1,4 +1,4 @@
-import { PagerDutyService, createPagerDutyService } from "../services/pagerDutyService";
+import { PagerDutyService, createPagerDutyService } from "../pagerDutyService";
 
 describe("PagerDutyService", () => {
   let service: PagerDutyService;

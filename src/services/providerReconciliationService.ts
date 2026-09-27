@@ -7,7 +7,7 @@ export interface ProviderReportConfig {
   id: string;
   provider: string;
   is_enabled: boolean;
-  download_method: 'api' | 'manual'; // Simplified for now
+  download_method: 'api' | 'manual';
   api_endpoint?: string;
   api_key?: string;
   api_secret?: string;
@@ -52,8 +52,34 @@ export interface ReconciliationAlert {
   reviewed_at?: string;
 }
 
+export interface ReconciliationReport {
+  run: ReconciliationRun;
+  alerts: ReconciliationAlert[];
+  summary: {
+    totalTransactions: number;
+    matchedCount: number;
+    discrepancyCount: number;
+    orphanedProviderCount: number;
+    orphanedDbCount: number;
+    matchRate: string;
+    autoCorrections: number;
+    pendingReview: number;
+  };
+  generatedAt: Date;
+}
+
+/**
+ * Status values that are safe to auto-correct from provider records.
+ * These are statuses where the provider's view is authoritative.
+ */
+const SAFE_STATUS_CORRECTIONS: Record<string, string[]> = {
+  // If provider says completed but we have pending, it's safe to update
+  pending: ['completed', 'failed'],
+  // If provider says failed but we have pending, it's safe to update
+  failed: ['completed'],
+};
+
 export class ProviderReconciliationService {
-  // S3 client removed for simplicity - can be added back later
 
   /**
    * Get provider report configurations
@@ -147,6 +173,9 @@ export class ProviderReconciliationService {
 
       const result = await reconcileTransactions(providerRows, dateRange);
 
+      // Attempt automatic corrections for safe status mismatches
+      const autoCorrections = await this.autoCorrectDiscrepancies(result.discrepancies);
+
       // Update reconciliation run with results
       await queryWrite(`
         UPDATE provider_reconciliation_runs
@@ -164,18 +193,30 @@ export class ProviderReconciliationService {
       `, [
         result.total_provider_rows,
         result.total_db_records,
-        result.summary.total_matched,
-        result.summary.total_discrepancies,
+        result.summary.total_matched + autoCorrections.corrected,
+        result.summary.total_discrepancies - autoCorrections.corrected,
         result.summary.total_orphaned_provider,
         result.summary.total_orphaned_db,
-        parseFloat(result.summary.match_rate),
+        parseFloat(result.summary.match_rate) + (autoCorrections.corrected / Math.max(result.total_provider_rows, 1) * 100),
         reconciliationRun.id
       ]);
 
-      // Create alerts for discrepancies
-      await this.createReconciliationAlerts(reconciliationRun.id, result);
+      // Create alerts for remaining discrepancies (after auto-corrections)
+      const remainingDiscrepancies = result.discrepancies.filter(
+        d => !autoCorrections.correctedRefs.has(d.reference_number)
+      );
+      await this.createReconciliationAlerts(reconciliationRun.id, {
+        ...result,
+        discrepancies: remainingDiscrepancies,
+      });
 
-      logger.info(`Reconciliation completed for ${provider}: ${result.summary.match_rate} match rate`);
+      // Generate and store reconciliation report
+      const report = await this.generateReconciliationReport(reconciliationRun.id, {
+        ...result,
+        discrepancies: remainingDiscrepancies,
+      }, autoCorrections.corrected);
+
+      logger.info(`Reconciliation completed for ${provider}: ${result.summary.match_rate} match rate, ${autoCorrections.corrected} auto-corrections`);
 
       // Return updated run
       const updatedResult = await queryRead(`
@@ -201,6 +242,104 @@ export class ProviderReconciliationService {
   }
 
   /**
+   * Automatically correct safe status mismatches.
+   * Only corrects transitions that are clearly safe (e.g., pending -> completed when provider confirms).
+   */
+  private async autoCorrectDiscrepancies(
+    discrepancies: any[]
+  ): Promise<{ corrected: number; correctedRefs: Set<string>; corrections: any[] }> {
+    const correctedRefs = new Set<string>();
+    const corrections: any[] = [];
+
+    for (const discrepancy of discrepancies) {
+      if (discrepancy.discrepancy_type !== 'status_mismatch') {
+        continue; // Only auto-correct status mismatches, not amount mismatches
+      }
+
+      const dbStatus = discrepancy.db_record?.status?.toLowerCase();
+      const providerStatus = discrepancy.provider_record?.status?.toLowerCase();
+
+      if (!dbStatus || !providerStatus) continue;
+
+      const safeStatuses = SAFE_STATUS_CORRECTIONS[dbStatus];
+      if (safeStatuses && safeStatuses.includes(providerStatus)) {
+        try {
+          // Update the transaction status in the database
+          await queryWrite(`
+            UPDATE transactions 
+            SET status = $1, updated_at = NOW(), metadata = jsonb_set(
+              COALESCE(metadata, '{}'),
+              '{reconciliation}',
+              '{"auto_corrected": true, "corrected_at": "' + NOW().toISOString() + '", "previous_status": "' || $2 || '"}'
+            )
+            WHERE id = $3
+          `, [providerStatus, dbStatus, discrepancy.db_record?.id]);
+
+          correctedRefs.add(discrepancy.reference_number);
+          corrections.push({
+            referenceNumber: discrepancy.reference_number,
+            transactionId: discrepancy.db_record?.id,
+            previousStatus: dbStatus,
+            correctedStatus: providerStatus,
+            correctedAt: new Date().toISOString(),
+          });
+
+          logger.info(`Auto-corrected status for transaction ${discrepancy.reference_number}: ${dbStatus} -> ${providerStatus}`);
+        } catch (error) {
+          logger.error(error, `Failed to auto-correct status for ${discrepancy.reference_number}`);
+        }
+      }
+    }
+
+    return {
+      corrected: correctedRefs.size,
+      correctedRefs,
+      corrections,
+    };
+  }
+
+  /**
+   * Generate a detailed reconciliation report
+   */
+  private async generateReconciliationReport(
+    runId: string,
+    result: any,
+    autoCorrectionCount: number
+  ): Promise<void> {
+    const report = {
+      runId,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        totalProviderRows: result.total_provider_rows,
+        totalDbRecords: result.total_db_records,
+        matchedCount: result.summary.total_matched,
+        discrepancyCount: result.summary.total_discrepancies,
+        orphanedProviderCount: result.summary.total_orphaned_provider,
+        orphanedDbCount: result.summary.total_orphaned_db,
+        matchRate: result.summary.match_rate,
+        autoCorrections: autoCorrectionCount,
+      },
+      discrepanciesByType: {
+        amountMismatches: result.discrepancies.filter((d: any) => d.discrepancy_type === 'amount_mismatch').length,
+        statusMismatches: result.discrepancies.filter((d: any) => d.discrepancy_type === 'status_mismatch').length,
+      },
+      highPriorityItems: result.discrepancies.filter((d: any) => {
+        const amount = Math.abs(parseFloat(d.db_record?.amount) || 0);
+        return amount > 100 || d.discrepancy_type === 'amount_mismatch';
+      }).length,
+    };
+
+    // Store report in reconciliation_reports table
+    await queryWrite(`
+      UPDATE reconciliation_reports 
+      SET summary = $1 
+      WHERE id = $2
+    `, [JSON.stringify(report), runId]);
+
+    logger.info(`Generated reconciliation report for run ${runId}`);
+  }
+
+  /**
    * Create alerts for reconciliation discrepancies
    */
   private async createReconciliationAlerts(runId: string, result: any): Promise<void> {
@@ -208,8 +347,8 @@ export class ProviderReconciliationService {
 
     // Create alerts for amount/status mismatches
     for (const discrepancy of result.discrepancies) {
-      const alertType = discrepancy.amount ? 'amount_mismatch' : 'status_mismatch';
-      const severity = Math.abs(discrepancy.amount || 0) > 100 ? 'high' : 'medium';
+      const alertType = discrepancy.discrepancy_type === 'amount_mismatch' ? 'amount_mismatch' : 'status_mismatch';
+      const severity = discrepancy.discrepancy_type === 'amount_mismatch' ? 'high' : 'medium';
 
       alerts.push({
         reconciliation_run_id: runId,
@@ -339,5 +478,83 @@ export class ProviderReconciliationService {
 
     const result = await queryRead(query, params);
     return result.rows;
+  }
+
+  /**
+   * Get unreconciled transactions (transactions older than X days without reconciliation)
+   */
+  async getUnreconciledTransactions(daysOld: number = 7): Promise<any[]> {
+    const result = await queryRead(`
+      SELECT 
+        t.id,
+        t.reference_number,
+        t.amount::text as amount,
+        t.status,
+        t.provider,
+        t.created_at,
+        t.updated_at
+      FROM transactions t
+      WHERE t.created_at < NOW() - INTERVAL '${daysOld} days'
+        AND t.status IN ('pending', 'completed')
+        AND NOT EXISTS (
+          SELECT 1 FROM reconciliation_discrepancies rd
+          WHERE rd.transaction_id = t.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM provider_reconciliation_alerts pra
+          WHERE pra.transaction_id = t.id
+        )
+      ORDER BY t.created_at ASC
+      LIMIT 100
+    `);
+
+    return result.rows;
+  }
+
+  /**
+   * Generate daily reconciliation summary for alerting
+   */
+  async getDailyReconciliationSummary(date: Date): Promise<{
+    date: string;
+    totalProviders: number;
+    completedReconciliations: number;
+    failedReconciliations: number;
+    totalAlerts: number;
+    criticalAlerts: number;
+    highAlerts: number;
+    totalAutoCorrections: number;
+  }> {
+    const dateStr = date.toISOString().split('T')[0];
+
+    const runsResult = await queryRead(`
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+        COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
+      FROM provider_reconciliation_runs
+      WHERE report_date = $1
+    `, [dateStr]);
+
+    const alertsResult = await queryRead(`
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN severity = 'critical' THEN 1 END) as critical,
+        COUNT(CASE WHEN severity = 'high' THEN 1 END) as high
+      FROM provider_reconciliation_alerts pra
+      JOIN provider_reconciliation_runs prr ON pra.reconciliation_run_id = prr.id
+      WHERE prr.report_date = $1
+        AND pra.status = 'pending_review'
+    `, [dateStr]);
+
+    return {
+      date: dateStr,
+      totalProviders: runsResult.rows[0]?.total || 0,
+      completedReconciliations: runsResult.rows[0]?.completed || 0,
+      failedReconciliations: runsResult.rows[0]?.failed || 0,
+      totalAlerts: alertsResult.rows[0]?.total || 0,
+      criticalAlerts: alertsResult.rows[0]?.critical || 0,
+      highAlerts: alertsResult.rows[0]?.high || 0,
+      totalAutoCorrections: 0, // Would need to track this in the runs
+    };
   }
 }

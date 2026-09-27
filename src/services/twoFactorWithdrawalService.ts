@@ -27,13 +27,25 @@ export class TwoFactorWithdrawalService {
   /**
    * Check if user requires 2FA for withdrawals
    */
-  async requires2FAForWithdrawal(userId: string): Promise<boolean> {
+  async requires2FAForWithdrawal(userId: string, amount?: number): Promise<boolean> {
     const user = await this.userModel.findById(userId);
     if (!user) {
       throw new Error('User not found');
     }
 
-    return user.mandatory2FAWithdrawals === true;
+    // Require 2FA if explicitly set to mandatory, or globally enabled and over high-value threshold ($1000)
+    if (user.mandatory2FAWithdrawals === true) {
+      return true;
+    }
+
+    if (is2FAEnabled(user)) {
+      if (amount !== undefined && amount >= 1000) {
+        return true;
+      }
+      return user.mandatory2FAWithdrawals ?? true;
+    }
+
+    return false;
   }
 
   /**

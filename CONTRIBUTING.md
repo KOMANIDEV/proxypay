@@ -315,7 +315,11 @@ Once approved:
 
 ## 🎯 Good First Issues
 
-New to the project? Look for issues labeled `good first issue`:
+New to the project? Look for issues labeled `good first issue`.
+
+A curated catalog of 25 beginner-friendly tasks — each with clear scope,
+acceptance criteria, and a named mentor — lives in
+[docs/GOOD_FIRST_ISSUES.md](docs/GOOD_FIRST_ISSUES.md).
 
 **Examples:**
 - Add input validation

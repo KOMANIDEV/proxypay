@@ -26,12 +26,14 @@ declare module "opossum" {
     );
 
     fire(...args: TArgs): Promise<TResult>;
+    close(): void;
     fallback(
       func: (...args: [...TArgs, unknown]) => Promise<TResult> | TResult,
     ): this;
     shutdown(): void;
 
     readonly closed: boolean;
+    readonly opened: boolean;
     readonly halfOpen: boolean;
     readonly open: boolean;
   }

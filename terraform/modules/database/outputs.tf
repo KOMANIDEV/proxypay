@@ -23,3 +23,26 @@ output "db_connection_url" {
   value       = "postgresql://${aws_db_instance.main.username}:${var.db_password}@${aws_db_instance.main.endpoint}/${aws_db_instance.main.db_name}"
   sensitive   = true
 }
+
+output "dr_db_endpoint" {
+  description = "Cross-region replica endpoint (host:port), empty when disabled"
+  value       = var.enable_cross_region_replica ? aws_db_instance.dr_replica[0].endpoint : ""
+}
+
+output "dr_db_address" {
+  description = "Cross-region replica hostname, empty when disabled"
+  value       = var.enable_cross_region_replica ? aws_db_instance.dr_replica[0].address : ""
+}
+
+output "dr_db_arn" {
+  description = "ARN of the cross-region replica (used for promotion), empty when disabled"
+  value       = var.enable_cross_region_replica ? aws_db_instance.dr_replica[0].arn : ""
+}
+
+output "dr_db_connection_url" {
+  description = "PostgreSQL connection URL for the cross-region replica"
+  value       = var.enable_cross_region_replica
+    ? "postgresql://${aws_db_instance.main.username}:${var.db_password}@${aws_db_instance.dr_replica[0].endpoint}/${aws_db_instance.main.db_name}"
+    : ""
+  sensitive   = true
+}

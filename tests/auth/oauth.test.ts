@@ -1,5 +1,6 @@
 import express from "express";
 import request from "supertest";
+import jwt from "jsonwebtoken";
 import {
   createOAuthRouter,
   createOAuthTokenStore,
@@ -207,5 +208,82 @@ describe("OAuth2 routes", () => {
       clientId: "test-client",
       scopes: ["reports:read", "stats:read"],
     });
+  });
+
+  it("introspects a valid access token with scope and expiration", async () => {
+    const app = createTestApp();
+    const authorizeResponse = await request(app)
+      .get("/oauth/authorize")
+      .set("X-API-Key", "test-admin-key")
+      .query({
+        response_type: "code",
+        client_id: "test-client",
+        redirect_uri: "http://localhost:3000/oauth/callback",
+        subject: "user-introspect",
+        scope: "reports:read stats:read",
+      });
+    const code = new URL(authorizeResponse.headers.location).searchParams.get(
+      "code",
+    );
+    const tokenResponse = await request(app)
+      .post("/oauth/token")
+      .type("form")
+      .send({
+        grant_type: "authorization_code",
+        client_id: "test-client",
+        client_secret: "test-secret",
+        redirect_uri: "http://localhost:3000/oauth/callback",
+        code,
+      });
+
+    const response = await request(app)
+      .post("/oauth/introspect")
+      .type("form")
+      .send({
+        token: tokenResponse.body.access_token,
+        client_id: "test-client",
+        client_secret: "test-secret",
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      active: true,
+      client_id: "test-client",
+      sub: "user-introspect",
+      scope: "reports:read stats:read",
+      token_type: "Bearer",
+    });
+    expect(response.body.exp).toBeGreaterThan(response.body.iat);
+  });
+
+  it("returns inactive for invalid and expired access tokens", async () => {
+    const app = createTestApp();
+    const expiredToken = jwt.sign(
+      {
+        client_id: "test-client",
+        scope: "reports:read",
+        token_use: "access",
+        role: "oauth-client",
+      },
+      process.env.OAUTH_JWT_SECRET,
+      {
+        algorithm: "HS256",
+        subject: "expired-user",
+        audience: process.env.OAUTH_AUDIENCE,
+        issuer: process.env.OAUTH_ISSUER,
+        expiresIn: -1,
+      },
+    );
+
+    for (const token of ["not-a-jwt", expiredToken]) {
+      const response = await request(app).post("/oauth/introspect").send({
+        token,
+        client_id: "test-client",
+        client_secret: "test-secret",
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ active: false });
+    }
   });
 });

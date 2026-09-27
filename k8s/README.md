@@ -32,6 +32,12 @@ This directory contains the manifests required to deploy the Mobile Money to Ste
     kubectl get svc proxypay-service
    ```
 
+6. Local Postgres Replica (dev clusters only):
+   `k8s/postgres-replica.yaml` starts a hot-standby streaming replica of the
+   dev `postgres-service` primary using a `pg_basebackup` initContainer.
+   Point the app at it with `READ_REPLICA_URL=postgresql://user:password@postgres-replica-service:5432/mobile_money`
+   to exercise replication lag monitoring and read routing locally.
+
 ## Autoscaling
 
 The Horizontal Pod Autoscaler is configured to scale between 2 and 10 replicas based on a target CPU utilization of 80%.

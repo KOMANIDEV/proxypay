@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main, develop]
   schedule:
-    - cron: '0 0 * * *' # Daily certificate check
+    - cron: "0 0 * * *" # Daily certificate check
 
 jobs:
   cert-check:
@@ -171,8 +171,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate migration files (static checks)
+        run: npm run migrate:validate
+        continue-on-error: false
+
+      - name: Dry-run migrations against a fresh database
+        run: npm run migrate:dry-run
+        continue-on-error: false
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+
       - name: Run database migrations
         run: npm run migrate:up
+        continue-on-error: false
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+
+      - name: Run migration integration tests (up/down + per-migration rollback)
+        run: npm run test:migrations
         continue-on-error: false
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db

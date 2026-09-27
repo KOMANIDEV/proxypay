@@ -1,6 +1,29 @@
 import { Request, Response, NextFunction } from "express";
 import { UAParser } from "ua-parser-js";
 import logger, { childLogger } from "../utils/logger";
+import { redact } from "../utils/redact";
+
+const MAX_LOGGED_PAYLOAD_BYTES = 8 * 1024;
+
+function safePayload(value: unknown): unknown {
+  if (value === undefined) return undefined;
+
+  try {
+    const redacted = redact(value);
+    const serialized = JSON.stringify(redacted);
+
+    if (Buffer.byteLength(serialized, "utf8") <= MAX_LOGGED_PAYLOAD_BYTES) {
+      return redacted;
+    }
+
+    return {
+      truncated: true,
+      preview: serialized.slice(0, MAX_LOGGED_PAYLOAD_BYTES),
+    };
+  } catch {
+    return "[UNSERIALIZABLE]";
+  }
+}
 
 /**
  * Request pathname without query string (avoids logging ?api_key=…, ?token=…, etc.).
@@ -56,9 +79,9 @@ function parseUserAgent(uaString: string | undefined): ParsedUserAgent {
 }
 
 /**
- * Logs each completed HTTP request. Uses pathname only (no query string),
- * and does not log headers or body, so API keys, tokens, and secrets in
- * URLs or payloads are not written to logs.
+ * Logs each completed HTTP request. Query parameters and request bodies are
+ * recursively redacted and bounded so API keys, tokens, and large payloads
+ * are not written to logs.
  *
  * User-Agent is parsed for analytics (browser/device) but no IP addresses,
  * cookies, or auth tokens are captured.
@@ -85,16 +108,28 @@ export function requestLogger(
       (req.headers["x-request-id"] as string | undefined);
 
     const reqLogger = traceId ? childLogger(traceId) : logger;
+    const requestWithId = req as Request & {
+      id?: string;
+      user?: { id?: string };
+    };
 
     reqLogger.info({
       event: { dataset: "http.request" },
+      requestId: requestWithId.id ?? traceId,
       method: req.method,
       path: loggedPath(req),
+      query: safePayload(req.query),
+      requestBody: safePayload(req.body),
+      userId: requestWithId.user?.id,
       statusCode: res.statusCode,
       responseTimeMs: Math.round(responseTimeMs * 1000) / 1000,
       http: {
         request: { method: req.method },
-        response: { status_code: res.statusCode },
+        response: {
+          status_code: res.statusCode,
+          content_type: res.getHeader("content-type"),
+          content_length: res.getHeader("content-length"),
+        },
       },
       userAgent: parseUserAgent(req.headers["user-agent"]),
     });

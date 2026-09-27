@@ -4,6 +4,7 @@ import { ERROR_CODES, getHttpStatus } from "../constants/errorCodes";
 import { getLocalizedMessage } from "../locales/messages";
 import { resolveLocale, resolveLocaleFromRequest } from "../utils/i18n";
 import logger from "../utils/logger";
+import { maskPIIDeep, maskPIIInText } from "../utils/masking";
 
 /**
  * Extended Error interface with error-specific properties.
@@ -174,15 +175,17 @@ export const errorHandler = (
 
   const requestId = err.requestId || (req as any).requestId || undefined;
 
+  const maskedMessage = err.message ? maskPIIInText(err.message) : err.message;
+
   logger.error({
     requestId,
     code: errorCode,
-    message: err.message,
-    stack: err.stack,
+    message: maskedMessage,
+    stack: err.stack ? maskPIIInText(err.stack) : err.stack,
     statusCode,
   }, 'Request Error');
 
-  const details = extractLegacyDetails(err);
+  const details = maskPIIDeep(extractLegacyDetails(err)) as Record<string, unknown>;
   const body: ErrorResponse & { statusCode: number; error?: string } = {
     code: errorCode,
     message: localizedMessage,
@@ -195,8 +198,8 @@ export const errorHandler = (
 
   if (details && typeof details === "object" && typeof details.error === "string") {
     body.error = details.error;
-  } else if (err.message) {
-    body.error = err.message;
+  } else if (maskedMessage) {
+    body.error = maskedMessage;
   } else {
     body.error = englishMessage;
   }

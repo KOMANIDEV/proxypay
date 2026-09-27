@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { fraudService, FraudTransactionInput, FraudResult } from '../services/fraud';
 import { Transaction, TransactionStatus } from '../models/transaction';
 import { TransactionModel } from '../models/transaction';
+import logger from '../utils/logger';
 
 /**
  * Fraud Detection Middleware
@@ -55,7 +56,7 @@ export class FraudDetectionMiddleware {
       // Continue with normal processing
       next();
     } catch (error) {
-      console.error('Fraud detection middleware error:', error);
+      logger.error({ err: error }, 'Fraud detection middleware error');
       // Continue processing even if fraud detection fails
       next();
     }
@@ -139,14 +140,16 @@ export class FraudDetectionMiddleware {
       // Set transaction to Review status
       await fraudService.setTransactionToReview(transactionId);
       
-      console.log(`Transaction ${transactionId} flagged for review:`, {
+      logger.warn({
+        transactionId,
         score: fraudResult.score,
         riskLevel: fraudResult.riskLevel,
         reasons: fraudResult.reasons,
-        heuristicsTriggered: fraudResult.heuristicsTriggered
-      });
+        heuristicsTriggered: fraudResult.heuristicsTriggered,
+        recommendedAction: fraudResult.recommendedAction,
+      }, 'Transaction flagged for review');
     } catch (error) {
-      console.error(`Failed to handle suspicious transaction ${transactionId}:`, error);
+      logger.error({ err: error, transactionId }, 'Failed to handle suspicious transaction');
     }
   }
 
@@ -178,7 +181,7 @@ export class FraudDetectionMiddleware {
       // Run fraud detection for learning purposes
       await fraudService.detectFraud(transactionInput);
     } catch (error) {
-      console.error('Failed to analyze completed transaction:', error);
+      logger.error({ err: error }, 'Failed to analyze completed transaction');
     }
   };
 

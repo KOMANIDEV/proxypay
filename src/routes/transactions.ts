@@ -27,8 +27,14 @@ import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { generateTransactionPdfBuffer } from "../services/pdfReceipt";
 import { generateShareToken, verifyShareToken } from "../utils/share";
 import { createExportRoutes } from "./export";
+import {
+  previewTransactionHandler,
+  validateTransactionPreview,
+} from "../controllers/transactionPreviewController";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { requirePermission } from "../middleware/rbac";
+import { transactionReversalService } from "../services/transactionReversalService";
 
 export const transactionRoutes = Router();
 transactionRoutes.use(createExportRoutes());
@@ -194,6 +200,20 @@ transactionRoutes.get(
   },
 );
 
+// Preview a transaction before submission — simulates fees/limits, creates nothing.
+transactionRoutes.post(
+  "/preview",
+  authenticateToken,
+  checkAccountStatusStrict,
+  geoFencingMiddleware,
+  TimeoutPresets.quick,
+  haltOnTimedout,
+  normalizeProvider,
+  validateTransactionPreview,
+  validateNetworkMiddleware,
+  previewTransactionHandler,
+);
+
 transactionRoutes.get(
   "/",
   TimeoutPresets.quick,
@@ -250,6 +270,46 @@ transactionRoutes.post(
   validateNetworkMiddleware,
   geolocateMiddleware,
   withdrawHandler,
+);
+
+/**
+ * Refund a failed or disputed transaction by posting a compensating ledger
+ * transaction and moving it to the reversed state.
+ */
+transactionRoutes.post(
+  "/:id/refund",
+  authenticateToken,
+  requirePermission("dispute:manage"),
+  async (req: Request, res: Response) => {
+    const reason = req.body?.reason;
+    if (!reason || typeof reason !== "string" || reason.trim().length === 0) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        'Field "reason" is required and must be a non-empty string',
+        { error: 'Field "reason" is required and must be a non-empty string' },
+      );
+    }
+
+    try {
+      const result = await transactionReversalService.reverse(
+        req.params.id,
+        reason.trim(),
+        req.user?.id,
+      );
+      return res.json({
+        transaction: result.transaction,
+        alreadyRefunded: result.reversal.alreadyReversed,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Refund failed";
+      const code = message.includes("not found")
+        ? ERROR_CODES.NOT_FOUND
+        : message.includes("Cannot reverse") || message.includes("No ledger")
+          ? ERROR_CODES.UNPROCESSABLE_CONTENT
+          : ERROR_CODES.INTERNAL_ERROR;
+      throw createError(code, message, { error: message });
+    }
+  },
 );
 
 transactionRoutes.get(

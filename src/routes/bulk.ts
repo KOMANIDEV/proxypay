@@ -335,6 +335,58 @@ bulkRoutes.use(
   },
 );
 
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 500;
+
+function parsePageParam(value: unknown, fallback: number, max: number): number {
+  const parsed = parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
+}
+
+/**
+ * Status polling endpoint. Returns the current counters plus a paginated slice
+ * of row errors so large batches can be inspected without oversized payloads.
+ */
+bulkRoutes.get("/:jobId/status", (req: Request, res: Response) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job) {
+    throw createError(ERROR_CODES.NOT_FOUND, "Job not found", {
+      error: "Job not found",
+    });
+  }
+
+  const page = parsePageParam(req.query.page, 1, Number.MAX_SAFE_INTEGER);
+  const pageSize = parsePageParam(
+    req.query.pageSize,
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+  );
+  const offset = (page - 1) * pageSize;
+
+  return res.json({
+    jobId: job.id,
+    status: job.status,
+    progress: {
+      total: job.total,
+      processed: job.processed,
+      succeeded: job.succeeded,
+      failed: job.failed,
+    },
+    errors: {
+      items: job.errors.slice(offset, offset + pageSize),
+      page,
+      pageSize,
+      total: job.errors.length,
+      totalPages: Math.ceil(job.errors.length / pageSize),
+      hasMore: offset + pageSize < job.errors.length,
+    },
+    createdAt: job.createdAt,
+    ...(job.completedAt && { completedAt: job.completedAt }),
+  });
+});
+
 bulkRoutes.get("/:jobId", (req: Request, res: Response) => {
   const job = jobs.get(req.params.jobId);
 

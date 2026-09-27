@@ -2,6 +2,7 @@ import {
   generateReceipt,
   generateReceiptHtml,
   generateReceiptNumber,
+  RECEIPT_PRINT_STYLES,
 } from "../../src/utils/receipt";
 
 describe("receipt utilities", () => {
@@ -83,5 +84,46 @@ describe("receipt utilities", () => {
     expect(html).toContain("10,100 XAF");
     expect(html).toContain("GBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
     expect(html).toContain("MTN &lt;strong&gt;Mobile&lt;/strong&gt; Money");
+  });
+
+  it("renders HTML receipt with business branding (logo, name, color)", () => {
+    const html = generateReceiptHtml(baseTransaction, {
+      generatedAt: "2026-03-27T10:30:00Z",
+      receiptNumber: "RCP-20260327-00001",
+      branding: {
+        businessName: "Acme Coffee",
+        logoUrl: "https://example.com/acme-logo.png",
+        primaryColor: "#123456",
+        footerText: "Thanks for your business!",
+      },
+    });
+
+    expect(html).toContain("Acme Coffee");
+    expect(html).toContain("https://example.com/acme-logo.png");
+    expect(html).toContain("#123456");
+    expect(html).toContain("Thanks for your business!");
+  });
+
+  it("embeds an inline print stylesheet so receipts print cleanly", () => {
+    const html = generateReceiptHtml(baseTransaction, {
+      generatedAt: "2026-03-28T10:30:00Z",
+      receiptNumber: "RCP-20260328-00001",
+    });
+
+    expect(html).toContain("<style>");
+    expect(html).toContain("@media print");
+    expect(html).toContain("@page");
+    expect(html).toContain("size: A4 portrait");
+    expect(html).toContain("receipt-wrapper");
+    expect(html).toContain('class="receipt-header"');
+    expect(html).toContain('class="receipt-table"');
+    expect(html).toContain('class="receipt-footer"');
+    expect(html).toContain("<title>Mobile Money — Transaction Receipt</title>");
+  });
+
+  it("uses black text on a white background for print legibility", () => {
+    expect(RECEIPT_PRINT_STYLES).toContain("color: #000000");
+    expect(RECEIPT_PRINT_STYLES).toContain("background: #ffffff !important");
+    expect(RECEIPT_PRINT_STYLES).toContain("border-collapse: collapse !important");
   });
 });

@@ -19,11 +19,14 @@ const l1 = new NodeCache({
 });
 
 const INVALIDATION_CHANNEL = "cache:invalidate:l1";
+const CACHE_VERSION_KEY = "cache:version";
 
 export class LayeredCache {
   private subscriber: any = null;
   private isInitialized = false;
   private activeRevalidations = new Map<string, Promise<void>>();
+  private hitCount = 0;
+  private missCount = 0;
 
   /**
    * Initialize Redis subscription for L1 invalidation
@@ -55,24 +58,32 @@ export class LayeredCache {
     // 1. Try L1 (Memory) - Extremely fast
     const cachedL1 = l1.get<T>(key);
     if (cachedL1 !== undefined) {
+      this.hitCount++;
       return cachedL1;
     }
 
     // 2. Try L2 (Redis)
-    if (!redisClient || !redisClient.isOpen) return null;
+    if (!redisClient || !redisClient.isOpen) {
+      this.missCount++;
+      return null;
+    }
     
     try {
       const raw = await redisClient.get(key);
-      if (!raw) return null;
+      if (!raw) {
+        this.missCount++;
+        return null;
+      }
       
       const parsed = JSON.parse(raw.toString());
       
       // Populate L1 for future fast access
-      // We use the remaining TTL from Redis or a default
       l1.set(key, parsed);
+      this.hitCount++;
       
       return parsed as T;
     } catch (err) {
+      this.missCount++;
       console.warn(`[LayeredCache] Get failed for key: ${key}`, err);
       return null;
     }
@@ -225,6 +236,60 @@ export class LayeredCache {
       l1: l1.getStats(),
       memory: process.memoryUsage().heapUsed,
     };
+  }
+
+  /**
+   * Get cache hit/miss metrics
+   */
+  getMetrics() {
+    const total = this.hitCount + this.missCount;
+    return {
+      hits: this.hitCount,
+      misses: this.missCount,
+      total,
+      hitRate: total > 0 ? (this.hitCount / total * 100).toFixed(2) + "%" : "0%",
+    };
+  }
+
+  /**
+   * Get the current cache version from Redis
+   */
+  async getVersion(): Promise<number> {
+    if (!redisClient || !redisClient.isOpen) return 0;
+    try {
+      const raw = await redisClient.get(CACHE_VERSION_KEY);
+      return raw ? parseInt(raw, 10) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Bump cache version (increments the version number in Redis)
+   */
+  async bumpVersion(): Promise<number> {
+    if (!redisClient || !redisClient.isOpen) return 0;
+    try {
+      const newVersion = await redisClient.incr(CACHE_VERSION_KEY);
+      return newVersion;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Invalidate all L1 caches across all instances by bumping the version.
+   * Keys stamped with an older version are treated as stale on next access.
+   */
+  async invalidateAll(): Promise<void> {
+    l1.flushAll();
+    if (redisClient && redisClient.isOpen) {
+      try {
+        await redisClient.publish(INVALIDATION_CHANNEL, "__FLUSH_ALL__");
+      } catch (err) {
+        console.warn("[LayeredCache] Failed to publish flush-all invalidation", err);
+      }
+    }
   }
 }
 

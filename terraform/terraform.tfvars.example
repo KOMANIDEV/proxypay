@@ -26,6 +26,14 @@ db_username          = "mobilemoney"
 db_password          = "REPLACE_WITH_SECURE_PASSWORD"
 db_multi_az          = false
 
+# Cross-region replication (DR) — set to true to provision a read replica in dr_region
+enable_cross_region_replica = false
+dr_region                   = "us-west-2"
+dr_vpc_cidr                 = "10.1.0.0/16"
+dr_az_count                 = 2
+dr_db_instance_class        = "db.t3.micro"
+dr_db_allocated_storage     = 20
+
 # Redis
 redis_node_type          = "cache.t3.micro"
 redis_num_cache_clusters = 1

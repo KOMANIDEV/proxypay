@@ -191,6 +191,7 @@ describe("PaymentLinkGenerator", () => {
       expect(response.body.paymentLink).toBeDefined();
       expect(response.body.paymentUrl).toContain("/pay/");
       expect(response.body.paymentLink.amount).toBe("15000");
+      expect(response.body.qrCodeDataUrl).toMatch(/^data:image\/png;base64,/);
     });
 
     it("should return 400 when amount is invalid", async () => {
@@ -291,6 +292,20 @@ describe("PaymentLinkGenerator", () => {
 
       expect(response.status).toBe(400);
       expect(response.text).toContain("already been used");
+    });
+  });
+
+  describe("GET /pay/:token/qr", () => {
+    it("should return a PNG QR code for an existing payment link", async () => {
+      (mockedPool.query as any).mockResolvedValueOnce({
+        rows: [{ token: "token123" }],
+      });
+
+      const response = await request(app).get("/pay/token123/qr");
+
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toMatch(/^image\/png/);
+      expect(response.body.length).toBeGreaterThan(100);
     });
   });
 

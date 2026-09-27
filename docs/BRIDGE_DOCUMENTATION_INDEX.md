@@ -310,6 +310,7 @@ Plus complete working code in JavaScript and Python.
 
 **For Operational Questions:**
 - [BRIDGE_DEPLOYMENT_RUNBOOK.md](./BRIDGE_DEPLOYMENT_RUNBOOK.md) - Deployment & ops
+- [runbooks/](./runbooks/README.md) - Incident runbooks for common production issues (provider down, DB bloat, latency, queue backlog, and more)
 - [BRIDGE_API_EXAMPLES.md](./BRIDGE_API_EXAMPLES.md) - API & integration
 
 **For Code Questions:**

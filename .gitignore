@@ -23,20 +23,32 @@ coverage/
 .nyc_output/
 stryker-tmp/
 
+# Test snapshots (never commit Jest/Vitest snapshots)
+**/__snapshots__/
+*.snap
+
+# Jest cache
+.jest-cache/
+jest_cache/
+jest-transform-cache/
+
 # Logs
 *.log
 pact.log
 *.pact.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # OS files
 .DS_Store
-.idea
+Thumbs.db
+.idea/
 .vscode/settings.json
+.vscode/*.code-workspace
 
 # Kiro
 .kiro/
-
-
 
 # Load test output
 tests/load/results/*.json
@@ -46,5 +58,40 @@ benchmarks/results/*.json
 *.tmp
 *.temp
 .cache/
+tmp/
+temp/
 
+# Secrets
 secret.yaml
+*.pem
+*.p12
+*.pfx
+*.key
+*.cert
+
+# Playwright test artifacts
+playwright-report/
+test-results/
+playwright/.cache/
+
+# Stryker mutation testing
+.stryker-tmp/
+reports/mutation/
+
+# Local development overrides
+docker-compose.override.yml
+
+# TypeScript diagnostics
+tsconfig.tsbuildinfo
+tsconfig.tsbuildinfo/**
+
+# pact contract test output (generated, not source)
+pact/pacts/
+pact/logs/
+
+# Misc editor / tool artifacts
+*.swp
+*.swo
+*~
+.eslintcache
+.stylelintcache

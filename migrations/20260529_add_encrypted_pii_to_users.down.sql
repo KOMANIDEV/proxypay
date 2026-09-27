@@ -1,5 +1,5 @@
--- Rollback Migration: 20260529_add_encrypted_pii_to_users.down
--- Description: Drop first_name, last_name, address, date_of_birth, id_number columns from users table
+-- Rollback: 20260529_add_encrypted_pii_to_users
+-- Inverted from 20260529_add_encrypted_pii_to_users.sql; hand-verified against the up migration.
 
 ALTER TABLE users DROP COLUMN IF EXISTS first_name;
 ALTER TABLE users DROP COLUMN IF EXISTS last_name;

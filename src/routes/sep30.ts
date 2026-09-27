@@ -13,6 +13,7 @@
  */
 import { Router, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import { sep30RecoveryRateLimiter } from '../middleware/rateLimit';
 import { z } from 'zod';
 import { Sep30Service } from '../services/sep30/sep30Service';
 import { pool } from '../config/database';
@@ -247,6 +248,7 @@ router.delete(
 router.post(
   '/keys/:keyId/recovery/session',
   sep30Limiter,
+  sep30RecoveryRateLimiter,
   async (req: Request, res: Response) => {
     try {
       const { keyId } = req.params;
@@ -285,6 +287,7 @@ router.post(
 router.post(
   '/keys/:keyId/recovery/initiate',
   sep30Limiter,
+  sep30RecoveryRateLimiter,
   async (req: Request, res: Response) => {
     try {
       const { keyId } = req.params;
@@ -322,6 +325,7 @@ router.post(
 router.post(
   '/keys/:keyId/recovery/approve',
   sep30Limiter,
+  sep30RecoveryRateLimiter,
   async (req: Request, res: Response) => {
     try {
       const { keyId } = req.params;
@@ -361,6 +365,7 @@ router.post(
 router.post(
   '/keys/:keyId/recovery/complete',
   sep30Limiter,
+  sep30RecoveryRateLimiter,
   async (req: Request, res: Response) => {
     try {
       const { keyId } = req.params;
@@ -389,6 +394,7 @@ router.post(
 router.post(
   '/keys/:keyId/recovery/cancel',
   sep30Limiter,
+  sep30RecoveryRateLimiter,
   async (req: Request, res: Response) => {
     try {
       const { keyId } = req.params;

@@ -35,6 +35,21 @@ provider "aws" {
   }
 }
 
+# Second region provider used for the cross-region database read replica (DR).
+provider "aws" {
+  alias  = "dr"
+  region = var.dr_region
+
+  default_tags {
+    tags = {
+      Project     = var.project
+      Environment = var.environment
+      ManagedBy   = "terraform"
+      Tier        = "dr"
+    }
+  }
+}
+
 locals {
   remote_state_bucket_name     = "mobile-money-terraform-state"
   remote_state_lock_table_name = "mobile-money-terraform-locks"
@@ -119,19 +134,33 @@ module "security" {
 }
 
 # ── 3. Managed Database (RDS PostgreSQL) ──────────────────────────────────
+# With `enable_cross_region_replica = true`, the database module also
+# provisions a read replica in `dr_region` (e.g. us-west-2) for DR.
 module "database" {
   source = "./modules/database"
 
-  project              = var.project
-  environment          = var.environment
-  private_subnet_ids   = module.vpc.private_subnet_ids
-  security_group_id    = module.security.database_security_group_id
-  db_instance_class    = var.db_instance_class
-  db_allocated_storage = var.db_allocated_storage
-  db_name              = var.db_name
-  db_username          = var.db_username
-  db_password          = var.db_password
-  db_multi_az          = var.db_multi_az
+  providers = {
+    aws    = aws
+    aws.dr = aws.dr
+  }
+
+  project                     = var.project
+  environment                 = var.environment
+  private_subnet_ids          = module.vpc.private_subnet_ids
+  security_group_id           = module.security.database_security_group_id
+  db_instance_class           = var.db_instance_class
+  db_allocated_storage        = var.db_allocated_storage
+  db_name                     = var.db_name
+  db_username                 = var.db_username
+  db_password                 = var.db_password
+  db_multi_az                 = var.db_multi_az
+  enable_cross_region_replica = var.enable_cross_region_replica
+  dr_region                   = var.dr_region
+  dr_vpc_cidr                 = var.dr_vpc_cidr
+  dr_az_count                 = var.dr_az_count
+  primary_vpc_cidr            = var.vpc_cidr
+  dr_db_instance_class        = var.dr_db_instance_class
+  dr_db_allocated_storage     = var.dr_db_allocated_storage
 }
 
 # ── 4. Managed Redis (ElastiCache) ────────────────────────────────────────

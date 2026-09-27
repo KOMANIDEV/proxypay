@@ -13,6 +13,7 @@ declare global {
       jwtUser?: { userId?: string; role?: string };
       user?: User;
       isNewDevice?: boolean;
+      requiresAdditionalVerification?: boolean;
       twoFactorVerified?: boolean;
       clientIp?: string;
       geoLocation?: unknown;

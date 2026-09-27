@@ -34,12 +34,26 @@ Slow queries are logged in structured JSON format:
 {
   "type": "slow_query",
   "duration": 1500,
+  "duration_ms": 1500,
   "threshold": 1000,
+  "threshold_ms": 1000,
   "query": "SELECT * FROM transactions WHERE user_id = ***",
+  "query_fingerprint": "a1b2c3d4e5f60718",
+  "query_operation": "SELECT",
+  "query_length": 58,
   "params": ["***@***.***", "***"],
+  "pool": "primary",
+  "status": "success",
+  "row_count": 25,
   "timestamp": "2024-03-25T18:34:00.000Z"
 }
 ```
+
+`query_fingerprint` is a stable hash of normalized SQL, allowing recurring slow
+query patterns to be grouped without exposing additional query data. `pool`
+identifies the primary or read-replica pool. Failed slow queries include
+`status: "error"` and sanitized database error details; successful queries
+include the returned row count when available.
 
 ## Data Sanitization
 
@@ -64,7 +78,8 @@ To protect sensitive information, the logging system automatically sanitizes:
 
 ### Database Pool Enhancement
 
-The feature extends the standard PostgreSQL pool with query timing:
+The feature extends the standard PostgreSQL pool with query timing. Queries
+through the primary pool and `queryRead` replica path are tracked:
 
 ```typescript
 class SlowQueryPool extends Pool {

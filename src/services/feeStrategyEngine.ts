@@ -16,10 +16,15 @@
  *   - TimeBasedFeeStrategy  — overrides fee during specific days/hours (e.g. Fee-free Fridays)
  *   - VolumeBasedFeeStrategy — tiered fee based on transaction amount brackets
  *
- * Caching:
+ * Caching (versioned + pub/sub):
  *   - Active strategies are cached in Redis (TTL: 60 s) and invalidated on any write.
- *   - Cache key: `fee_strategies:active` (all active), `fee_strategies:user:<id>`,
- *     `fee_strategies:provider:<name>`
+ *   - A monotonically increasing `version` counter is stored in Redis.  Every
+ *     write increments the version.  On read, if the cached version is stale
+ *     the entry is rejected, avoiding cross-instance inconsistency windows.
+ *   - Writes publish an invalidation message on the `fee_strategies:invalidate`
+ *     Redis Pub/Sub channel so every subscriber (across all instances) drops
+ *     its local cache immediately.
+ *   - Cache hit/miss counters are exported as Prometheus metrics.
  *
  * Thread safety:
  *   - All writes go through PostgreSQL transactions.
@@ -28,6 +33,8 @@
 
 import { pool } from "../config/database";
 import { redisClient } from "../config/redis";
+import logger from "../utils/logger";
+import { feeAuditService } from "./feeAuditService";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types & Interfaces
@@ -111,6 +118,36 @@ export interface FeeCalculationResult {
     appliedMinimum?: number;
     appliedMaximum?: number;
   };
+  /** Outcome of the post-calculation safety validation (Issue #623). */
+  validation: FeeValidationResult;
+}
+
+export interface FeeValidationResult {
+  /** Upper bound that was enforced for this calculation. */
+  appliedFeeCap: number;
+  /** True when the applied fee was reduced because it exceeded the cap. */
+  capped: boolean;
+  /** True when the raw fee was negative, non-finite or otherwise invalid. */
+  invalid: boolean;
+  /** Human readable explanations for every adjustment that was made. */
+  warnings: string[];
+}
+
+/**
+ * Global safety ceiling applied to calculated fees when a strategy does not
+ * declare its own `feeMaximum`. Expressed as a fraction of the transaction
+ * amount — the default is 1% (`0.01`).
+ *
+ * Overridable via `FEE_STRATEGY_MAX_FEE_RATE` for tenants with a different
+ * regulatory cap. Strategies that explicitly declare a `feeMaximum` are treated
+ * as pre-authorised bounds and keep their configured ceiling.
+ */
+export const DEFAULT_MAX_FEE_RATE = 0.01;
+
+export function getMaxFeeRate(): number {
+  const configured = Number(process.env.FEE_STRATEGY_MAX_FEE_RATE);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return DEFAULT_MAX_FEE_RATE;
 }
 
 export interface CreateFeeStrategyRequest {
@@ -279,40 +316,169 @@ function applyVolumeBasedFee(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cache helpers
+// Cache helpers — versioned + pub/sub invalidation + hit/miss metrics
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CACHE_PREFIX = "fee_strategies:";
 const CACHE_TTL_SECONDS = 60; // Short TTL so live changes propagate quickly
+const VERSION_KEY = `${CACHE_PREFIX}version`;
+const INVALIDATION_CHANNEL = `${CACHE_PREFIX}invalidate`;
 
+// In-memory hit/miss counters (reset on process restart — good enough for
+// Prometheus scrapes which happen every 15–30 s).
+const cacheStats = { hits: 0, misses: 0 };
+
+/**
+ * Increment the global cache version counter.
+ * Called on every write so that in-flight reads with the old version are
+ * rejected.
+ */
+async function bumpCacheVersion(): Promise<number> {
+  try {
+    const v = await redisClient.incr(VERSION_KEY);
+    const num = typeof v === "string" ? parseInt(v, 10) : v;
+    // Ensure the key doesn't expire accidentally — refresh TTL
+    await redisClient.expire(VERSION_KEY, 60 * 60 * 24); // 24 h safety
+    return num;
+  } catch {
+    return Date.now(); // fallback: timestamp is monotonically increasing
+  }
+}
+
+async function getCacheVersion(): Promise<number> {
+  try {
+    const v = await redisClient.get(VERSION_KEY);
+    return v ? (typeof v === "string" ? parseInt(v, 10) : Number(v)) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Read cached strategies for a given cache key.
+ * Returns null when the entry is missing, expired, or its version is stale.
+ */
 async function cacheGet(key: string): Promise<FeeStrategy[] | null> {
   try {
     const raw = await redisClient.get(`${CACHE_PREFIX}${key}`);
-    if (!raw) return null;
-    const str = typeof raw === "string" ? raw : raw.toString();
-    return JSON.parse(str) as FeeStrategy[];
+    if (!raw) {
+      cacheStats.misses++;
+      return null;
+    }
+    const parsed = JSON.parse(typeof raw === "string" ? raw : raw.toString()) as {
+      version: number;
+      data: FeeStrategy[];
+    };
+
+    // Version check — if the entry was written before the last bump it's stale
+    const currentVersion = await getCacheVersion();
+    if (parsed.version !== undefined && parsed.version < currentVersion) {
+      cacheStats.misses++;
+      return null;
+    }
+
+    cacheStats.hits++;
+    return parsed.data;
   } catch {
+    cacheStats.misses++;
     return null;
   }
 }
 
+/**
+ * Write strategies to cache, stamping them with the current version.
+ */
 async function cacheSet(key: string, strategies: FeeStrategy[]): Promise<void> {
   try {
-    await redisClient.setEx(`${CACHE_PREFIX}${key}`, CACHE_TTL_SECONDS, JSON.stringify(strategies));
+    const version = await getCacheVersion();
+    const payload = JSON.stringify({ version, data: strategies });
+    await redisClient.setEx(`${CACHE_PREFIX}${key}`, CACHE_TTL_SECONDS, payload);
   } catch {
     // Cache write failure is non-fatal
   }
 }
 
-async function cacheInvalidateAll(): Promise<void> {
+/**
+ * Invalidate all cached fee strategy entries across every instance.
+ *
+ * 1. Delete all keys matching the prefix.
+ * 2. Bump the version counter so any in-flight reads with the old version
+ *    are rejected even before the key delete propagates.
+ * 3. Publish an invalidation message so remote instances can drop their
+ *    in-memory L1 caches immediately.
+ */
+export async function cacheInvalidateAll(): Promise<void> {
   try {
+    // 1. Bump version first (so concurrent readers see stale)
+    await bumpCacheVersion();
+
+    // 2. Delete all keys
     const keys = await redisClient.keys(`${CACHE_PREFIX}*`);
-    for (const key of keys) {
-      await redisClient.del(key);
+    // Filter out the version key itself and the channel key
+    const keysToDelete = keys.filter(
+      (k) => k !== VERSION_KEY && !k.endsWith(":stats"),
+    );
+    if (keysToDelete.length > 0) {
+      await redisClient.del(keysToDelete);
+    }
+
+    // 3. Publish invalidation so other instances drop L1 entries
+    try {
+      await redisClient.publish(INVALIDATION_CHANNEL, JSON.stringify({ ts: Date.now() }));
+    } catch {
+      // Best-effort
     }
   } catch {
     // Non-fatal
   }
+}
+
+/**
+ * Subscribe to cache invalidation pub/sub channel.
+ * Call once during application bootstrap.
+ */
+export async function subscribeToCacheInvalidation(): Promise<void> {
+  if (!redisClient.isOpen) return;
+
+  try {
+    const subscriber = redisClient.duplicate();
+    await subscriber.connect();
+    await subscriber.subscribe(INVALIDATION_CHANNEL, () => {
+      // On invalidation message, the version counter is already bumped so
+      // any in-memory L1 cache will naturally miss. Nothing else required
+      // here because we don't keep an L1 map inside this engine.
+      logger.info("[FeeStrategyEngine] Cache invalidation received via pub/sub");
+    });
+    logger.info("[FeeStrategyEngine] Subscribed to cache invalidation channel");
+  } catch (err) {
+    logger.warn({ err }, "[FeeStrategyEngine] Failed to subscribe to invalidation channel");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Prometheus-style metrics (lightweight counters)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Return current cache performance stats for the admin monitoring endpoint.
+ */
+export function getCacheStats() {
+  const total = cacheStats.hits + cacheStats.misses;
+  return {
+    hits: cacheStats.hits,
+    misses: cacheStats.misses,
+    total,
+    hitRatio: total > 0 ? parseFloat((cacheStats.hits / total).toFixed(4)) : 0,
+    ttlSeconds: CACHE_TTL_SECONDS,
+  };
+}
+
+/**
+ * Reset stats counters (useful for periodic windowed reporting).
+ */
+export function resetCacheStats(): void {
+  cacheStats.hits = 0;
+  cacheStats.misses = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -399,9 +565,36 @@ export class FeeStrategyEngine {
     for (const strategy of candidates) {
       const result = this.applyStrategy(strategy, ctx.amount, evaluationTime);
       if (result !== null) {
+        const validation = this.validateCalculatedFee(
+          result.clampedFee,
+          ctx.amount,
+          strategy,
+        );
+        const fee = parseFloat(validation.fee.toFixed(2));
+
+        // Audit trail — every applied fee is logged with its provenance.
+        logger.info(
+          {
+            event: "fee_calculation",
+            amount: ctx.amount,
+            fee,
+            strategyId: strategy.id,
+            strategyName: strategy.name,
+            strategyType: strategy.strategyType,
+            scope: strategy.scope,
+            userId: ctx.userId,
+            provider: ctx.provider,
+            appliedFeeCap: validation.validation.appliedFeeCap,
+            capped: validation.validation.capped,
+            invalid: validation.validation.invalid,
+            warnings: validation.validation.warnings,
+          },
+          "[FeeStrategyEngine] fee calculation",
+        );
+
         return {
-          fee: parseFloat(result.clampedFee.toFixed(2)),
-          total: parseFloat((ctx.amount + result.clampedFee).toFixed(2)),
+          fee,
+          total: parseFloat((ctx.amount + fee).toFixed(2)),
           strategyUsed: strategy.name,
           scopeUsed: strategy.scope,
           timeOverrideActive: strategy.strategyType === "time_based",
@@ -413,12 +606,35 @@ export class FeeStrategyEngine {
             appliedMinimum: result.appliedMinimum,
             appliedMaximum: result.appliedMaximum,
           },
+          validation: validation.validation,
         };
+
+        // Persist audit record (non-fatal)
+        await feeAuditService.logFeeCalculation({
+          userId: ctx.userId,
+          provider: ctx.provider,
+          inputAmount: ctx.amount,
+          calculatedFee: calcResult.fee,
+          totalAmount: calcResult.total,
+          strategyId: strategy.id,
+          strategyName: strategy.name,
+          strategyType: strategy.strategyType,
+          strategyScope: strategy.scope,
+          feePercentage: strategy.feePercentage ?? null,
+          flatAmount: strategy.flatAmount ?? null,
+          feeMinimum: strategy.feeMinimum ?? null,
+          feeMaximum: strategy.feeMaximum ?? null,
+          timeOverrideActive: calcResult.timeOverrideActive,
+          rawFee: calcResult.breakdown.rawFee,
+          clampedFee: calcResult.breakdown.clampedFee,
+        });
+
+        return calcResult;
       }
     }
 
     // No strategy matched — return zero fee as safe default
-    return {
+    const defaultResult: FeeCalculationResult = {
       fee: 0,
       total: ctx.amount,
       strategyUsed: "none",
@@ -430,7 +646,104 @@ export class FeeStrategyEngine {
         rawFee: 0,
         clampedFee: 0,
       },
+      validation: {
+        appliedFeeCap: parseFloat((ctx.amount * getMaxFeeRate()).toFixed(2)),
+        capped: false,
+        invalid: false,
+        warnings: [],
+      },
     };
+  }
+
+  /**
+   * Verify that a strategy's calculated fee is within acceptable bounds
+   * (Issue #623).
+   *
+   * Rules:
+   *   1. Fees must be finite and `>= 0` — invalid values fall back to `0`.
+   *   2. Fees must not exceed the effective cap:
+   *      - `strategy.feeMaximum` when the strategy declares one (an
+   *        operator-authored bound), otherwise
+   *      - `DEFAULT_MAX_FEE_RATE` of the transaction amount (1% by default).
+   *
+   * The raw fee is never mutated — the corrections are returned alongside the
+   * warnings so callers (and the audit log) can see exactly what happened.
+   */
+  private validateCalculatedFee(
+    fee: number,
+    amount: number,
+    strategy: FeeStrategy,
+  ): { fee: number; validation: FeeValidationResult } {
+    const warnings: string[] = [];
+    let validated = fee;
+    let invalid = false;
+    let capped = false;
+
+    const safetyCap = Math.max(0, amount) * getMaxFeeRate();
+    const appliedFeeCap =
+      strategy.feeMaximum !== undefined
+        ? Math.max(strategy.feeMaximum, 0)
+        : safetyCap;
+
+    if (!Number.isFinite(validated) || validated < 0) {
+      warnings.push(
+        `Calculated fee (${fee}) is invalid — negative or non-finite fees are not permitted; falling back to 0`,
+      );
+      validated = 0;
+      invalid = true;
+    }
+
+    if (validated > appliedFeeCap) {
+      warnings.push(
+        `Calculated fee (${validated}) exceeds the maximum allowed fee cap (${appliedFeeCap}); clamping to the cap`,
+      );
+      validated = appliedFeeCap;
+      capped = true;
+    }
+
+    if (warnings.length > 0) {
+      logger.warn(
+        {
+          event: "fee_calculation_validation",
+          amount,
+          strategyId: strategy.id,
+          strategyName: strategy.name,
+          requestedFee: fee,
+          appliedFee: validated,
+          appliedFeeCap,
+          warnings,
+        },
+        "[FeeStrategyEngine] fee calculation failed validation and was adjusted",
+      );
+    }
+
+    return {
+      fee: validated,
+      validation: {
+        appliedFeeCap: parseFloat(appliedFeeCap.toFixed(2)),
+        capped,
+        invalid,
+        warnings,
+      },
+    };
+
+    // Persist audit record for the default (zero-fee) case as well (non-fatal)
+    await feeAuditService.logFeeCalculation({
+      userId: ctx.userId,
+      provider: ctx.provider,
+      inputAmount: ctx.amount,
+      calculatedFee: 0,
+      totalAmount: ctx.amount,
+      strategyId: "",
+      strategyName: "none",
+      strategyType: "flat",
+      strategyScope: "global",
+      timeOverrideActive: false,
+      rawFee: 0,
+      clampedFee: 0,
+    });
+
+    return defaultResult;
   }
 
   /**

@@ -4,16 +4,19 @@ module.exports = {
   setupFiles: ["<rootDir>/tests/jest.setup.ts"],
   roots: ["<rootDir>/src", "<rootDir>/tests"],
   testMatch: ["**/__tests__/**/*.ts", "**/?(*.)+(spec|test).ts"],
-  testPathIgnorePatterns: ["/node_modules/", "/tests/pact/"],
+  testPathIgnorePatterns: [
+    "/node_modules/",
+    "/tests/pact/",
+    // DB-backed migration integration tests run via `npm run test:migrations`
+    // (they need a real PostgreSQL instance).
+    "/tests/migrations/integration/",
+  ],
   testTimeout: 30000,
   moduleNameMapper: {
     "^(\\.\\.?\\/.+)\\.js$": "$1",
   },
   transform: {
-    "^.+\\.ts$": [
-      "ts-jest",
-      { diagnostics: false },
-    ],
+    "^.+\\.ts$": ["ts-jest", { diagnostics: false }],
   },
   collectCoverageFrom: [
     "src/**/*.ts",

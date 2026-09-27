@@ -40,6 +40,40 @@ export function maskStellarAddress(address: string): string {
   return `${address.slice(0, 4)}...${address.slice(-4)}`;
 }
 
+const EMAIL_PATTERN = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
+const PHONE_PATTERN = /\+?\d[\d\s-]{7,}\d/g;
+
+/**
+ * Masks emails and phone numbers embedded in free-form text (e.g. error
+ * messages, log strings) without altering the surrounding text.
+ */
+export function maskPIIInText(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(EMAIL_PATTERN, (match) => maskEmail(match))
+    .replace(PHONE_PATTERN, (match) => maskPhoneNumber(match.replace(/[\s-]/g, "")));
+}
+
+/**
+ * Recursively masks emails/phone numbers embedded anywhere in a value
+ * (objects, arrays, strings) without otherwise altering the text — unlike
+ * {@link maskPII}, this never mangles arbitrary strings that don't contain PII.
+ * Suitable for logging/serializing free-form error details of unknown shape.
+ */
+export function maskPIIDeep(value: unknown): unknown {
+  if (value == null) return value;
+  if (typeof value === "string") return maskPIIInText(value);
+  if (Array.isArray(value)) return value.map((v) => maskPIIDeep(v));
+  if (typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = maskPIIDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 /**
  * General purpose masking utility.
  */
@@ -114,6 +148,19 @@ export function maskPII(value: any): any {
         lk === "full_name"
       ) {
         out[k] = typeof v === "string" ? maskPII(String(v)) : v;
+        continue;
+      }
+      if (lk === "email" || lk === "emailaddress" || lk === "email_address") {
+        out[k] = typeof v === "string" ? maskEmail(v) : v;
+        continue;
+      }
+      if (
+        lk === "accountid" ||
+        lk === "account_id" ||
+        lk === "accountnumber" ||
+        lk === "account_number"
+      ) {
+        out[k] = typeof v === "string" ? maskStellarAddress(v) : v;
         continue;
       }
       // nested payer/payee objects with partyId

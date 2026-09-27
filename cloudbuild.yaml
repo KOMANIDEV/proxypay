@@ -1,0 +1,59 @@
+# Cloud Build configuration for Google Cloud Run one-click deployment.
+#
+# Builds the proxypay image and deploys it to Cloud Run. Triggers this via the
+# Cloud Console "Run on Cloud Run" button or `gcloud builds submit`.
+#
+# Supported substitutions (override with --substitutions if needed):
+#   _SERVICE_NAME        - Cloud Run service name          (default: proxypay)
+#   _REGION              - GCP region                      (default: us-central1)
+#   _STELLAR_NETWORK     - testnet | public                 (default: testnet)
+#   _STELLAR_HORIZON_URL - Horizon base URL                 (default: testnet)
+#
+# DATABASE_URL, REDIS_URL and long-lived provider secrets are not provided
+# here. Set them on the Cloud Run service after deployment (via the Console,
+# `gcloud run services update --set-env-vars`, or secret references as shown in
+# cloud-run/service.yaml). The build itself stays secret-free.
+
+substitutions:
+  _SERVICE_NAME: "proxypay"
+  _REGION: "us-central1"
+  _STELLAR_NETWORK: "testnet"
+  _STELLAR_HORIZON_URL: "https://horizon-testnet.stellar.org"
+
+steps:
+  # 1. Build the production image.
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--tag"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_SERVICE_NAME}/${_SERVICE_NAME}:$COMMIT_SHA"
+      - "--tag"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_SERVICE_NAME}/${_SERVICE_NAME}:latest"
+      - "."
+
+  # 2. Push the image to Artifact Registry.
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_SERVICE_NAME}/${_SERVICE_NAME}:$COMMIT_SHA"
+
+  # 3. Deploy the image to Cloud Run.
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - "run"
+      - "deploy"
+      - "${_SERVICE_NAME}"
+      - "--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_SERVICE_NAME}/${_SERVICE_NAME}:$COMMIT_SHA"
+      - "--region=${_REGION}"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--port=3000"
+      - "--set-env-vars=STELLAR_NETWORK=${_STELLAR_NETWORK},STELLAR_HORIZON_URL=${_STELLAR_HORIZON_URL},NODE_ENV=production"
+      - "--memory=1Gi"
+      - "--cpu=1"
+      - "--min-instances=0"
+      - "--max-instances=3"
+
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_SERVICE_NAME}/${_SERVICE_NAME}:$COMMIT_SHA"

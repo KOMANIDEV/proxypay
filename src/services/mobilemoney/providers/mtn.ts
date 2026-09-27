@@ -61,6 +61,29 @@ export class MTNProvider {
     return token;
   }
 
+  /**
+   * Probes whether the configured credentials are still accepted by MTN by
+   * requesting a fresh access token. Used by the provider token watchdog to
+   * detect revoked/expired API credentials before they interrupt service.
+   */
+  async checkAuth(): Promise<{
+    success: boolean;
+    invalidCredentials?: boolean;
+    error?: unknown;
+  }> {
+    try {
+      const token = await this.getAccessToken();
+      return { success: Boolean(token) };
+    } catch (error: any) {
+      const status = error?.response?.status;
+      return {
+        success: false,
+        invalidCredentials: status === 401 || status === 403,
+        error,
+      };
+    }
+  }
+
   async getOperationalBalance() {
     try {
       const token = await this.getAccessToken();

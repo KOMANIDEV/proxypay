@@ -18,6 +18,8 @@ import {
   resetSettings,
   deleteSettings,
   validateSettings,
+  resolveSettingsConflict,
+  onSettingsChanged,
   SETTINGS_OPTIONS,
   DEFAULT_SETTINGS,
   _resetStoreForTesting,
@@ -34,7 +36,9 @@ jest.mock("fs", () => {
     ...actual,
     existsSync: jest.fn().mockReturnValue(false),
     readFileSync: jest.fn(),
-    writeFile: jest.fn((_p: unknown, _d: unknown, _e: unknown, cb: () => void) => cb()),
+    writeFile: jest.fn(
+      (_p: unknown, _d: unknown, _e: unknown, cb: () => void) => cb(),
+    ),
     mkdirSync: jest.fn(),
   };
 });
@@ -305,7 +309,144 @@ describe("SETTINGS_OPTIONS", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. Disk hydration
+// 7. Versioning & concurrency control
+// ---------------------------------------------------------------------------
+
+describe("versioning", () => {
+  it("starts at version 0 for an unknown user", () => {
+    expect(getSettings("user-v0").version).toBe(0);
+  });
+
+  it("increments the version on every successful update", () => {
+    updateSettings("user-v1", { theme: "dark" });
+    expect(getSettings("user-v1").version).toBe(1);
+    updateSettings("user-v1", { currency: "EUR" });
+    expect(getSettings("user-v1").version).toBe(2);
+  });
+
+  it("does not increment the version when validation fails", () => {
+    updateSettings("user-vbad", { theme: "dark" });
+    updateSettings("user-vbad", { theme: "rainbow" as never });
+    expect(getSettings("user-vbad").version).toBe(1);
+  });
+
+  it("applies an update when expectedVersion matches", () => {
+    updateSettings("user-ok", { theme: "dark" }); // version 1
+    const result = updateSettings(
+      "user-ok",
+      { currency: "EUR" },
+      {
+        expectedVersion: 1,
+      },
+    );
+    expect("settings" in result).toBe(true);
+    if ("settings" in result) {
+      expect(result.settings.currency).toBe("EUR");
+      expect(result.settings.version).toBe(2);
+    }
+  });
+
+  it("rejects the update with a conflict when expectedVersion is stale", () => {
+    updateSettings("user-conflict", { theme: "dark" }); // version 1
+    // A second session writes first, bumping to version 2.
+    updateSettings("user-conflict", { currency: "EUR" }); // version 2
+
+    const result = updateSettings(
+      "user-conflict",
+      { theme: "light" },
+      {
+        expectedVersion: 1, // stale
+      },
+    );
+    expect("conflict" in result).toBe(true);
+    if ("conflict" in result) {
+      expect(result.current.version).toBe(2);
+      expect(result.current.currency).toBe("EUR");
+    }
+    // Nothing was clobbered.
+    expect(getSettings("user-conflict").theme).toBe("dark");
+  });
+
+  it("resolveSettingsConflict server-wins keeps stored values but advances the version", () => {
+    updateSettings("user-sw", { theme: "dark" }); // version 1
+    const result = resolveSettingsConflict(
+      "user-sw",
+      { theme: "light" },
+      "server-wins",
+    );
+    expect("settings" in result).toBe(true);
+    if ("settings" in result) {
+      expect(result.settings.theme).toBe("dark"); // server value kept
+      expect(result.settings.version).toBe(2);
+    }
+  });
+
+  it("resolveSettingsConflict client-wins applies the incoming patch", () => {
+    updateSettings("user-cw", { theme: "dark" }); // version 1
+    const result = resolveSettingsConflict(
+      "user-cw",
+      { theme: "light" },
+      "client-wins",
+    );
+    expect("settings" in result).toBe(true);
+    if ("settings" in result) {
+      expect(result.settings.theme).toBe("light");
+      expect(result.settings.version).toBe(2);
+    }
+  });
+
+  it("resolveSettingsConflict merge keeps untouched fields from the server", () => {
+    updateSettings("user-merge2", { theme: "dark", currency: "EUR" }); // version 1
+    const result = resolveSettingsConflict(
+      "user-merge2",
+      { theme: "light" },
+      "merge",
+    );
+    expect("settings" in result).toBe(true);
+    if ("settings" in result) {
+      expect(result.settings.theme).toBe("light"); // from patch
+      expect(result.settings.currency).toBe("EUR"); // kept from server
+    }
+  });
+
+  it("resetSettings advances the version", () => {
+    updateSettings("user-reset-v", { theme: "dark" }); // version 1
+    const settings = resetSettings("user-reset-v");
+    expect(settings.version).toBe(2);
+  });
+
+  it("emits a change event after a successful update", () => {
+    const events: Array<Record<string, unknown>> = [];
+    const unsubscribe = onSettingsChanged((event) => events.push(event));
+    try {
+      updateSettings("user-evt", { theme: "dark" }, { source: "test" });
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        userId: "user-evt",
+        action: "update",
+        previousVersion: 0,
+        newVersion: 1,
+        source: "test",
+      });
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("does not emit a change event when validation fails", () => {
+    const listener = jest.fn();
+    const unsubscribe = onSettingsChanged(listener);
+    try {
+      updateSettings("user-noevt", { theme: "bad" as never });
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Disk hydration
 // ---------------------------------------------------------------------------
 
 describe("disk hydration", () => {

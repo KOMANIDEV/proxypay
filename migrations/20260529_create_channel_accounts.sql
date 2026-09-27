@@ -2,8 +2,8 @@
 -- Issue: #843
 -- Description: Persistent storage for channel accounts that distribute transaction load
 --              across multiple Stellar accounts to avoid sequence number collisions.
-
-BEGIN;
+-- NOTE: no explicit BEGIN/COMMIT — the migration runner wraps each migration
+-- in a transaction, so the version record and the DDL commit atomically.
 
 -- Table: channel_accounts
 CREATE TABLE IF NOT EXISTS channel_accounts (
@@ -44,5 +44,3 @@ CREATE TRIGGER trg_channel_accounts_updated_at
   BEFORE UPDATE ON channel_accounts
   FOR EACH ROW
   EXECUTE FUNCTION update_channel_accounts_updated_at();
-
-COMMIT;

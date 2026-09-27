@@ -77,6 +77,11 @@ import { requireAuth } from "../middleware/auth";
 import { requirePermission } from "../middleware/rbac";
 import { createError } from "../middleware/errorHandler";
 import { ERROR_CODES } from "../constants/errorCodes";
+import {
+  gateUpload,
+  linkStoredKey,
+  UploadGateResult,
+} from "../services/fileSecurityService";
 
 const VALID_STATUSES: DisputeStatus[] = [
   "open",
@@ -659,6 +664,33 @@ disputeRoutes.post(
       });
     }
 
+    // Security scan: antivirus + magic-byte type validation + integrity hash.
+    // The file must pass before anything is written to storage.
+    const security = await gateUpload(file, {
+      userId: req.user?.id || null,
+    });
+    if (security.outcome === "infected") {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Upload rejected: file failed the security scan",
+        { error: security.reason },
+      );
+    }
+    if (security.outcome === "quarantined") {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Upload quarantined: scan engine unavailable, please retry later",
+        { error: security.reason },
+      );
+    }
+    if (security.outcome === "error" || !security.record) {
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Upload security scan failed",
+        { error: security.reason },
+      );
+    }
+
     try {
       // Upload to S3
       const uploadResult = await uploadDisputeEvidenceToS3({
@@ -671,6 +703,18 @@ disputeRoutes.post(
         throw createError(ERROR_CODES.INTERNAL_ERROR, uploadResult.error, {
           error: uploadResult.error,
         });
+      }
+
+      // Attach the stored key to the security record for integrity audits.
+      if (uploadResult.success && uploadResult.key) {
+        await linkStoredKey(security.record.id, uploadResult.key).catch(
+          (err: unknown) => {
+            console.error(
+              "Failed to link security record to S3 key:",
+              err,
+            );
+          },
+        );
       }
 
       // Save evidence record
@@ -736,6 +780,37 @@ disputeRoutes.post(
       }
     }
 
+    // Security scan every file before anything is written to storage. If any
+    // file fails, the whole batch is rejected.
+    const securityResults: UploadGateResult[] = [];
+    for (const file of files) {
+      const security = await gateUpload(file, {
+        userId: req.user?.id || null,
+      });
+      if (security.outcome === "infected") {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          `File "${file.originalname}" rejected: failed the security scan`,
+          { error: security.reason },
+        );
+      }
+      if (security.outcome === "quarantined") {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          `File "${file.originalname}" quarantined: scan engine unavailable, please retry later`,
+          { error: security.reason },
+        );
+      }
+      if (security.outcome === "error" || !security.record) {
+        throw createError(
+          ERROR_CODES.INTERNAL_ERROR,
+          "Upload security scan failed",
+          { error: security.reason },
+        );
+      }
+      securityResults.push(security);
+    }
+
     try {
       // Upload all files to S3
       const uploadResults = await uploadMultipleDisputeEvidenceToS3(
@@ -764,6 +839,19 @@ disputeRoutes.post(
         const description = Array.isArray(descriptions)
           ? descriptions[i]
           : descriptions;
+
+        // Attach the stored key to the security record for integrity audits.
+        if (uploadResult.success && uploadResult.key) {
+          await linkStoredKey(
+            securityResults[i].record!.id,
+            uploadResult.key,
+          ).catch((err: unknown) => {
+            console.error(
+              "Failed to link security record to S3 key:",
+              err,
+            );
+          });
+        }
 
         const evidence = await disputeService.addEvidence(
           disputeId,
@@ -817,6 +905,242 @@ disputeRoutes.get(
         {
           error: message,
         },
+      );
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// #413 Dispute Evidence Organization — categorization, search, timeline
+// ---------------------------------------------------------------------------
+
+/**
+ * Valid evidence categories for #413.
+ * Covers transaction proof, communication logs, and merchant statements.
+ */
+export const EVIDENCE_CATEGORIES = [
+  "transaction_proof",
+  "communication",
+  "merchant_statement",
+  "identity_document",
+  "bank_statement",
+  "screenshot",
+  "other",
+] as const;
+
+export type EvidenceCategory = (typeof EVIDENCE_CATEGORIES)[number];
+
+/**
+ * PATCH /api/disputes/:disputeId/evidence/:evidenceId/category
+ *
+ * Update the category of a specific evidence item.
+ * Body: { category: EvidenceCategory }
+ */
+disputeRoutes.patch(
+  "/:disputeId/evidence/:evidenceId/category",
+  requireAuth,
+  requirePermission("dispute:update"),
+  async (req: Request, res: Response) => {
+    const { disputeId, evidenceId } = req.params;
+    const { category } = req.body;
+
+    if (!category || !EVIDENCE_CATEGORIES.includes(category as EvidenceCategory)) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        `Field "category" must be one of: ${EVIDENCE_CATEGORIES.join(", ")}`,
+        { error: `Invalid category: ${category}` },
+      );
+    }
+
+    try {
+      const updated = await disputeService.updateEvidenceCategory(
+        disputeId,
+        evidenceId,
+        category as EvidenceCategory,
+      );
+      if (!updated) {
+        throw createError(ERROR_CODES.NOT_FOUND, "Evidence item not found", {
+          error: "Evidence item not found",
+        });
+      }
+      return res.json(updated);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to update category";
+      throw createError(
+        message.includes("not found")
+          ? ERROR_CODES.NOT_FOUND
+          : ERROR_CODES.INTERNAL_ERROR,
+        message,
+        { error: message },
+      );
+    }
+  },
+);
+
+/**
+ * PATCH /api/disputes/:disputeId/evidence/reorder
+ *
+ * Drag-and-drop reorder: update the display_order of multiple evidence items.
+ * Body: { order: Array<{ id: string; position: number }> }
+ */
+disputeRoutes.patch(
+  "/:disputeId/evidence/reorder",
+  requireAuth,
+  requirePermission("dispute:update"),
+  async (req: Request, res: Response) => {
+    const { disputeId } = req.params;
+    const { order } = req.body;
+
+    if (
+      !Array.isArray(order) ||
+      order.length === 0 ||
+      !order.every(
+        (o: unknown) =>
+          o !== null &&
+          typeof o === "object" &&
+          typeof (o as any).id === "string" &&
+          typeof (o as any).position === "number",
+      )
+    ) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        'Field "order" must be an array of { id: string; position: number }',
+        { error: "Invalid order format" },
+      );
+    }
+
+    try {
+      const updated = await disputeService.reorderEvidence(disputeId, order);
+      return res.json({ reordered: updated });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to reorder evidence";
+      throw createError(
+        message.includes("not found")
+          ? ERROR_CODES.NOT_FOUND
+          : ERROR_CODES.INTERNAL_ERROR,
+        message,
+        { error: message },
+      );
+    }
+  },
+);
+
+/**
+ * GET /api/disputes/:disputeId/evidence/search
+ *
+ * Search evidence by keyword (searches file name, description, and category).
+ * Query: q (search term), category (optional filter)
+ */
+disputeRoutes.get(
+  "/:disputeId/evidence/search",
+  requireAuth,
+  requirePermission("dispute:read"),
+  async (req: Request, res: Response) => {
+    const { disputeId } = req.params;
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const category =
+      typeof req.query.category === "string"
+        ? (req.query.category as EvidenceCategory)
+        : undefined;
+
+    if (!q && !category) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        'At least one of "q" or "category" query params is required',
+        { error: "Missing search parameters" },
+      );
+    }
+
+    if (
+      category &&
+      !EVIDENCE_CATEGORIES.includes(category as EvidenceCategory)
+    ) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        `Invalid category. Must be one of: ${EVIDENCE_CATEGORIES.join(", ")}`,
+        { error: `Invalid category: ${category}` },
+      );
+    }
+
+    try {
+      const results = await disputeService.searchEvidence(
+        disputeId,
+        q,
+        category,
+      );
+      return res.json({ count: results.length, evidence: results });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Evidence search failed";
+      throw createError(
+        message.includes("not found")
+          ? ERROR_CODES.NOT_FOUND
+          : ERROR_CODES.INTERNAL_ERROR,
+        message,
+        { error: message },
+      );
+    }
+  },
+);
+
+/**
+ * GET /api/disputes/:disputeId/timeline
+ *
+ * Returns a chronological timeline of all events for a dispute:
+ * status changes, evidence uploads, notes, and assignments.
+ */
+disputeRoutes.get(
+  "/:disputeId/timeline",
+  requireAuth,
+  requirePermission("dispute:read"),
+  async (req: Request, res: Response) => {
+    try {
+      const timeline = await disputeService.getTimeline(req.params.disputeId);
+      return res.json({ count: timeline.length, timeline });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to retrieve timeline";
+      throw createError(
+        message.includes("not found")
+          ? ERROR_CODES.NOT_FOUND
+          : ERROR_CODES.INTERNAL_ERROR,
+        message,
+        { error: message },
+      );
+    }
+  },
+);
+
+/**
+ * GET /api/disputes/:disputeId/evidence/by-category
+ *
+ * Returns evidence grouped by category for the organized review UI.
+ */
+disputeRoutes.get(
+  "/:disputeId/evidence/by-category",
+  requireAuth,
+  requirePermission("dispute:read"),
+  async (req: Request, res: Response) => {
+    try {
+      const evidence = await disputeService.getEvidenceByCategory(
+        req.params.disputeId,
+      );
+      return res.json(evidence);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to retrieve categorized evidence";
+      throw createError(
+        message.includes("not found")
+          ? ERROR_CODES.NOT_FOUND
+          : ERROR_CODES.INTERNAL_ERROR,
+        message,
+        { error: message },
       );
     }
   },

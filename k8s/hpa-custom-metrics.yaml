@@ -1,0 +1,282 @@
+---
+# Enhanced HPA Configuration with Custom Metrics
+#
+# This configuration provides scaling based on application-level metrics
+# in addition to standard CPU/memory metrics.
+#
+# Metrics used for scaling:
+# 1. Queue depth (primary) - scales based on pending transactions
+# 2. Transaction processing rate - scales based on throughput
+# 3. Provider-specific queue depth - allows provider-aware scaling
+# 4. Worker utilization - ensures adequate worker capacity
+#
+# Prerequisites:
+# - Prometheus must be scraping /metrics endpoint
+# - Custom metrics must be registered in prom-client
+# - KEDA or Prometheus Adapter must be installed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Option 1: KEDA ScaledObject (Recommended)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: proxypay-worker-scaledobject
+  namespace: default
+  labels:
+    app: proxypay-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: proxypay-worker
+
+  # Scaling bounds
+  minReplicaCount: 1
+  maxReplicaCount: 20
+
+  # Cooldown to prevent thrashing
+  cooldownPeriod: 60
+  pollingInterval: 30
+
+  # Advanced scaling options
+  advanced:
+    # Restore to original replica count after scale-down
+    restoreToOriginalReplicaCount: false
+    # HorizontalPodAutoscalerConfig for fine-tuning
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 60
+            - type: Pods
+              value: 4
+              periodSeconds: 60
+          selectPolicy: Max
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 10
+              periodSeconds: 120
+          selectPolicy: Min
+
+  triggers:
+    # ── Primary: Queue Depth (BullMQ) ──
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: transaction_queue_depth_total
+        # Sum of all pending transactions across all queues
+        query: |
+          sum(bullmq_queue_waiting_jobs{queue=~"transaction|webhook|notification"})
+        threshold: "20"
+        activationThreshold: "5"  # Start scaling when queue has 5+ jobs
+
+    # ── Secondary: Transaction Processing Rate ──
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: transaction_processing_rate
+        # Scale up when processing rate exceeds capacity
+        query: |
+          sum(rate(transaction_total{status="completed"}[5m]))
+        threshold: "10"  # Scale up when rate > 10 TPS
+        activationThreshold: "2"
+
+    # ── Tertiary: Provider-Specific Queue Depth ──
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: provider_queue_depth_total
+        # Scale based on individual provider queue depths
+        query: |
+          sum by (provider) (provider_queue_depth)
+        threshold: "10"
+        activationThreshold: "3"
+
+    # ── Safety: Worker Utilization ──
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-service.monitoring.svc.cluster.local:9090
+        metricName: worker_utilization_ratio
+        # Scale up when workers are heavily utilized
+        query: |
+          worker_utilization_ratio
+        threshold: "0.8"  # Scale up when utilization > 80%
+        activationThreshold: "0.5"
+
+    # ── Fallback: HTTP Queue Depth API ──
+    - type: metrics-api
+      metadata:
+        url: "http://proxypay-service.default.svc.cluster.local:3000/health/queue/depth"
+        valueLocation: "total_depth"
+        targetValue: "20"
+        activationThreshold: "5"
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Option 2: API Server HPA with Custom Metrics
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: proxypay-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: proxypay
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 120
+      selectPolicy: Min
+  metrics:
+    # ── Primary: CPU Utilization ──
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # ── Secondary: Memory Utilization ──
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # ── Tertiary: HTTP Request Rate ──
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"
+
+    # ── Quaternary: Request Latency (P95) ──
+    - type: Pods
+      pods:
+        metric:
+          name: http_request_duration_seconds_p95
+        target:
+          type: AverageValue
+          averageValue: "1"  # Scale up when P95 > 1 second
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus ServiceMonitor for scraping custom metrics
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: proxypay-metrics
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: proxypay
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - default
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# PrometheusRule for HPA-related alerts
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: proxypay-hpa-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: proxypay-hpa
+      rules:
+        # Alert when queue depth is high for extended period
+        - alert: ProxyPayHighQueueDepth
+          expr: |
+            sum(bullmq_queue_waiting_jobs{queue=~"transaction|webhook|notification"}) > 50
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High transaction queue depth"
+            description: "Queue depth has been above 50 for 5 minutes. Current: {{ $value }}"
+
+        # Alert when worker utilization is high
+        - alert: ProxyPayHighWorkerUtilization
+          expr: |
+            worker_utilization_ratio > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High worker utilization"
+            description: "Worker utilization is above 90% for 5 minutes. Current: {{ $value }}"
+
+        # Alert when processing latency is high
+        - alert: ProxyPayHighProcessingLatency
+          expr: |
+            transaction_processing_latency_p95_seconds > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High transaction processing latency"
+            description: "P95 processing latency is above 5 seconds. Current: {{ $value }}s"
+
+        # Alert when HPA is at max capacity
+        - alert: ProxyPayHPAMaxCapacity
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler=~"proxypay.*"} 
+            == 
+            kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler=~"proxypay.*"}
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "HPA at max capacity"
+            description: "ProxyPay HPA has been at maximum replicas for 10 minutes"
+
+        # Alert on scaling failures
+        - alert: ProxyPayScalingFailure
+          expr: |
+            increase(kube_horizontalpodautoscaler_status_conditions{condition="ScalingActive",status="false"}[5m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: "HPA scaling failure"
+            description: "HPA failed to scale. Check HPA events and metrics."

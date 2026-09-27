@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { verifyOAuthAccessToken } from "../auth/oauth";
-import { verifyToken, JWTPayload } from "../auth/jwt";
+import { verifyToken, createSessionBinding, JWTPayload } from "../auth/jwt";
 import { ADMIN_API_KEY } from "../config/env";
 import { redisClient } from "../config/redis";
 import { getAdminSep10Service } from "../stellar/adminSep10";
@@ -192,7 +192,10 @@ export async function authenticateToken(
   }
 
   try {
-    const decoded = verifyToken(token);
+    const decoded = await verifyTokenStateful(
+      token,
+      createSessionBinding(req.header("X-Device-ID"), req.get("user-agent")),
+    );
     if (rejectMutationDuringImpersonation(req, res, decoded)) {
       return;
     }
@@ -267,7 +270,7 @@ export function optionalAuthentication(
   next();
 }
 
-export async function verifyTokenStateful(token: string): Promise<JWTPayload> {
+export async function verifyTokenStateful(token: string, binding?: string): Promise<JWTPayload> {
   // Run standard cryptographic verification
   const decoded = verifyToken(token);
   
@@ -277,6 +280,15 @@ export async function verifyTokenStateful(token: string): Promise<JWTPayload> {
     const invalidatedAt = invalidatedAtRaw ? String(invalidatedAtRaw) : null;
     if (invalidatedAt && decoded.iat <= parseInt(invalidatedAt, 10)) {
       throw new Error("Token has been revoked due to password change");
+    }
+  }
+
+  if (redisClient.isOpen && decoded.sessionId) {
+    const sessionRaw = await redisClient.get(`jwt:session:${decoded.sessionId}`);
+    if (!sessionRaw) throw new Error("Session has been revoked or expired");
+    const session = JSON.parse(sessionRaw) as { userId: string; binding?: string };
+    if (session.userId !== decoded.userId || (binding && session.binding !== binding)) {
+      throw new Error("Session binding validation failed");
     }
   }
   

@@ -15,6 +15,7 @@ export const ROUTING_KEYS = {
 
 export const QUEUES = {
   TRANSACTION_PROCESSING: "transaction-processing-queue",
+  TRANSACTION_REPROCESSING: "transaction-reprocessing-queue",
 };
 
 class RabbitMQManager {
@@ -34,6 +35,12 @@ class RabbitMQManager {
           channel.assertQueue(QUEUES.TRANSACTION_PROCESSING, { durable: true }),
           channel.bindQueue(
             QUEUES.TRANSACTION_PROCESSING,
+            EXCHANGES.TRANSACTIONS,
+            ROUTING_KEYS.TRANSACTION_PROCESS
+          ),
+          channel.assertQueue(QUEUES.TRANSACTION_REPROCESSING, { durable: true }),
+          channel.bindQueue(
+            QUEUES.TRANSACTION_REPROCESSING,
             EXCHANGES.TRANSACTIONS,
             ROUTING_KEYS.TRANSACTION_PROCESS
           ),

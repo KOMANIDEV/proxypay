@@ -6,6 +6,7 @@ import { MerchantService } from "../services/merchantService";
 import { CreateMerchantInput } from "../models/merchant";
 import { authenticateToken } from "../middleware/auth";
 import { checkAccountStatusStrict } from "../middleware/checkAccountStatus";
+import { requireScope, ApiKeyScope } from "../middleware/scopeEnforcement";
 
 interface CsvRow {
   name: string;
@@ -178,6 +179,7 @@ merchantRoutes.post(
   "/",
   authenticateToken,
   requireAdmin,
+  requireScope(ApiKeyScope.TRANSACTIONS_WRITE, ApiKeyScope.ADMIN),
   async (req: Request, res: Response) => {
     try {
       const input: CreateMerchantInput = req.body;
@@ -216,6 +218,7 @@ merchantRoutes.post(
   "/bulk",
   authenticateToken,
   requireAdmin,
+  requireScope(ApiKeyScope.TRANSACTIONS_WRITE, ApiKeyScope.ADMIN),
   upload.single("file"),
   async (req: Request, res: Response) => {
     try {
@@ -284,6 +287,7 @@ merchantRoutes.get(
   "/bulk/:jobId",
   authenticateToken,
   requireAdmin,
+  requireScope(ApiKeyScope.TRANSACTIONS_READ, ApiKeyScope.ADMIN),
   async (req: Request, res: Response) => {
     try {
       const { jobId } = req.params;
@@ -311,6 +315,7 @@ merchantRoutes.get(
   "/",
   authenticateToken,
   requireAdmin,
+  requireScope(ApiKeyScope.TRANSACTIONS_READ, ApiKeyScope.ADMIN),
   async (req: Request, res: Response) => {
     try {
       const page = parseInt(req.query.page as string) || 1;
@@ -341,6 +346,7 @@ merchantRoutes.get(
   "/:id",
   authenticateToken,
   requireAdmin,
+  requireScope(ApiKeyScope.TRANSACTIONS_READ, ApiKeyScope.ADMIN),
   async (req: Request, res: Response) => {
     try {
       const { id } = req.params;

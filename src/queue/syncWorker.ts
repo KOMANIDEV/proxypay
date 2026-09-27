@@ -1,6 +1,7 @@
 import { Worker, Job } from "bullmq";
 import { queueOptions } from "./config";
 import { SyncJobData, SyncJobResult, SYNC_QUEUE_NAME } from "./syncQueue";
+import { instrumentWorker } from "./queueMetricsService";
 import {
   AccountingService,
   RateLimitError,
@@ -77,6 +78,8 @@ export const syncWorker = new Worker<SyncJobData, SyncJobResult>(
     concurrency: 3, // Safe concurrency limit for accounting API rate-limits
   },
 );
+
+instrumentWorker(SYNC_QUEUE_NAME, syncWorker);
 
 // Graceful shutdown helper
 export async function closeSyncWorker(): Promise<void> {

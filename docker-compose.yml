@@ -23,6 +23,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      maildev:
+        condition: service_healthy
+      stellar:
+        condition: service_healthy
     env_file:
       - .env
     environment:
@@ -30,6 +34,10 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: postgresql://user:password@postgres:5432/proxypay_stellar
       REDIS_URL: redis://redis:6379
+      SMTP_HOST: maildev
+      SMTP_PORT: 1025
+      STELLAR_HORIZON_URL: http://stellar:8000
+      STELLAR_NETWORK: local
       # Loki transport — optional, falls back to stdout when unset
       LOKI_HOST: ${LOKI_HOST:-http://loki:3100}
       SERVICE_NAME: ${SERVICE_NAME:-proxypay-api}
@@ -54,6 +62,37 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - proxypay_net
+
+  # ---------------------------------------------------------------------------
+  # Postgres streaming read replica (hot standby) — simulates a cross-region
+  # replica locally for lag monitoring / failover testing. Configure the app
+  # with READ_REPLICA_URL=postgresql://user:password@postgres-replica:5432/proxypay_stellar
+  # ---------------------------------------------------------------------------
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: proxypay_postgres_replica
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: proxypay_stellar
+      PRIMARY_HOST: postgres
+      REPLICA_USER: user
+      PGPASSWORD: password
+    entrypoint: ["/usr/local/bin/pg-replica-entrypoint.sh"]
+    volumes:
+      - ./scripts/pg-replica-entrypoint.sh:/usr/local/bin/pg-replica-entrypoint.sh:ro
+      - postgres_replica_data:/var/lib/postgresql/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d proxypay_stellar"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - proxypay_net
 
@@ -106,33 +145,12 @@ services:
       start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # Application (live reload via ts-node-dev)
+  # Loki (centralized log aggregation)
   # ---------------------------------------------------------------------------
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    container_name: proxypay_app
+  loki:
+    image: grafana/loki:latest
+    container_name: proxypay_loki
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      maildev:
-        condition: service_healthy
-      stellar:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      # Override the localhost URLs from .env to use Docker service names
-      DATABASE_URL: postgresql://user:password@postgres:5432/proxypay_stellar
-      REDIS_URL: redis://redis:6379
-      SMTP_HOST: maildev
-      SMTP_PORT: 1025
-      STELLAR_HORIZON_URL: http://stellar:8000
-      STELLAR_NETWORK: local
     ports:
       - "3100:3100"
     volumes:
@@ -172,3 +190,4 @@ networks:
 volumes:
   grafana_data:
   redis_data:
+  postgres_replica_data:

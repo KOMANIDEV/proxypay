@@ -79,6 +79,15 @@ DROP INDEX IF EXISTS idx_transactions_idempotency_key;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Step 2: Rename the existing (now constraint-free) table.
 -- ─────────────────────────────────────────────────────────────────────────────
+-- PostgreSQL constraint names share a schema-wide namespace. The CHECK
+-- constraints still on this table (type/status/webhook_delivery_status) keep
+-- those names occupied, so the partitioned parent created in Step 3 would be
+-- forced to auto-name its copies transactions_*_check1, which then breaks
+-- ATTACH PARTITION. Rename them out of the way first.
+ALTER TABLE transactions RENAME CONSTRAINT transactions_type_check TO transactions_legacy_type_check;
+ALTER TABLE transactions RENAME CONSTRAINT transactions_status_check TO transactions_legacy_status_check;
+ALTER TABLE transactions RENAME CONSTRAINT transactions_webhook_delivery_status_check TO transactions_legacy_webhook_delivery_status_check;
+
 ALTER TABLE transactions RENAME TO transactions_legacy;
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -88,12 +97,14 @@ CREATE TABLE transactions (
   id                       UUID           NOT NULL DEFAULT gen_random_uuid(),
   reference_number         VARCHAR(25)    NOT NULL,
   type                     VARCHAR(10)    NOT NULL
+                             CONSTRAINT transactions_legacy_type_check
                              CHECK (type IN ('deposit', 'withdraw')),
   amount                   DECIMAL(20, 7) NOT NULL,
   phone_number             TEXT           NOT NULL,
   provider                 VARCHAR(20)    NOT NULL,
   stellar_address          TEXT           NOT NULL,
   status                   VARCHAR(20)    NOT NULL
+                             CONSTRAINT transactions_legacy_status_check
                              CHECK (status IN ('pending', 'completed', 'failed', 'cancelled')),
   user_id                  UUID           REFERENCES users(id),
   tags                     TEXT[]         DEFAULT '{}',
@@ -104,6 +115,7 @@ CREATE TABLE transactions (
   notes                    TEXT,
   admin_notes              TEXT,
   webhook_delivery_status  VARCHAR(20)    NOT NULL DEFAULT 'pending'
+                             CONSTRAINT transactions_legacy_webhook_delivery_status_check
                              CHECK (webhook_delivery_status IN ('pending', 'delivered', 'failed', 'skipped')),
   webhook_last_attempt_at  TIMESTAMP,
   webhook_delivered_at     TIMESTAMP,
@@ -210,8 +222,17 @@ CREATE TRIGGER transactions_updated_at
   FOR EACH ROW EXECUTE FUNCTION update_transactions_updated_at();
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Step 9: Recreate foreign key constraints that were dropped in Step 1.
+-- Step 9: Foreign key constraints dropped in Step 1.
 -- ─────────────────────────────────────────────────────────────────────────────
-ALTER TABLE disputes
-  ADD CONSTRAINT disputes_transaction_id_fkey
-  FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE RESTRICT;
+-- NOTE: disputes_transaction_id_fkey is deliberately NOT recreated here.
+-- PostgreSQL requires the referenced column(s) of a foreign key to have a
+-- UNIQUE constraint, and a UNIQUE constraint on a partitioned table must
+-- include the partition key (created_at). Disputes has no matching
+-- transaction created_at column, so the constraint cannot exist against the
+-- partitioned parent. Rolling back (the .down.sql file) restores it together
+-- with the original table.
+--
+-- Data-integrity impact: disputes.transaction_id is not FK-enforced while
+-- transactions is partitioned. Application-level checks in the dispute flow
+-- remain the guard; if FK enforcement is required, add a UNIQUE (id, created_at)
+-- to the parent and a corresponding two-column FK from a new disputes column.

@@ -169,8 +169,11 @@ contactsRoutes.get(
     }
 
     try {
-      const contacts = await contactModel.listByUser(userId);
-      return res.json(contacts);
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+      const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+      const search = typeof req.query.search === "string" ? req.query.search : undefined;
+      const { contacts, nextCursor } = await contactModel.listByUser(userId, { limit, cursor, search });
+      return res.json({ contacts, nextCursor });
     } catch (error) {
       console.error("List contacts error:", error);
       throw createError(

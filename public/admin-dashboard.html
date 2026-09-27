@@ -1,0 +1,1093 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ProxyPay Control Room</title>
+    <style>
+      :root {
+        --ink: #16232d;
+        --muted: #6b7b84;
+        --paper: #f4f7f4;
+        --panel: #ffffff;
+        --line: #dce5df;
+        --teal: #087f75;
+        --teal-dark: #075d59;
+        --lime: #b8e36d;
+        --amber: #d88924;
+        --red: #c84b45;
+        --blue: #3c6f9c;
+        --shadow: 0 18px 50px rgba(24, 48, 45, 0.08);
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      .shell {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 248px 1fr;
+      }
+      aside {
+        background: #123b3a;
+        color: #e9f5ea;
+        padding: 28px 20px;
+        display: flex;
+        flex-direction: column;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        margin-bottom: 48px;
+      }
+      .brand-mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        background: var(--lime);
+        color: var(--teal-dark);
+        display: grid;
+        place-items: center;
+        font-weight: 900;
+      }
+      nav {
+        display: grid;
+        gap: 8px;
+      }
+      nav button {
+        border: 0;
+        text-align: left;
+        color: #aac9c1;
+        background: transparent;
+        padding: 12px 14px;
+        border-radius: 9px;
+        font-weight: 700;
+      }
+      nav button.active,
+      nav button:hover {
+        background: rgba(184, 227, 109, 0.14);
+        color: #fff;
+      }
+      .aside-foot {
+        margin-top: auto;
+        color: #8fb5ac;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      main {
+        min-width: 0;
+        padding: 30px clamp(20px, 4vw, 60px) 54px;
+      }
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        align-items: flex-start;
+        margin-bottom: 26px;
+      }
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+      h1 {
+        font-size: clamp(28px, 3vw, 42px);
+        letter-spacing: -0.03em;
+        line-height: 1.05;
+      }
+      .eyebrow {
+        color: var(--teal);
+        text-transform: uppercase;
+        font-size: 11px;
+        letter-spacing: 0.14em;
+        font-weight: 800;
+        margin-bottom: 8px;
+      }
+      .subtitle {
+        color: var(--muted);
+        margin-top: 10px;
+      }
+      .actions {
+        display: flex;
+        gap: 9px;
+        align-items: center;
+      }
+      .btn {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--ink);
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-weight: 750;
+      }
+      .btn:hover {
+        border-color: var(--teal);
+        color: var(--teal-dark);
+      }
+      .btn.primary {
+        background: var(--teal);
+        border-color: var(--teal);
+        color: #fff;
+      }
+      .btn.primary:hover {
+        background: var(--teal-dark);
+      }
+      .btn.danger {
+        color: var(--red);
+      }
+      .status-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        border: 1px solid var(--line);
+        border-radius: 99px;
+        padding: 7px 10px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        background: #fff;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .dot.ok {
+        background: #54a765;
+      }
+      .dot.warn {
+        background: var(--amber);
+      }
+      .dot.bad {
+        background: var(--red);
+      }
+      .view {
+        display: none;
+      }
+      .view.active {
+        display: block;
+      }
+      .grid {
+        display: grid;
+        gap: 16px;
+      }
+      .metrics {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        box-shadow: var(--shadow);
+      }
+      .metric {
+        padding: 20px;
+        min-height: 132px;
+        position: relative;
+        overflow: hidden;
+      }
+      .metric:after {
+        content: "";
+        position: absolute;
+        right: -22px;
+        bottom: -30px;
+        width: 90px;
+        height: 90px;
+        border-radius: 50%;
+        background: #e8f3d0;
+      }
+      .metric-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 750;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .metric-value {
+        font-size: 31px;
+        font-weight: 800;
+        margin-top: 14px;
+        letter-spacing: -0.04em;
+      }
+      .metric-note {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 7px;
+      }
+      .two-col {
+        grid-template-columns: 1.25fr 0.75fr;
+        margin-top: 16px;
+      }
+      .three-col {
+        grid-template-columns: repeat(3, 1fr);
+        margin-top: 16px;
+      }
+      .panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 18px 20px;
+        border-bottom: 1px solid var(--line);
+      }
+      .panel-head h2 {
+        font-size: 16px;
+      }
+      .panel-body {
+        padding: 18px 20px;
+      }
+      .health-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+      }
+      .health-item {
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 13px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+      }
+      .health-item strong {
+        display: block;
+        font-size: 13px;
+      }
+      .health-item span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .bar {
+        height: 8px;
+        background: #e7eeea;
+        border-radius: 99px;
+        overflow: hidden;
+        margin-top: 12px;
+      }
+      .bar i {
+        display: block;
+        height: 100%;
+        background: var(--teal);
+        border-radius: inherit;
+        width: 0;
+        transition: width 0.4s ease;
+      }
+      .queue-list {
+        display: grid;
+        gap: 12px;
+      }
+      .queue-row {
+        display: flex;
+        justify-content: space-between;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .queue-row strong {
+        color: var(--ink);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 13px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        font-size: 10px;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      .pill {
+        padding: 5px 8px;
+        border-radius: 99px;
+        font-size: 11px;
+        font-weight: 800;
+        background: #eaf2ed;
+        color: var(--teal-dark);
+      }
+      .pill.warn {
+        background: #fff2dc;
+        color: #9b6016;
+      }
+      .pill.bad {
+        background: #fde7e5;
+        color: #a53d38;
+      }
+      .toolbar {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .input {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: 10px 12px;
+        color: var(--ink);
+        min-width: 220px;
+      }
+      .user-layout {
+        display: grid;
+        grid-template-columns: 1fr 310px;
+        gap: 16px;
+      }
+      .detail-empty {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      .detail-list {
+        display: grid;
+        gap: 12px;
+      }
+      .detail-line {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 13px;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 10px;
+      }
+      .detail-line span {
+        color: var(--muted);
+      }
+      .ops {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 16px;
+      }
+      .op-card {
+        padding: 20px;
+      }
+      .op-card h3 {
+        font-size: 16px;
+        margin-bottom: 7px;
+      }
+      .op-card p {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+        margin-bottom: 16px;
+      }
+      .op-card .toolbar {
+        align-items: stretch;
+      }
+      .op-card .input {
+        min-width: 0;
+        flex: 1;
+      }
+      .log {
+        background: #102726;
+        color: #bce0c8;
+        padding: 15px;
+        border-radius: 8px;
+        min-height: 145px;
+        font:
+          12px/1.7 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+        white-space: pre-wrap;
+      }
+      .toast {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        background: #153f3d;
+        color: #fff;
+        padding: 13px 16px;
+        border-radius: 9px;
+        box-shadow: var(--shadow);
+        transform: translateY(130%);
+        transition: transform 0.25s ease;
+        z-index: 4;
+        font-size: 13px;
+      }
+      .toast.show {
+        transform: translateY(0);
+      }
+      .modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(9, 28, 27, 0.42);
+        display: none;
+        place-items: center;
+        padding: 20px;
+        z-index: 3;
+      }
+      .modal.open {
+        display: grid;
+      }
+      .modal-card {
+        width: min(460px, 100%);
+        background: #fff;
+        border-radius: 12px;
+        padding: 24px;
+        box-shadow: 0 28px 80px rgba(0, 0, 0, 0.2);
+      }
+      .modal-card h2 {
+        margin-bottom: 10px;
+      }
+      .modal-card p {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+        margin-bottom: 16px;
+      }
+      .modal-card textarea {
+        width: 100%;
+        min-height: 110px;
+        resize: vertical;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 11px;
+      }
+      .modal-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 9px;
+        margin-top: 15px;
+      }
+      @media (max-width: 1050px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+        aside {
+          padding: 17px 20px;
+          flex-direction: row;
+          align-items: center;
+          gap: 28px;
+        }
+        .brand {
+          margin: 0;
+        }
+        nav {
+          display: flex;
+          overflow-x: auto;
+        }
+        nav button {
+          white-space: nowrap;
+        }
+        .aside-foot {
+          display: none;
+        }
+        .metrics {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+      @media (max-width: 760px) {
+        main {
+          padding: 24px 16px 40px;
+        }
+        .topbar {
+          flex-direction: column;
+        }
+        .actions {
+          width: 100%;
+        }
+        .actions .btn {
+          flex: 1;
+        }
+        .two-col,
+        .three-col,
+        .user-layout,
+        .ops {
+          grid-template-columns: 1fr;
+        }
+        .health-grid {
+          grid-template-columns: 1fr;
+        }
+        .metrics {
+          gap: 10px;
+        }
+        .metric {
+          padding: 15px;
+          min-height: 116px;
+        }
+        .metric-value {
+          font-size: 25px;
+        }
+        .input {
+          min-width: 0;
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside>
+        <div class="brand">
+          <div class="brand-mark">P</div>
+          <span>ProxyPay / control</span>
+        </div>
+        <nav aria-label="Dashboard sections">
+          <button class="active" data-view="overview">Overview</button>
+          <button data-view="users">Users</button>
+          <button data-view="operations">Operations</button>
+        </nav>
+        <div class="aside-foot">
+          Admin surface<br /><span id="last-refresh"
+            >Waiting for first sync</span
+          >
+        </div>
+      </aside>
+      <main>
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">Operations center</div>
+            <h1 id="page-title">System overview</h1>
+            <p class="subtitle">
+              Live health, throughput, and intervention controls.
+            </p>
+          </div>
+          <div class="actions">
+            <span class="status-chip"
+              ><i class="dot" id="global-dot"></i
+              ><span id="global-status">Connecting</span></span
+            ><button class="btn primary" id="refresh-btn">Refresh data</button>
+          </div>
+        </header>
+
+        <section class="view active" id="overview">
+          <div class="grid metrics">
+            <article class="panel metric">
+              <div class="metric-label">24h transactions</div>
+              <div class="metric-value" id="m-total">--</div>
+              <div class="metric-note" id="m-volume">Volume unavailable</div>
+            </article>
+            <article class="panel metric">
+              <div class="metric-label">Success rate</div>
+              <div class="metric-value" id="m-success">--</div>
+              <div class="metric-note">Across recent activity</div>
+            </article>
+            <article class="panel metric">
+              <div class="metric-label">Active users</div>
+              <div class="metric-value" id="m-users">--</div>
+              <div class="metric-note">Seen in the last 24 hours</div>
+            </article>
+            <article class="panel metric">
+              <div class="metric-label">Queue pressure</div>
+              <div class="metric-value" id="m-queue">--</div>
+              <div class="metric-note" id="m-queue-note">
+                Awaiting queue data
+              </div>
+            </article>
+          </div>
+          <div class="grid two-col">
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Core services</h2>
+                <span class="pill" id="health-time">--</span>
+              </div>
+              <div class="panel-body">
+                <div class="health-grid" id="health-grid"></div>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Queue load</h2>
+                <span class="pill" id="queue-state">Unknown</span>
+              </div>
+              <div class="panel-body">
+                <div class="queue-list" id="queue-list"></div>
+                <div class="bar"><i id="queue-bar"></i></div>
+              </div>
+            </article>
+          </div>
+          <div class="grid three-col">
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Provider posture</h2>
+                <button class="btn" data-action="provider-refresh">
+                  Refresh
+                </button>
+              </div>
+              <div class="panel-body">
+                <div class="health-grid" id="providers-grid"></div>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Database replicas</h2>
+                <span class="pill" id="replica-state">--</span>
+              </div>
+              <div class="panel-body">
+                <div class="queue-list" id="replicas-list"></div>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Connection pool</h2>
+                <span class="pill" id="pool-state">--</span>
+              </div>
+              <div class="panel-body">
+                <div class="queue-list" id="pool-list"></div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="users">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>User management</h2>
+                <p class="subtitle">
+                  Review accounts and apply guarded account controls.
+                </p>
+              </div>
+              <div class="toolbar">
+                <input
+                  class="input"
+                  id="user-filter"
+                  placeholder="Search user or role"
+                /><button class="btn primary" id="load-users">
+                  Load users
+                </button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>User</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="users-body">
+                  <tr>
+                    <td colspan="5" class="detail-empty">
+                      Load users to begin.
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel" style="margin-top: 16px">
+            <div class="panel-head">
+              <h2>Selected user</h2>
+              <span class="pill" id="selected-user-state">None</span>
+            </div>
+            <div class="panel-body" id="user-detail">
+              <p class="detail-empty">
+                Select a user to inspect account details and controls.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="operations">
+          <div class="ops">
+            <article class="panel op-card">
+              <h3>Refund a transaction</h3>
+              <p>
+                Post a compensating ledger entry for a failed or disputed
+                transaction. Requires an admin bearer token.
+              </p>
+              <div class="toolbar">
+                <input
+                  class="input"
+                  id="refund-id"
+                  placeholder="Transaction ID"
+                /><button class="btn danger" data-action="refund">
+                  Refund
+                </button>
+              </div>
+            </article>
+            <article class="panel op-card">
+              <h3>Replica routing</h3>
+              <p>
+                Temporarily remove a degraded read replica from rotation or
+                restore it after recovery.
+              </p>
+              <div class="toolbar">
+                <input
+                  class="input"
+                  id="replica-url"
+                  placeholder="Replica URL"
+                /><button class="btn" data-action="disable-replica">
+                  Disable</button
+                ><button class="btn" data-action="enable-replica">
+                  Enable
+                </button>
+              </div>
+            </article>
+            <article class="panel op-card">
+              <h3>Service diagnostics</h3>
+              <p>
+                Run a fresh health read across the application, queue, Redis,
+                providers, and database replicas.
+              </p>
+              <button class="btn primary" data-action="diagnostics">
+                Run diagnostics
+              </button>
+            </article>
+            <article class="panel op-card">
+              <h3>Activity log</h3>
+              <div class="log" id="activity-log">
+                No operations performed in this session.
+              </div>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <div class="modal" id="confirm-modal">
+      <div class="modal-card">
+        <h2 id="modal-title">Confirm operation</h2>
+        <p id="modal-copy"></p>
+        <textarea
+          id="modal-reason"
+          placeholder="Reason for this operation"
+        ></textarea>
+        <div class="modal-actions">
+          <button class="btn" data-action="close-modal">Cancel</button
+          ><button class="btn primary" data-action="confirm-modal">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const state = { users: [], pending: null };
+      const $ = (id) => document.getElementById(id);
+      const token = () => localStorage.getItem("proxypay_admin_token") || "";
+      const api = async (path, options = {}) => {
+        const headers = {
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(token() ? { Authorization: `Bearer ${token()}` } : {}),
+          ...(options.headers || {}),
+        };
+        const response = await fetch(path, { ...options, headers });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok)
+          throw new Error(
+            data.message || data.error || `Request failed (${response.status})`,
+          );
+        return data;
+      };
+      const showToast = (message) => {
+        $("toast").textContent = message;
+        $("toast").classList.add("show");
+        setTimeout(() => $("toast").classList.remove("show"), 3200);
+      };
+      const log = (message) => {
+        $("activity-log").textContent =
+          `[${new Date().toLocaleTimeString()}] ${message}\n` +
+          $("activity-log").textContent;
+      };
+      const statusClass = (value) =>
+        String(value || "")
+          .toLowerCase()
+          .includes("healthy") ||
+        String(value).toLowerCase() === "ok" ||
+        String(value).toLowerCase() === "online"
+          ? "ok"
+          : String(value).toLowerCase().includes("degrad") ||
+              String(value).toLowerCase().includes("unknown")
+            ? "warn"
+            : "bad";
+      const pill = (value) =>
+        `<span class="pill ${statusClass(value) === "bad" ? "bad" : statusClass(value) === "warn" ? "warn" : ""}">${value || "unknown"}</span>`;
+      const setHealth = (items) => {
+        $("health-grid").innerHTML = items
+          .map(
+            ([name, value]) =>
+              `<div class="health-item"><div><strong>${name}</strong><span>${value || "unknown"}</span></div><i class="dot ${statusClass(value)}"></i></div>`,
+          )
+          .join("");
+      };
+
+      async function loadOverview() {
+        try {
+          const [stats, provider, connections, replicas] = await Promise.all([
+            api("/api/admin/dashboard/stats"),
+            api("/api/admin/providers/health"),
+            api("/api/admin/connections/summary"),
+            api("/api/admin/replicas"),
+          ]);
+          const t = stats.transactions || {},
+            q = stats.queue || {};
+          $("m-total").textContent = Number(t.totalCount || 0).toLocaleString();
+          $("m-volume").textContent =
+            `Volume ${Number(t.totalVolume || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+          $("m-success").textContent =
+            `${Number(t.successRate || 0).toFixed(1)}%`;
+          $("m-users").textContent = Number(
+            t.activeUsers || 0,
+          ).toLocaleString();
+          $("m-queue").textContent = Number(
+            q.pendingJobs || 0,
+          ).toLocaleString();
+          $("m-queue-note").textContent =
+            `${Number(q.activeJobs || 0)} active / ${Number(q.failedJobs || 0)} failed`;
+          setHealth([
+            ["Database", stats.health?.database],
+            ["Redis", stats.health?.redis],
+            ["Stellar", stats.health?.stellar],
+            ["API latency", `${stats.health?.responseTime || 0} ms`],
+          ]);
+          $("health-time").textContent = new Date(
+            stats.timestamp || Date.now(),
+          ).toLocaleTimeString();
+          $("queue-state").outerHTML =
+            `<span class="pill" id="queue-state">${q.failedJobs > 100 ? "Degraded" : "Healthy"}</span>`;
+          $("queue-list").innerHTML = [
+            ["Pending jobs", q.pendingJobs],
+            ["Active jobs", q.activeJobs],
+            ["Completed jobs", q.completedJobs],
+            ["Failed jobs", q.failedJobs],
+            ["Dead letter", q.dlqSize],
+          ]
+            .map(
+              ([k, v]) =>
+                `<div class="queue-row"><span>${k}</span><strong>${Number(v || 0).toLocaleString()}</strong></div>`,
+            )
+            .join("");
+          $("queue-bar").style.width =
+            `${Math.min(100, (Number(q.activeJobs || 0) + Number(q.pendingJobs || 0)) / Math.max(1, Number(q.totalJobs || 1) * 0.01))}%`;
+          const providerEntries =
+            provider.providers && Array.isArray(provider.providers)
+              ? provider.providers
+              : Object.entries(stats.providers || {}).map(([name, value]) => ({
+                  provider: name,
+                  status: value.status,
+                  failureRate: value.failureRate,
+                }));
+          $("providers-grid").innerHTML = providerEntries.length
+            ? providerEntries
+                .map(
+                  (p) =>
+                    `<div class="health-item"><div><strong>${p.provider || "provider"}</strong><span>${p.failureRate != null ? `${Number(p.failureRate).toFixed(1)}% failure` : "health feed"}</span></div>${pill(p.status || (p.isHealthy ? "online" : "offline"))}</div>`,
+                )
+                .join("")
+            : `<p class="detail-empty">No provider health data.</p>`;
+          const live = replicas.liveHealth || [];
+          $("replica-state").textContent =
+            `${live.filter((r) => r.healthy).length}/${live.length || 0} healthy`;
+          $("replicas-list").innerHTML = live.length
+            ? live
+                .map(
+                  (r) =>
+                    `<div class="queue-row"><span>${r.url || "replica"}</span>${pill(r.healthy ? "healthy" : "offline")}</div>`,
+                )
+                .join("")
+            : `<p class="detail-empty">No replicas configured.</p>`;
+          $("pool-state").textContent =
+            `${connections.longRunningCount || 0} long-running`;
+          $("pool-list").innerHTML = [
+            ["Primary total", connections.primaryPoolTotal],
+            ["Primary idle", connections.primaryPoolIdle],
+            ["Waiting", connections.primaryPoolWaiting],
+            ["Trackers", connections.activeTrackers],
+          ]
+            .map(
+              ([k, v]) =>
+                `<div class="queue-row"><span>${k}</span><strong>${Number(v || 0).toLocaleString()}</strong></div>`,
+            )
+            .join("");
+          $("global-dot").className = "dot ok";
+          $("global-status").textContent = "All systems read";
+          $("last-refresh").textContent =
+            `Last sync ${new Date().toLocaleTimeString()}`;
+        } catch (error) {
+          $("global-dot").className = "dot bad";
+          $("global-status").textContent = "Auth or API error";
+          showToast(error.message);
+        }
+      }
+
+      async function loadUsers() {
+        try {
+          const data = await api("/api/admin/users?page=1&limit=50");
+          state.users = data.data || data.users || [];
+          const filter = $("user-filter").value.toLowerCase();
+          const users = state.users.filter((u) =>
+            JSON.stringify(u).toLowerCase().includes(filter),
+          );
+          $("users-body").innerHTML = users.length
+            ? users
+                .map(
+                  (u) =>
+                    `<tr><td><strong>${u.displayName || u.email || u.id || "Unknown"}</strong><br><small>${u.id || ""}</small></td><td>${u.role || "user"}</td><td>${pill(u.status || (u.locked ? "locked" : "active"))}</td><td>${u.createdAt ? new Date(u.createdAt).toLocaleDateString() : "-"}</td><td><button class="btn" data-user="${u.id}">Inspect</button></td></tr>`,
+                )
+                .join("")
+            : `<tr><td colspan="5" class="detail-empty">No users returned by the admin API.</td></tr>`;
+          $("users-body")
+            .querySelectorAll("button[data-user]")
+            .forEach((button) =>
+              button.addEventListener("click", () =>
+                selectUser(button.dataset.user),
+              ),
+            );
+        } catch (error) {
+          showToast(error.message);
+        }
+      }
+      function selectUser(id) {
+        const user = state.users.find((item) => item.id === id);
+        if (!user) return;
+        $("selected-user-state").textContent = user.status || "active";
+        $("user-detail").innerHTML = `<div class="detail-list">${Object.entries(
+          user,
+        )
+          .filter(
+            ([key]) => !["backup_codes", "two_factor_secret"].includes(key),
+          )
+          .slice(0, 12)
+          .map(
+            ([key, value]) =>
+              `<div class="detail-line"><span>${key}</span><strong>${typeof value === "object" ? JSON.stringify(value) : (value ?? "-")}</strong></div>`,
+          )
+          .join(
+            "",
+          )}<div class="toolbar"><button class="btn danger" data-action="user-freeze" data-user-id="${id}">Freeze account</button><button class="btn" data-action="user-unfreeze" data-user-id="${id}">Unfreeze</button></div></div>`;
+      }
+      function openConfirm(action, payload, title, copy) {
+        state.pending = { action, payload };
+        $("modal-title").textContent = title;
+        $("modal-copy").textContent = copy;
+        $("modal-reason").value = "";
+        $("confirm-modal").classList.add("open");
+      }
+      async function confirmAction() {
+        const item = state.pending;
+        if (!item) return;
+        const reason =
+          $("modal-reason").value.trim() || "Admin dashboard operation";
+        try {
+          if (item.action === "refund")
+            await api(`/api/transactions/${item.payload}/refund`, {
+              method: "POST",
+              body: JSON.stringify({ reason }),
+            });
+          if (item.action === "freeze" || item.action === "unfreeze")
+            await api(`/api/admin/users/${item.payload}/${item.action}`, {
+              method: "POST",
+              body: JSON.stringify({ reason }),
+            });
+          showToast("Operation completed");
+          log(`${item.action} completed for ${item.payload}`);
+          $("confirm-modal").classList.remove("open");
+          await loadOverview();
+        } catch (error) {
+          showToast(error.message);
+        }
+      }
+      async function operation(action) {
+        if (action === "refund")
+          return openConfirm(
+            "refund",
+            $("refund-id").value.trim(),
+            "Confirm refund",
+            "This will post a compensating ledger entry and reverse the transaction.",
+          );
+        if (action === "diagnostics") {
+          await loadOverview();
+          showToast("Diagnostics refreshed");
+          log("System diagnostics refreshed");
+        }
+        if (action === "disable-replica" || action === "enable-replica") {
+          const url = $("replica-url").value.trim();
+          if (!url) return showToast("Enter a replica URL");
+          try {
+            await api(
+              `/api/admin/replicas/${action === "disable-replica" ? "disable" : "enable"}`,
+              { method: "POST", body: JSON.stringify({ url }) },
+            );
+            showToast("Replica routing updated");
+            log(`${action} ${url}`);
+            await loadOverview();
+          } catch (error) {
+            showToast(error.message);
+          }
+        }
+      }
+
+      document.querySelectorAll("nav button").forEach((button) =>
+        button.addEventListener("click", () => {
+          document
+            .querySelectorAll("nav button")
+            .forEach((item) => item.classList.remove("active"));
+          document
+            .querySelectorAll(".view")
+            .forEach((item) => item.classList.remove("active"));
+          button.classList.add("active");
+          $(button.dataset.view).classList.add("active");
+          $("page-title").textContent = button.textContent;
+          if (button.dataset.view === "users") loadUsers();
+        }),
+      );
+      $("refresh-btn").addEventListener("click", loadOverview);
+      $("load-users").addEventListener("click", loadUsers);
+      $("user-filter").addEventListener("input", loadUsers);
+      $("confirm-modal").addEventListener("click", (event) => {
+        if (event.target.id === "confirm-modal")
+          $("confirm-modal").classList.remove("open");
+      });
+      document.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-action]");
+        if (!button) return;
+        const action = button.dataset.action;
+        if (action === "close-modal")
+          $("confirm-modal").classList.remove("open");
+        else if (action === "confirm-modal") confirmAction();
+        else if (action === "user-freeze" || action === "user-unfreeze")
+          openConfirm(
+            action.replace("user-", ""),
+            button.dataset.userId,
+            `${action === "user-freeze" ? "Freeze" : "Unfreeze"} account`,
+            "This changes the account status and writes an admin audit event.",
+          );
+        else operation(action);
+      });
+      if (!token()) {
+        const supplied = window.prompt(
+          "Paste an admin bearer token to connect (optional):",
+        );
+        if (supplied)
+          localStorage.setItem("proxypay_admin_token", supplied.trim());
+      }
+      loadOverview();
+    </script>
+  </body>
+</html>

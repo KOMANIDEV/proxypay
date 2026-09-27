@@ -220,6 +220,7 @@ GET  /api/transactions/:id            # Transaction details
 GET  /api/transactions/:id/invoice    # Download completed transaction invoice
 POST /api/transactions/:id/cancel     # Cancel pending transaction
 POST /api/transactions/:id/dispute    # Open dispute
+GET  /api/transactions/search         # Search by phone (merchant_id/merchantIds filter, paginated)
 POST /api/transactions/bulk           # Bulk operations
 
 # Auth
@@ -254,6 +255,8 @@ POST /sep31/transactions              # SEP-31 cross-border
 
 # Admin
 GET  /api/admin/*                     # Admin dashboard endpoints
+GET  /api/admin/audit-logs            # Audit trail (filters: adminId, action, resource, from, to)
+GET  /api/admin/audit-logs/view       # Audit trail HTML viewer
 GET  /api/stats                       # Transaction statistics
 GET  /api/reconciliation              # Provider reconciliation
 GET  /metrics                         # Prometheus metrics
@@ -388,6 +391,15 @@ terraform init
 terraform plan -var-file=environments/production.tfvars
 terraform apply
 ```
+
+## 🛠️ Operations & Incident Response
+
+- **Deployment & rollback**: [docs/BRIDGE_DEPLOYMENT_RUNBOOK.md](docs/BRIDGE_DEPLOYMENT_RUNBOOK.md)
+- **Incident runbooks**: [docs/runbooks/](docs/runbooks/README.md) — step-by-step
+  diagnosis and mitigation for the top production incidents (provider down,
+  database index bloat, high API latency, queue backlog, Redis outage, Horizon
+  degradation, DB pool exhaustion, replica lag, ledger imbalance, elevated
+  error rate).
 
 ## 🤝 Contributing
 

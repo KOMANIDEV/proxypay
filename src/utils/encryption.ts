@@ -314,3 +314,11 @@ export function decrypt(encryptedData: string | null | undefined): string | null
   }
   return encryptedData;
 }
+
+/** Returns a keyed digest suitable for equality searches over normalized PII. */
+export function hashSearchValue(value: string): string {
+  return crypto
+    .createHmac("sha256", deriveKey(env.DB_ENCRYPTION_KEY, "pii-search"))
+    .update(value)
+    .digest("hex");
+}

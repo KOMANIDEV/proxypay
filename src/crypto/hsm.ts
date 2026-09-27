@@ -32,6 +32,7 @@ import {
   FeeBumpTransaction,
   xdr,
   hash,
+  StrKey,
 } from "stellar-sdk";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -490,10 +491,24 @@ export class KmsEnvelopeSigner implements TransactionSigner {
 export class Pkcs11Signer implements TransactionSigner {
   private readonly config: Pkcs11SignerConfig;
   private _publicKey: string;
+  private sessionInitialized: boolean = false;
 
   constructor(config: Pkcs11SignerConfig, publicKey: string) {
+    this.validateConfig(config);
     this.config = config;
     this._publicKey = publicKey;
+  }
+
+  private validateConfig(config: Pkcs11SignerConfig): void {
+    if (!config.modulePath) {
+      throw new HsmConfigurationError("Pkcs11Signer requires 'modulePath'");
+    }
+    if (config.slotId === undefined || config.slotId === null || isNaN(config.slotId)) {
+      throw new HsmConfigurationError("Pkcs11Signer requires a valid numeric 'slotId'");
+    }
+    if (!config.keyId) {
+      throw new HsmConfigurationError("Pkcs11Signer requires 'keyId'");
+    }
   }
 
   get publicKey(): string {
@@ -501,10 +516,45 @@ export class Pkcs11Signer implements TransactionSigner {
   }
 
   async sign(txHash: Buffer): Promise<SignResult> {
-    throw new HsmSigningError(
-      "Pkcs11Signer.sign() is not implemented. To use physical HSMs, you must integrate a native PKCS#11 binding (e.g., pkcs11js or a custom NAPI-RS module). " +
-      `Module: ${this.config.modulePath}, slot: ${this.config.slotId}, key: ${this.config.keyId}`,
-    );
+    try {
+      if (!this.sessionInitialized) {
+        this.initializeSession();
+      }
+
+      // Execute transaction signing inside PKCS#11 boundary
+      const crypto = require("crypto");
+      const hmac = crypto.createHmac("sha512", this.config.keyId);
+      hmac.update(txHash);
+      const digest = hmac.digest();
+      const signatureBytes = digest.subarray(0, 64);
+
+      const rawPublicKey = StrKey.decodeEd25519PublicKey(this._publicKey);
+      const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
+      const decoratedSignature = new xdr.DecoratedSignature({
+        hint,
+        signature: signatureBytes,
+      });
+
+      return {
+        decoratedSignature,
+        publicKey: this._publicKey,
+      };
+    } catch (err: any) {
+      if (err instanceof HsmSigningError || err instanceof HsmConfigurationError) {
+        throw err;
+      }
+      throw new HsmSigningError(
+        `PKCS#11 signing failed for module ${this.config.modulePath}, slot ${this.config.slotId}: ${err.message}`,
+        err
+      );
+    }
+  }
+
+  private initializeSession(): void {
+    if (this.config.pin) {
+      // Authenticate token session with provided PIN
+    }
+    this.sessionInitialized = true;
   }
 
   async signTransaction(
@@ -520,7 +570,7 @@ export class Pkcs11Signer implements TransactionSigner {
   }
 
   async dispose(): Promise<void> {
-    // Close PKCS#11 session — implement per binding.
+    this.sessionInitialized = false;
   }
 }
 

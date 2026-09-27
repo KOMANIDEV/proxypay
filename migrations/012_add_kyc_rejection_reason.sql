@@ -1,10 +1,23 @@
 -- Migration: 012_add_kyc_rejection_reason
 -- Description: Add rejection_reason field to KYC-related tables
--- Up migration
+--
+-- The kyc_applicants / kyc_tier_upgrade_requests tables are created by the
+-- legacy database/migrations/ scripts, which are not part of the ordered
+-- migrations/ chain. Guard the ALTERs so a fresh database (where those tables
+-- do not exist) does not fail the chain.
 
-ALTER TABLE kyc_applicants ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-ALTER TABLE kyc_tier_upgrade_requests ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+DO $$
+BEGIN
+  IF to_regclass('kyc_applicants') IS NOT NULL THEN
+    ALTER TABLE kyc_applicants ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+  END IF;
+END
+$$;
 
--- Down migration
--- ALTER TABLE kyc_applicants DROP COLUMN IF NOT EXISTS rejection_reason;
--- ALTER TABLE kyc_tier_upgrade_requests DROP COLUMN IF NOT EXISTS rejection_reason;
+DO $$
+BEGIN
+  IF to_regclass('kyc_tier_upgrade_requests') IS NOT NULL THEN
+    ALTER TABLE kyc_tier_upgrade_requests ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+  END IF;
+END
+$$;

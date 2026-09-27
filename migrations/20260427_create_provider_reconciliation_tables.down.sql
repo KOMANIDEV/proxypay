@@ -1,0 +1,21 @@
+-- Rollback: 20260427_create_provider_reconciliation_tables
+-- Inverted from 20260427_create_provider_reconciliation_tables.sql; hand-verified against the up migration.
+
+DROP TRIGGER IF EXISTS provider_reconciliation_runs_updated_at ON provider_reconciliation_runs;
+DROP TRIGGER IF EXISTS provider_reconciliation_alerts_updated_at ON provider_reconciliation_alerts;
+DROP TRIGGER IF EXISTS provider_report_configs_updated_at ON provider_report_configs;
+DROP TABLE IF EXISTS provider_report_configs;
+DROP TABLE IF EXISTS provider_reconciliation_alerts;
+DROP TABLE IF EXISTS provider_reconciliation_runs;
+DROP INDEX IF EXISTS idx_provider_reconciliation_runs_provider_date;
+DROP INDEX IF EXISTS idx_provider_reconciliation_runs_status;
+DROP INDEX IF EXISTS idx_provider_reconciliation_runs_created_at;
+DROP INDEX IF EXISTS idx_provider_reconciliation_alerts_run_id;
+DROP INDEX IF EXISTS idx_provider_reconciliation_alerts_status;
+DROP INDEX IF EXISTS idx_provider_reconciliation_alerts_severity;
+DROP INDEX IF EXISTS idx_provider_reconciliation_alerts_type;
+DROP INDEX IF EXISTS idx_provider_reconciliation_alerts_reference;
+DROP INDEX IF EXISTS idx_provider_reconciliation_alerts_created_at;
+DROP FUNCTION IF EXISTS update_provider_reconciliation_runs_updated_at;
+DROP FUNCTION IF EXISTS update_provider_reconciliation_alerts_updated_at;
+DROP FUNCTION IF EXISTS update_provider_report_configs_updated_at;

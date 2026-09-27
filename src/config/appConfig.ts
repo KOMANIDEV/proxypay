@@ -73,6 +73,12 @@ export const configSchema = convict({
         default: 500000,
         env: "MTN_MAX_AMOUNT",
       },
+      dailyLimit: {
+        doc: "Daily cumulative transaction limit for MTN (XAF)",
+        format: "nat",
+        default: 500000,
+        env: "MTN_DAILY_LIMIT",
+      },
       callbackSecret: {
         doc: "MTN callback HMAC secret for verifying incoming callbacks",
         format: String,
@@ -99,6 +105,24 @@ export const configSchema = convict({
         default: 1000000,
         env: "AIRTEL_MAX_AMOUNT",
       },
+      dailyLimit: {
+        doc: "Daily cumulative transaction limit for Airtel (XAF)",
+        format: "nat",
+        default: 1000000,
+        env: "AIRTEL_DAILY_LIMIT",
+      },
+      callbackSecret: {
+        doc: "Airtel callback HMAC secret for verifying incoming callbacks",
+        format: String,
+        default: "",
+        env: "AIRTEL_CALLBACK_SECRET",
+      },
+      callbackSignatureHeader: {
+        doc: "Header used by Airtel for callback signature verification",
+        format: String,
+        default: "X-Airtel-Signature",
+        env: "AIRTEL_CALLBACK_SIGNATURE_HEADER",
+      },
     },
     orange: {
       minAmount: {
@@ -112,6 +136,24 @@ export const configSchema = convict({
         format: "nat",
         default: 750000,
         env: "ORANGE_MAX_AMOUNT",
+      },
+      dailyLimit: {
+        doc: "Daily cumulative transaction limit for Orange (XAF)",
+        format: "nat",
+        default: 750000,
+        env: "ORANGE_DAILY_LIMIT",
+      },
+      callbackSecret: {
+        doc: "Orange callback HMAC secret for verifying incoming callbacks",
+        format: String,
+        default: "",
+        env: "ORANGE_CALLBACK_SECRET",
+      },
+      callbackSignatureHeader: {
+        doc: "Header used by Orange for callback signature verification",
+        format: String,
+        default: "X-Orange-Signature",
+        env: "ORANGE_CALLBACK_SIGNATURE_HEADER",
       },
     },
   },

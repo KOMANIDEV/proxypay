@@ -205,6 +205,65 @@ describe("OrangeProvider web session flow", () => {
     removeSession(filePath);
   });
 
+  describe("checkAuth (direct mode)", () => {
+    it("reports success when a fresh OAuth token is obtained", async () => {
+      const directClient = new QueueHttpClient([
+        response(200, { access_token: "token-123", expires_in: 3600 }),
+      ]);
+
+      const provider = new OrangeProvider({
+        mode: "direct",
+        baseUrl: "https://orange.test",
+        apiKey: "key",
+        apiSecret: "secret",
+        directHttpClient: directClient,
+        clock: () => now,
+      });
+
+      await expect(provider.checkAuth()).resolves.toEqual({ success: true });
+    });
+
+    it("flags a 401 from the OAuth token endpoint as invalid credentials", async () => {
+      const directClient = new QueueHttpClient([
+        response(401, { error: "invalid_client" }),
+      ]);
+
+      const provider = new OrangeProvider({
+        mode: "direct",
+        baseUrl: "https://orange.test",
+        apiKey: "key",
+        apiSecret: "secret",
+        directHttpClient: directClient,
+        clock: () => now,
+      });
+
+      await expect(provider.checkAuth()).resolves.toMatchObject({
+        success: false,
+        invalidCredentials: true,
+      });
+    });
+
+    it("does not flag network errors as invalid credentials", async () => {
+      const directClient = new QueueHttpClient([
+        response(503, { error: "upstream down" }),
+      ]);
+
+      const provider = new OrangeProvider({
+        mode: "direct",
+        baseUrl: "https://orange.test",
+        apiKey: "key",
+        apiSecret: "secret",
+        directHttpClient: directClient,
+        clock: () => now,
+      });
+
+      await expect(provider.checkAuth()).resolves.toMatchObject({
+        success: false,
+        invalidCredentials: false,
+      });
+    });
+  });
+
   it("uses a configured proxy without requiring web credentials", async () => {
     const proxyClient = new QueueHttpClient([
       response(202, { transactionId: "proxy-tx" }),

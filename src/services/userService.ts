@@ -17,6 +17,9 @@ export interface User {
   two_factor_enabled?: boolean;
   two_factor_verified?: boolean;
   backup_codes?: string[] | null;
+  is_active: boolean;
+  deactivated_at?: Date | null;
+  status: 'active' | 'frozen' | 'suspended';
   created_at: Date;
   updated_at: Date;
 }

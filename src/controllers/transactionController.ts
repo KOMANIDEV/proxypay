@@ -3,18 +3,29 @@ import { z } from "zod";
 import { StellarService } from "../services/stellar/stellarService";
 import { MobileMoneyService } from "../services/mobilemoney/mobileMoneyService";
 import { maskPhoneNumber } from "../utils/masking";
+import {
+  getPaginationInfo,
+  VALID_STATUSES as VALID_STATUS_FILTERS,
+} from "../utils/transactionFilters";
 import { validatePhoneProviderMatch } from "../utils/phoneUtils";
 import {
   Transaction,
+  TransactionListFilters,
   TransactionModel,
   TransactionStatus,
+  validateMetadataSchema,
 } from "../models/transaction";
+import {
+  getFilterTemplate,
+  parseFilterExpression,
+} from "../services/transactionFilterService";
 import { lockManager, LockKeys } from "../utils/lock";
 import { TransactionLimitService } from "../services/transactionLimit/transactionLimitService";
 import { KYCService } from "../services/kyc/kycService";
 import {
   MobileMoneyProvider,
   validateProviderLimits,
+  validateDepositAmount,
 } from "../config/providers";
 import type { TransactionJobData } from "../queue/transactionQueue";
 import { amlService } from "../services/aml";
@@ -35,6 +46,14 @@ import { getConfiguredPaymentAsset } from "../services/stellar/assetService";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { travelRuleService } from "../compliance/travelRule";
 import { createError } from "../middleware/errorHandler";
+import {
+  createCursor,
+  createPaginatedResponse,
+  decodeCursor,
+  PaginationError,
+} from "../utils/pagination";
+import { activityTrackingService } from "../services/activityTrackingService";
+import { transactionReversalService } from "../services/transactionReversalService";
 
 const IDEMPOTENCY_TTL_HOURS = Number(
   process.env.IDEMPOTENCY_KEY_TTL_HOURS || 24,
@@ -127,6 +146,16 @@ export const getTransactionHistoryHandler = async (
       maxAmount,
       provider,
       tags,
+      // #480 – Advanced filtering
+      currency,
+      type,
+      statuses,
+      referenceNumber,
+      dateField,
+      startDateTime,
+      endDateTime,
+      filter,
+      templateId,
     } = req.query;
 
     const isValidISO = (dateStr: unknown) => {
@@ -168,7 +197,7 @@ export const getTransactionHistoryHandler = async (
 
     // Filter Construction
     // Note: tags are expected as a comma-separated string in the query (e.g. ?tags=refund,priority)
-    const filters = {
+    const filters: TransactionListFilters = {
       minAmount: minAmount ? parseFloat(minAmount as string) : undefined,
       maxAmount: maxAmount ? parseFloat(maxAmount as string) : undefined,
       provider: provider as string | undefined,
@@ -177,12 +206,112 @@ export const getTransactionHistoryHandler = async (
         : undefined,
     };
 
+    // #480 – Advanced filtering.
+    // Anything malformed is rejected here rather than reaching the model,
+    // where a bad expression would otherwise become a confusing 500.
+    if (currency) filters.currency = currency as string;
+    if (type) filters.type = type as string;
+    if (referenceNumber) filters.referenceNumber = referenceNumber as string;
+    if (statuses) {
+      filters.statuses = (statuses as string)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean) as TransactionListFilters["statuses"];
+    }
+
+    const DATE_FIELDS = ["createdAt", "updatedAt"];
+    if (dateField) {
+      if (!DATE_FIELDS.includes(dateField as string)) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          `Invalid dateField. Must be one of: ${DATE_FIELDS.join(", ")}`,
+          { error: "Invalid dateField" },
+        );
+      }
+      filters.dateField = dateField as TransactionListFilters["dateField"];
+    }
+    if (startDateTime || endDateTime) {
+      const parseInstant = (value: unknown, label: string) => {
+        const parsedDate = new Date(value as string);
+        if (Number.isNaN(parsedDate.getTime())) {
+          throw createError(
+            ERROR_CODES.INVALID_INPUT,
+            `Invalid ${label}. Must be a valid ISO 8601 timestamp`,
+            { error: `Invalid ${label}` },
+          );
+        }
+        return parsedDate;
+      };
+      if (startDateTime) {
+        filters.startDateTime = parseInstant(
+          startDateTime,
+          "startDateTime",
+        ).toISOString();
+      }
+      if (endDateTime) {
+        filters.endDateTime = parseInstant(endDateTime, "endDateTime").toISOString();
+      }
+      if (
+        filters.startDateTime &&
+        filters.endDateTime &&
+        new Date(filters.startDateTime) > new Date(filters.endDateTime)
+      ) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "startDateTime cannot be greater than endDateTime",
+          { error: "startDateTime cannot be greater than endDateTime" },
+        );
+      }
+    }
+
+    if (templateId) {
+      const template = await getFilterTemplate(
+        templateId as string,
+        (req as any).user?.id,
+      );
+      if (!template) {
+        throw createError(
+          ERROR_CODES.NOT_FOUND,
+          "Filter template not found",
+          { error: "Filter template not found" },
+        );
+      }
+      filters.filter = template.expression;
+    } else if (filter) {
+      try {
+        filters.filter = parseFilterExpression(
+          typeof filter === "string" ? JSON.parse(filter) : filter,
+        );
+      } catch (error) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          error instanceof Error ? error.message : "Invalid filter expression",
+          { error: "Invalid filter expression" },
+        );
+      }
+    }
+
     // Database Queries
     // If using cursor-based pagination, fetch limit+1 items to determine `hasMore`.
     let transactions = [] as any[];
     let total: number | undefined;
 
     if (before || after) {
+      // Validate incoming cursors up front (legacy `<ts>|<id>` format still accepted)
+      try {
+        if (before) decodeCursor(before as string);
+        if (after) decodeCursor(after as string);
+      } catch (error) {
+        if (error instanceof PaginationError) {
+          throw createError(
+            ERROR_CODES.INVALID_INPUT,
+            "Invalid pagination cursor",
+            { error: "Invalid pagination cursor" },
+          );
+        }
+        throw error;
+      }
+
       const rows = await transactionModel.list(
         limitNum + 1,
         offsetNum,
@@ -200,24 +329,20 @@ export const getTransactionHistoryHandler = async (
         rows.reverse();
       }
 
-      const hasMore = rows.length > limitNum;
-      transactions = rows.slice(0, limitNum);
+      const result = createPaginatedResponse({
+        rows,
+        limit: limitNum,
+        getSortValue: (tx: any) => tx.createdAt,
+        getId: (tx: any) => tx.id,
+      });
 
       return res.json({
-        data: transactions,
+        data: result.data,
         pagination: {
-          limit: limitNum,
-          before: transactions.length
-            ? Buffer.from(
-                `${transactions[0].createdAt.toISOString()}|${transactions[0].id}`,
-              ).toString("base64")
-            : null,
-          after: transactions.length
-            ? Buffer.from(
-                `${transactions[transactions.length - 1].createdAt.toISOString()}|${transactions[transactions.length - 1].id}`,
-              ).toString("base64")
-            : null,
-          hasMore,
+          limit: result.pagination.limit,
+          before: result.pagination.prevCursor,
+          after: result.pagination.nextCursor,
+          hasMore: result.pagination.hasMore,
         },
       });
     }
@@ -469,17 +594,29 @@ async function processTransactionRequest(
 
     const idempotencyKey = getIdempotencyKey(req);
 
-    const providerLimitCheck = validateProviderLimits(
-      provider as MobileMoneyProvider,
-      parseFloat(amount),
-    );
+    const parsedAmount = parseFloat(amount);
+
+    // Deposits enforce the destination provider's own per-transaction limits
+    // (e.g. MTN vs Airtel); withdrawals keep the generic provider check.
+    const providerLimitCheck =
+      type === "deposit"
+        ? validateDepositAmount(provider, parsedAmount)
+        : validateProviderLimits(provider as MobileMoneyProvider, parsedAmount);
+
     if (!providerLimitCheck.valid) {
-      return res.status(400).json({ error: providerLimitCheck.error });
+      const limitCode =
+        "code" in providerLimitCheck ? providerLimitCheck.code : undefined;
+
+      return res.status(400).json({
+        error: providerLimitCheck.error,
+        ...(limitCode ? { code: limitCode } : {}),
+      });
     }
 
     const limitCheck = await transactionLimitService.checkTransactionLimit(
       userId,
       requestAmount,
+      provider,
     );
 
     if (!limitCheck.allowed) {
@@ -603,6 +740,23 @@ async function processTransactionRequest(
             });
             void monitorTransactionForAML(transaction);
             void applyTravelRule(transaction);
+
+            // Track transaction initiation for activity analytics (best-effort).
+            void activityTrackingService.trackActivity({
+              userId,
+              eventType:
+                type === "deposit"
+                  ? "transaction.deposit_initiated"
+                  : "transaction.withdraw_initiated",
+              aggregateId: transaction.id,
+              payload: {
+                transactionId: transaction.id,
+                amount: String(amount),
+                provider,
+              },
+              ipAddress: req.ip,
+              userAgent: req.get("user-agent"),
+            });
 
             const job = await addTransactionJob(
               {
@@ -771,14 +925,11 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
 
     if (process.env.WEBHOOK_URL) {
       try {
-        await fetch(process.env.WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            event: "transaction.cancelled",
-            data: updatedTransaction,
-          }),
-        });
+        const webhookService = new WebhookService();
+        await webhookService.sendTransactionEvent(
+          "transaction.cancelled",
+          updatedTransaction,
+        );
       } catch (webhookError) {
         console.error("Webhook notification failed", webhookError);
       }
@@ -837,7 +988,6 @@ export const updateNotesHandler = async (req: Request, res: Response) => {
 export const refundTransactionHandler = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-
     const transaction = await transactionModel.findById(id);
     if (!transaction) {
       throw createError(ERROR_CODES.NOT_FOUND, null, {
@@ -845,52 +995,31 @@ export const refundTransactionHandler = async (req: Request, res: Response) => {
       });
     }
 
-    if (transaction.type !== "withdraw") {
-      throw createError(ERROR_CODES.INVALID_INPUT, null, {
-        error: "Only withdrawal transactions can be refunded",
-      });
-    }
-
-    if (transaction.status !== TransactionStatus.Failed) {
-      throw createError(
-        ERROR_CODES.INVALID_INPUT,
-        `Cannot refund transaction with status '${transaction.status}'. Only failed transactions are eligible.`,
-        {
-          error: `Cannot refund transaction with status '${transaction.status}'. Only failed transactions are eligible.`,
-        },
-      );
-    }
-
-    const amount = parseFloat(transaction.amount);
-    const { calculateFee } = await import("../utils/fees.js");
-    const { fee } = await calculateFee(amount);
-    const refundAmount = parseFloat((amount - fee).toFixed(2));
-
-    if (refundAmount <= 0) {
-      throw createError(
-        ERROR_CODES.INVALID_INPUT,
-        "Refund amount after fees is zero or negative",
-        {
-          error: "Refund amount after fees is zero or negative",
-        },
-      );
-    }
-
-    await transactionModel.updateStatus(id, TransactionStatus.Completed);
+    const actorId = (req as Request & { user?: { id?: string } }).user?.id;
+    const result = await transactionReversalService.reverse(
+      id,
+      req.body?.reason || "Administrative refund",
+      actorId,
+    );
 
     return res.json({
       message: "Refund processed successfully",
       transactionId: id,
-      originalAmount: amount,
-      feeDeducted: fee,
-      refundAmount,
+      originalAmount: transaction.amount,
+      refundAmount: transaction.amount,
+      alreadyRefunded: result.reversal.alreadyReversed,
+      transaction: result.transaction,
     });
   } catch (err) {
     if (err && (err as any).code) throw err;
-    console.error("Refund error:", err);
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to process refund", {
-      error: "Failed to process refund",
-    });
+    const message =
+      err instanceof Error ? err.message : "Failed to process refund";
+    const code = message.includes("not found")
+      ? ERROR_CODES.NOT_FOUND
+      : message.includes("Cannot reverse") || message.includes("No ledger")
+        ? ERROR_CODES.INVALID_INPUT
+        : ERROR_CODES.INTERNAL_ERROR;
+    throw createError(code, message, { error: message });
   }
 };
 
@@ -930,6 +1059,72 @@ export const updateAdminNotesHandler = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * Query parameter names accepted for the merchant filter. `merchantIds` and
+ * `merchant_ids` are the canonical forms; the singular names are kept for
+ * convenience when only one merchant is searched for (issue #621).
+ */
+const MERCHANT_FILTER_QUERY_KEYS = [
+  "merchantIds",
+  "merchant_ids",
+  "merchantId",
+  "merchant_id",
+];
+
+/**
+ * Normalize the merchant filter query params.
+ *
+ * Each accepted key may be a single id, a comma-separated list, or a repeated
+ * query parameter, so one request can search several merchants in bulk.
+ */
+const parseMerchantIds = (query: Record<string, unknown>): string[] => {
+  const raw = MERCHANT_FILTER_QUERY_KEYS.flatMap((key) => {
+    const value = query[key];
+    if (typeof value === "string") return [value];
+    if (Array.isArray(value)) {
+      return value.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+    }
+    return [];
+  });
+
+  const ids = raw
+    .flatMap((value) => value.split(","))
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+
+  return Array.from(new Set(ids));
+};
+
+/**
+ * Enforce that non-admin callers can only search their own merchant's
+ * transactions. A request naming any other merchant is rejected with 403 so the
+ * filter cannot be used to enumerate other merchants' data (issue #621).
+ */
+const enforceMerchantScope = (req: Request, merchantIds: string[]): void => {
+  if (merchantIds.length === 0) return;
+
+  const user = (req as any).user as
+    | { id?: string; userId?: string; role?: string }
+    | undefined;
+
+  if (user?.role === "admin" || user?.role === "super-admin") return;
+
+  const ownMerchantId = user?.userId ?? user?.id;
+  if (!ownMerchantId) {
+    throw createError(ERROR_CODES.UNAUTHORIZED, null, {
+      error: "Authentication required",
+    });
+  }
+
+  if (merchantIds.some((id) => id !== ownMerchantId)) {
+    throw createError(ERROR_CODES.FORBIDDEN, null, {
+      error: "Merchants may only search their own transactions",
+    });
+  }
+};
+
 export const searchTransactionsHandler = async (
   req: Request,
   res: Response,
@@ -952,6 +1147,9 @@ export const searchTransactionsHandler = async (
       });
     }
 
+    const merchantIds = parseMerchantIds(req.query as Record<string, unknown>);
+    enforceMerchantScope(req, merchantIds);
+
     const pageNum = Math.max(1, parseInt(page as string) || 1);
     const limitNum = Math.max(
       1,
@@ -959,11 +1157,19 @@ export const searchTransactionsHandler = async (
     );
     const offset = (pageNum - 1) * limitNum;
 
-    const { transactions, total } = await transactionModel.searchByPhoneNumber(
-      sanitized,
-      limitNum,
-      offset,
-    );
+    const { transactions, total } =
+      merchantIds.length > 0
+        ? await transactionModel.searchByPhoneNumber(
+            sanitized,
+            limitNum,
+            offset,
+            merchantIds,
+          )
+        : await transactionModel.searchByPhoneNumber(
+            sanitized,
+            limitNum,
+            offset,
+          );
 
     const masked = transactions.map((tx: any) => ({
       ...tx,
@@ -980,6 +1186,7 @@ export const searchTransactionsHandler = async (
         totalPages: Math.ceil(total / limitNum),
       },
       data: masked,
+      ...(merchantIds.length > 0 ? { filters: { merchantIds } } : {}),
     };
 
     return res.json(body);
@@ -1000,40 +1207,47 @@ export const listTransactionsHandler = async (req: Request, res: Response) => {
       offset: 0,
     };
 
-    const totalCount = await transactionModel.countByStatuses(filters.statuses);
-    const transactions = await transactionModel.findByStatuses(
-      filters.statuses,
-      filters.limit,
-      filters.offset,
-    );
+    // An empty status filter means "all statuses" — expand to the full valid
+    // set so SQL receives an explicit (OR) status list.
+    const statuses: TransactionStatus[] = (filters.statuses?.length
+      ? filters.statuses
+      : VALID_STATUS_FILTERS) as TransactionStatus[];
 
-    // If a reference search is requested, we should probably use the list method instead
-    // or just filter the results. But wait, findByStatuses is limited.
-    // Let's use the list() method instead which is more flexible.
-    const results = await transactionModel.list(
+    // Reference lookups need the more flexible list/count helpers; status
+    // filtering is applied through findByStatuses/countByStatuses.
+    if (filters.reference) {
+      const results = await transactionModel.list(
+        filters.limit,
+        filters.offset,
+        undefined,
+        undefined,
+        {
+          tags: [],
+          referenceNumber: filters.reference,
+        },
+      );
+      const total = await transactionModel.count(undefined, undefined, {
+        referenceNumber: filters.reference,
+      });
+
+      return res.json({
+        data: results,
+        pagination: getPaginationInfo(total, filters.limit, filters.offset),
+        filters: { statuses },
+      });
+    }
+
+    const totalCount = await transactionModel.countByStatuses(statuses);
+    const transactions = await transactionModel.findByStatuses(
+      statuses,
       filters.limit,
       filters.offset,
-      undefined,
-      undefined,
-      {
-        tags: [], // Could be extended
-        referenceNumber: filters.reference,
-      },
     );
-    const total = filters.reference
-      ? await transactionModel.count(undefined, undefined, {
-          referenceNumber: filters.reference,
-        })
-      : totalCount;
 
     return res.json({
-      data: results,
-      pagination: {
-        total,
-        limit: filters.limit,
-        offset: filters.offset,
-        hasMore: filters.offset + filters.limit < total,
-      },
+      data: transactions,
+      pagination: getPaginationInfo(totalCount, filters.limit, filters.offset),
+      filters: { statuses },
     });
   } catch (err) {
     console.error("Failed to list transactions:", err);
@@ -1167,6 +1381,17 @@ export const updateMetadataHandler = async (req: Request, res: Response) => {
       );
     }
 
+    // Issue #645 – validate against the Zod schema before writing.
+    try {
+      validateMetadataSchema(metadata);
+    } catch (schemaErr) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        schemaErr instanceof Error ? schemaErr.message : "Invalid metadata",
+        { error: schemaErr instanceof Error ? schemaErr.message : "Invalid metadata" },
+      );
+    }
+
     const transaction = await transactionModel.updateMetadata(id, metadata);
     if (!transaction) {
       throw createError(ERROR_CODES.NOT_FOUND, "Transaction not found", {
@@ -1214,6 +1439,17 @@ export const patchMetadataHandler = async (req: Request, res: Response) => {
         {
           error: "metadata must be a JSON object",
         },
+      );
+    }
+
+    // Issue #645 – validate patch against the Zod schema before writing.
+    try {
+      validateMetadataSchema(metadata);
+    } catch (schemaErr) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        schemaErr instanceof Error ? schemaErr.message : "Invalid metadata",
+        { error: schemaErr instanceof Error ? schemaErr.message : "Invalid metadata" },
       );
     }
 

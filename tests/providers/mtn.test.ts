@@ -85,6 +85,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: true,
         data: mockResponse.data,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -106,6 +107,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: mockError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -120,6 +122,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: timeoutError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -141,6 +144,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: authError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -155,6 +159,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: networkError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -176,6 +181,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: serverError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -197,6 +203,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: rateLimitError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -338,6 +345,45 @@ describe("MTNProvider", () => {
     });
   });
 
+  describe("checkAuth", () => {
+    it("reports success when a fresh access token can be obtained", async () => {
+      mockedAxios.post.mockResolvedValue({
+        data: { access_token: "fresh-token", expires_in: 3600 },
+      });
+
+      const result = await provider.checkAuth();
+
+      expect(result).toEqual({ success: true });
+    });
+
+    it("flags 401/403 responses as invalid credentials", async () => {
+      mockedAxios.post.mockRejectedValue({
+        response: { status: 401 },
+      });
+
+      const result = await provider.checkAuth();
+
+      expect(result.success).toBe(false);
+      expect(result.invalidCredentials).toBe(true);
+    });
+
+    it("does not flag network/5xx errors as invalid credentials", async () => {
+      mockedAxios.post.mockRejectedValue(new Error("Network error"));
+
+      const networkResult = await provider.checkAuth();
+      expect(networkResult.success).toBe(false);
+      expect(networkResult.invalidCredentials).toBe(false);
+
+      mockedAxios.post.mockRejectedValue({
+        response: { status: 500 },
+      });
+
+      const serverResult = await provider.checkAuth();
+      expect(serverResult.success).toBe(false);
+      expect(serverResult.invalidCredentials).toBe(false);
+    });
+  });
+
   describe("Status Check", () => {
     it("should handle successful status check through requestPayment response", async () => {
       const mockResponse = {
@@ -460,6 +506,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: true,
         data: null,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -473,6 +520,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: true,
         data: undefined,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
 
@@ -487,6 +535,7 @@ describe("MTNProvider", () => {
       expect(result).toEqual({
         success: false,
         error: cancelError,
+        providerResponseTimeMs: expect.any(Number),
       });
     });
   });

@@ -4,6 +4,7 @@ import {
 } from "../services/mobilemoney/providers/healthCheck";
 import { checkAndResetCircuitBreaker } from "../utils/circuitBreaker";
 import { createPagerDutyService } from "../services/pagerDutyService";
+import { getSystemHealthAggregation } from "../services/providerHealthAggregationService";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -278,6 +279,19 @@ export async function runProviderHealthCheckJob(): Promise<void> {
     log("warn", "Provider watchdog finished with outages", {
       downProviders,
       incidentCount: activeIncidents.size,
+    });
+  }
+
+  // ── Aggregate provider health into a system-wide score ────────────────────
+  try {
+    const aggregation = await getSystemHealthAggregation(true);
+    log("info", `Provider health aggregation complete: score=${aggregation.overallScore} status=${aggregation.overallStatus}`, {
+      overallScore: aggregation.overallScore,
+      overallStatus: aggregation.overallStatus,
+    });
+  } catch (err) {
+    log("warn", "Provider health aggregation failed", {
+      reason: err instanceof Error ? err.message : String(err),
     });
   }
 }

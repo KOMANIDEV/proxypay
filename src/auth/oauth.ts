@@ -436,6 +436,38 @@ export function verifyOAuthAccessToken(token: string): OAuthAccessTokenClaims {
   }) as OAuthAccessTokenClaims;
 }
 
+function introspectAccessToken(token: string): Record<string, unknown> {
+  try {
+    const claims = verifyOAuthAccessToken(token);
+    if (
+      claims.token_use !== "access" ||
+      claims.role !== "oauth-client" ||
+      typeof claims.sub !== "string" ||
+      typeof claims.client_id !== "string" ||
+      typeof claims.scope !== "string" ||
+      typeof claims.exp !== "number"
+    ) {
+      return { active: false };
+    }
+
+    return {
+      active: true,
+      client_id: claims.client_id,
+      username: claims.sub,
+      scope: claims.scope,
+      sub: claims.sub,
+      aud: claims.aud,
+      iss: claims.iss,
+      iat: claims.iat,
+      exp: claims.exp,
+      jti: claims.jti,
+      token_type: "Bearer",
+    };
+  } catch {
+    return { active: false };
+  }
+}
+
 export function createOAuthTokenStore(): OAuthTokenStore {
   return createRedisBackedStore();
 }
@@ -593,6 +625,33 @@ export function createOAuthRouter(
       "unsupported_grant_type",
       "Supported grant types are authorization_code and refresh_token",
     );
+  });
+
+  router.post("/introspect", (req: Request, res: Response) => {
+    const config = getOAuthConfig();
+    const basicCredentials = parseBasicClientCredentials(req);
+    const clientId = String(
+      basicCredentials.clientId || req.body.client_id || "",
+    );
+    const clientSecret = String(
+      basicCredentials.clientSecret || req.body.client_secret || "",
+    );
+
+    if (clientId !== config.clientId || clientSecret !== config.clientSecret) {
+      return sendOAuthError(
+        res,
+        401,
+        "invalid_client",
+        "Client authentication failed",
+      );
+    }
+
+    const token = String(req.body.token || "").trim();
+    if (!token) {
+      return sendOAuthError(res, 400, "invalid_request", "token is required");
+    }
+
+    return res.json(introspectAccessToken(token));
   });
 
   return router;

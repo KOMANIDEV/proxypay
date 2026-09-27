@@ -9,6 +9,7 @@ import { scheduleProviderBalanceAlertJob } from "./providerBalanceAlertQueue";
 import { startAccountingTokenRefreshWorker, closeAccountingTokenRefreshWorker } from "./accountingTokenRefreshWorker";
 
 export async function shutdownQueue(): Promise<void> {
+  stopQueueMetricsCollection();
   await Promise.all([
     closeWorker().catch(() => undefined),
     closeSyncWorker().catch(() => undefined),
@@ -84,6 +85,13 @@ export {
   startAccountingTokenRefreshWorker,
   closeAccountingTokenRefreshWorker,
 };
+
+// Queue Metrics Service
+export {
+  startQueueMetricsCollection,
+  stopQueueMetricsCollection,
+  instrumentWorker,
+} from "./queueMetricsService";
 
 // Trace-ID propagation utilities
 export { withTraceId, traceIdFromJob, childLoggerWithTrace, TRACE_ID_KEY } from "./trace";

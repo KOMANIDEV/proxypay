@@ -1,8 +1,9 @@
-import { Request, Response, Router } from "express";
+import { Request, Response, Router, NextFunction } from "express";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
 import { optimizeProfileImage, upload } from "../middleware/upload";
 import { uploadToS3 } from "../services/s3Upload";
+import { gateUpload, linkStoredKey } from "../services/fileSecurityService";
 import { pool } from "../config/database";
 import { UserModel } from "../models/users";
 import {
@@ -28,6 +29,39 @@ router.post(
   "/profile-picture",
   requireAuth,
   upload.single("avatar"),
+  // Scan the original upload before sharp re-encodes it, so embedded malware
+  // can't slip through into storage.
+  async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.file) return next();
+
+    const security = await gateUpload(req.file, {
+      userId: req.user?.id ?? null,
+    });
+    if (security.outcome === "infected") {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Upload rejected: file failed the security scan",
+        { error: security.reason },
+      );
+    }
+    if (security.outcome === "quarantined") {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Upload quarantined: scan engine unavailable, please retry later",
+        { error: security.reason },
+      );
+    }
+    if (security.outcome === "error" || !security.record) {
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Upload security scan failed",
+        { error: security.reason },
+      );
+    }
+
+    res.locals.securityRecord = security.record;
+    next();
+  },
   optimizeProfileImage,
   async (req: Request, res: Response) => {
     try {
@@ -49,6 +83,16 @@ router.post(
       if (!uploadResult.success) {
         throw createError(ERROR_CODES.INTERNAL_ERROR, uploadResult.error, {
           error: uploadResult.error,
+        });
+      }
+
+      // Attach the stored key to the security record for integrity audits.
+      if (uploadResult.success && uploadResult.key && res.locals.securityRecord) {
+        await linkStoredKey(
+          res.locals.securityRecord.id,
+          uploadResult.key,
+        ).catch((err: unknown) => {
+          console.error("Failed to link security record to S3 key:", err);
         });
       }
 

@@ -39,6 +39,8 @@ interface AuthenticatedWebSocket extends WebSocket {
  *  - Heartbeat / ping-pong to clean up stale connections
  *  - Redis pub/sub for horizontal scaling across multiple process instances
  */
+export const TRANSACTION_UPDATES_CHANNEL = "transaction.updates";
+
 export class WebSocketManager {
   private static activeInstance: WebSocketManager | null = null;
 
@@ -52,8 +54,12 @@ export class WebSocketManager {
   private redisSub: RedisClientType | null = null;
   private redisPub: RedisClientType | null = null;
   public redisReady: Promise<void>;
+  // Monotonic suffix so two connections from the same user in the same
+  // millisecond still get distinct client IDs (Date.now() alone can collide
+  // and silently drop one socket from the clients map).
+  private nextClientId = 0;
 
-  private readonly REDIS_CHANNEL = "transaction.updates";
+  private readonly REDIS_CHANNEL = TRANSACTION_UPDATES_CHANNEL;
   private readonly HEARTBEAT_INTERVAL_MS = 10_000; // faster heartbeat for quicker stale detection
   private readonly MAX_MISSED_PINGS = 2; // number of missed pings before termination
 
@@ -86,7 +92,10 @@ export class WebSocketManager {
       }
 
       try {
-        const decoded = verifyToken(token) as unknown as Record<string, unknown>;
+        const decoded = verifyToken(token) as unknown as Record<
+          string,
+          unknown
+        >;
         const candidateUserId =
           typeof decoded.userId === "string"
             ? decoded.userId
@@ -105,7 +114,7 @@ export class WebSocketManager {
         return;
       }
 
-      const clientId = `${client.userId}::${Date.now()}`;
+      const clientId = `${client.userId}::${Date.now()}::${this.nextClientId++}`;
       this.clients.set(clientId, client);
       this.joinUserRoom(client.userId, clientId);
 
@@ -327,6 +336,7 @@ export class WebSocketManager {
     clientId: string,
     client: AuthenticatedWebSocket,
   ): void {
+    if (!this.clients.has(clientId)) return;
     // Remove client from all subscription maps
     for (const transactionId of client.subscriptions) {
       this.subscriptions.get(transactionId)?.delete(clientId);
@@ -346,7 +356,9 @@ export class WebSocketManager {
         if (!client.isAlive) {
           client.missedPings += 1;
           if (client.missedPings >= this.MAX_MISSED_PINGS) {
-            console.log(`Terminating stale WebSocket client after ${client.missedPings} missed pings: ${clientId}`);
+            console.log(
+              `Terminating stale WebSocket client after ${client.missedPings} missed pings: ${clientId}`,
+            );
             client.terminate();
             this.handleDisconnect(clientId, client);
             continue;
@@ -408,7 +420,18 @@ export class WebSocketManager {
   async close(): Promise<void> {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
     }
+
+    // Upgraded WebSocket connections are not regular HTTP requests and can
+    // otherwise keep the shared server alive indefinitely during shutdown.
+    for (const client of this.clients.values()) {
+      client.terminate();
+    }
+    this.clients.clear();
+    this.userRooms.clear();
+    this.subscriptions.clear();
+
     await this.redisSub?.unsubscribe();
     await this.redisSub?.disconnect();
     await this.redisPub?.disconnect();

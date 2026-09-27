@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Postgres streaming read replica (dev / local cluster)
+#
+# Mirrors k8s/postgres-dev.yaml but starts a hot-standby replica of the
+# postgres-service primary. The initContainer clones the primary with
+# pg_basebackup into an emptyDir shared with the main container; the main
+# container then boots the existing (non-empty) data directory as a standby.
+#
+# This is for local/minikube/kind development only — production uses the RDS
+# cross-region replica managed by Terraform (see terraform/).
+#
+# Apply with:
+#   kubectl apply -f k8s/postgres-replica.yaml
+#
+# Point the app at it via READ_REPLICA_URL=postgresql://user:password@postgres-replica-service:5432/mobile_money
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-replica
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+      role: replica
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: replica
+    spec:
+      initContainers:
+        - name: pg-basebackup
+          image: postgres:16-alpine
+          env:
+            - name: PGPASSWORD
+              value: password
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+                echo "[replica] cloning primary (postgres-service)..."
+                rm -rf /var/lib/postgresql/data/*
+                pg_basebackup -h postgres-service -U user -D /var/lib/postgresql/data -R -P --wal-method=stream
+                chown -R postgres:postgres /var/lib/postgresql/data
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: user
+            - name: POSTGRES_PASSWORD
+              value: password
+            - name: POSTGRES_DB
+              value: mobile_money
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replica-service
+spec:
+  selector:
+    app: postgres
+    role: replica
+  ports:
+    - port: 5432
+      targetPort: 5432

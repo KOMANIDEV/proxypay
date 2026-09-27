@@ -50,4 +50,19 @@ describe("i18n utility", () => {
       "Invalid input provided",
     );
   });
+
+  it("translates supported error codes across every locale", () => {
+    expect(translate("errors.TRUSTLINE_MISSING", "pt")).toBe(
+      "A conta de destino nao estabeleceu uma linha de confianca para este ativo",
+    );
+    expect(translate("errors.KYC_REQUIRED", "fr")).toBe(
+      "La verification d identite est requise pour continuer",
+    );
+    expect(translate("errors.ACCOUNT_LOCKED", "es")).toBe(
+      "La cuenta esta bloqueada temporalmente por demasiados intentos fallidos",
+    );
+    expect(translate("errors.INSUFFICIENT_FUNDS", "sw")).toBe(
+      "Fedha hazitoshi kukamilisha operesheni hii",
+    );
+  });
 });

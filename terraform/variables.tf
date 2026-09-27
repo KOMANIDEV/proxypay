@@ -113,6 +113,43 @@ variable "db_multi_az" {
   default     = false
 }
 
+# ── Cross-Region Replication (DR) ──────────────────────────────────────────
+variable "enable_cross_region_replica" {
+  description = "Provision a read replica of the primary RDS instance in a second AWS region for disaster recovery"
+  type        = bool
+  default     = false
+}
+
+variable "dr_region" {
+  description = "AWS region for the cross-region read replica (DR region)"
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "dr_vpc_cidr" {
+  description = "CIDR block for the minimal DR-region VPC hosting the cross-region replica"
+  type        = string
+  default     = "10.1.0.0/16"
+}
+
+variable "dr_az_count" {
+  description = "Number of availability zones for the DR-region subnet group"
+  type        = number
+  default     = 2
+}
+
+variable "dr_db_instance_class" {
+  description = "RDS instance class for the cross-region replica"
+  type        = string
+  default     = "db.t3.micro"
+}
+
+variable "dr_db_allocated_storage" {
+  description = "Initial storage allocation in GB for the cross-region replica"
+  type        = number
+  default     = 20
+}
+
 # ── Redis ──────────────────────────────────────────────────────────────────
 variable "redis_node_type" {
   description = "ElastiCache Redis node type"

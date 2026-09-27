@@ -44,6 +44,17 @@ jest.mock("../../src/config/database", () => ({
     { url: "replica1", healthy: true },
     { url: "replica2", healthy: true },
   ]),
+  getPoolStats: jest.fn().mockResolvedValue({
+    primary: {
+      mode: "normal",
+      url: "postgresql://primary",
+      description: "Primary database - all critical writes",
+    },
+    replicas: [
+      { url: "replica1", healthy: true, enabled: true, lagSeconds: 1.2 },
+      { url: "replica2", healthy: true, enabled: true, lagSeconds: 0.4 },
+    ],
+  }),
 }));
 
 // Now safe to import adminRoutes
@@ -117,6 +128,29 @@ describe("Admin Routes - Provider Health", () => {
       // Database should have primary and replicas
       expect(response.body.database).toHaveProperty("primary");
       expect(Array.isArray(response.body.database.replicas)).toBe(true);
+    });
+  });
+
+  describe("GET /api/admin/database/replication", () => {
+    it("should return 403 when user is not authenticated", async () => {
+      const response = await request(app).get("/api/admin/database/replication");
+
+      expect(response.status).toBe(403);
+    });
+
+    it("should return replication status including primary mode and replica lag", async () => {
+      const response = await request(app)
+        .get("/api/admin/database/replication")
+        .query({ mockAdmin: "true" });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.primary.mode).toBe("normal");
+      expect(response.body.primary.url).toBe("postgresql://primary");
+      expect(response.body.replicas).toEqual([
+        { url: "replica1", healthy: true, enabled: true, lagSeconds: 1.2 },
+        { url: "replica2", healthy: true, enabled: true, lagSeconds: 0.4 },
+      ]);
     });
   });
 });

@@ -1,4 +1,10 @@
-import { KYCLevel, TRANSACTION_LIMITS, MIN_TRANSACTION_AMOUNT, MAX_TRANSACTION_AMOUNT } from '../../config/limits';
+import {
+  KYCLevel,
+  TRANSACTION_LIMITS,
+  MIN_TRANSACTION_AMOUNT,
+  MAX_TRANSACTION_AMOUNT,
+} from '../../config/limits';
+import { getProviderLimits } from '../../config/providers';
 import { KYCService } from '../kyc/kycService';
 import { TransactionModel } from '../../models/transaction';
 
@@ -15,96 +21,151 @@ export interface LimitCheckResult {
 export class TransactionLimitService {
   constructor(
     private kycService: KYCService,
-    private transactionModel: TransactionModel
+    private transactionModel: TransactionModel,
   ) {}
 
   async checkTransactionLimit(
     userId: string,
-    transactionAmount: number
+    transactionAmount: number,
+    provider?: string,
   ): Promise<LimitCheckResult> {
-    // Validate per-transaction amount limits first
     if (transactionAmount < MIN_TRANSACTION_AMOUNT) {
       return {
         allowed: false,
-        kycLevel: KYCLevel.Unverified, // Placeholder, actual level not needed for amount validation
+        kycLevel: KYCLevel.Unverified,
         dailyLimit: 0,
         currentDailyTotal: 0,
         remainingLimit: 0,
-        message: `Transaction amount too small. Minimum allowed: ${MIN_TRANSACTION_AMOUNT} XAF. Attempted: ${transactionAmount} XAF.`
+        message: `Transaction amount too small. Minimum allowed: ${MIN_TRANSACTION_AMOUNT} XAF. Attempted: ${transactionAmount} XAF.`,
       };
     }
-    
+
     if (transactionAmount > MAX_TRANSACTION_AMOUNT) {
       return {
         allowed: false,
-        kycLevel: KYCLevel.Unverified, // Placeholder, actual level not needed for amount validation
+        kycLevel: KYCLevel.Unverified,
         dailyLimit: 0,
         currentDailyTotal: 0,
         remainingLimit: 0,
-        message: `Transaction amount too large. Maximum allowed: ${MAX_TRANSACTION_AMOUNT} XAF. Attempted: ${transactionAmount} XAF.`
+        message: `Transaction amount too large. Maximum allowed: ${MAX_TRANSACTION_AMOUNT} XAF. Attempted: ${transactionAmount} XAF.`,
       };
     }
-    
-    // Get user's KYC level
+
     const kycLevel = await this.kycService.getUserKYCLevel(userId);
-    const dailyLimit = TRANSACTION_LIMITS[kycLevel];
-    
-    // Calculate 24-hour window start time (current time - 24 hours)
+    const globalDailyLimit = TRANSACTION_LIMITS[kycLevel];
+
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    
-    // Query recent transactions using transactionModel.findCompletedByUserSince
     const recentTransactions = await this.transactionModel.findCompletedByUserSince(
       userId,
-      twentyFourHoursAgo
+      twentyFourHoursAgo,
     );
-    
-    // Sum transaction amounts to get currentDailyTotal
+
     const currentDailyTotal = recentTransactions.reduce(
       (sum, tx) => sum + parseFloat(tx.amount),
-      0
+      0,
     );
-    
-    // Calculate newTotal = currentDailyTotal + transactionAmount
-    const newTotal = currentDailyTotal + transactionAmount;
-    const remainingLimit = dailyLimit - currentDailyTotal;
-    
-    // Return approval if newTotal ≤ dailyLimit, rejection otherwise
-    if (newTotal > dailyLimit) {
+
+    const providerDailyLimit = this.getProviderDailyLimit(provider);
+    const providerCurrentDailyTotal = this.getProviderDailyTotal(
+      recentTransactions,
+      provider,
+    );
+    const newProviderTotal = providerCurrentDailyTotal + transactionAmount;
+
+    if (providerDailyLimit !== null && newProviderTotal > providerDailyLimit) {
       return {
         allowed: false,
         kycLevel,
-        dailyLimit,
-        currentDailyTotal,
-        remainingLimit,
-        message: this.buildErrorMessage(kycLevel, dailyLimit, currentDailyTotal, transactionAmount),
-        upgradeAvailable: kycLevel !== KYCLevel.Full
+        dailyLimit: providerDailyLimit,
+        currentDailyTotal: providerCurrentDailyTotal,
+        remainingLimit: Math.max(0, providerDailyLimit - providerCurrentDailyTotal),
+        message: this.buildProviderErrorMessage(
+          provider,
+          providerDailyLimit,
+          providerCurrentDailyTotal,
+          transactionAmount,
+        ),
+        upgradeAvailable: kycLevel !== KYCLevel.Full,
       };
     }
-    
+
+    const newTotal = currentDailyTotal + transactionAmount;
+    const remainingLimit = globalDailyLimit - currentDailyTotal;
+
+    if (newTotal > globalDailyLimit) {
+      return {
+        allowed: false,
+        kycLevel,
+        dailyLimit: globalDailyLimit,
+        currentDailyTotal,
+        remainingLimit,
+        message: this.buildErrorMessage(
+          kycLevel,
+          globalDailyLimit,
+          currentDailyTotal,
+          transactionAmount,
+        ),
+        upgradeAvailable: kycLevel !== KYCLevel.Full,
+      };
+    }
+
     return {
       allowed: true,
       kycLevel,
-      dailyLimit,
+      dailyLimit: Math.min(globalDailyLimit, providerDailyLimit ?? globalDailyLimit),
       currentDailyTotal,
-      remainingLimit: dailyLimit - newTotal
+      remainingLimit: globalDailyLimit - newTotal,
     };
+  }
+
+  private getProviderDailyLimit(provider?: string): number | null {
+    if (!provider) return null;
+    const normalizedProvider = provider.toLowerCase();
+    try {
+      const limits = getProviderLimits(normalizedProvider as any);
+      return limits.dailyLimit;
+    } catch {
+      return null;
+    }
+  }
+
+  private getProviderDailyTotal(
+    recentTransactions: Array<{ amount: string; provider?: string }>,
+    provider?: string,
+  ): number {
+    if (!provider) return 0;
+    const normalizedProvider = provider.toLowerCase();
+    return recentTransactions.reduce((sum, tx) => {
+      const txProvider = String(tx.provider ?? '').toLowerCase();
+      return txProvider === normalizedProvider ? sum + parseFloat(tx.amount) : sum;
+    }, 0);
   }
 
   private buildErrorMessage(
     kycLevel: KYCLevel,
     limit: number,
     current: number,
-    attempted: number
+    attempted: number,
   ): string {
     let message = `Transaction limit exceeded. Your ${kycLevel} KYC level allows ${limit} XAF per day. `;
     message += `Current daily total: ${current} XAF. Attempted transaction: ${attempted} XAF.`;
-    
+
     if (kycLevel === KYCLevel.Unverified) {
       message += ' Upgrade to Basic KYC for 100,000 XAF daily limit.';
     } else if (kycLevel === KYCLevel.Basic) {
       message += ' Upgrade to Full KYC for 1,000,000 XAF daily limit.';
     }
-    
+
     return message;
+  }
+
+  private buildProviderErrorMessage(
+    provider: string | undefined,
+    limit: number,
+    current: number,
+    attempted: number,
+  ): string {
+    const providerName = provider ? provider.toUpperCase() : 'Provider';
+    return `${providerName} daily limit exceeded. ${providerName} allows ${limit} XAF per day. Current provider total: ${current} XAF. Attempted transaction: ${attempted} XAF.`;
   }
 }

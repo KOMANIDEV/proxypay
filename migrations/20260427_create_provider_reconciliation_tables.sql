@@ -44,7 +44,12 @@ CREATE TRIGGER provider_reconciliation_runs_updated_at
 CREATE TABLE IF NOT EXISTS provider_reconciliation_alerts (
   id UUID DEFAULT gen_random_uuid(),
   reconciliation_run_id UUID NOT NULL REFERENCES provider_reconciliation_runs(id) ON DELETE CASCADE,
-  transaction_id UUID REFERENCES transactions(id) ON DELETE CASCADE,
+  -- transaction_id is a plain column, not an FK: since
+  -- 009_partition_transactions, transactions is partitioned and PostgreSQL
+  -- forbids FK references to it without a UNIQUE constraint that includes the
+  -- partition key (created_at). Referential integrity is enforced by the
+  -- reconciliation job at write time.
+  transaction_id UUID,
   alert_type VARCHAR(50) NOT NULL, -- 'amount_mismatch', 'status_mismatch', 'orphaned_provider', 'orphaned_db'
   severity VARCHAR(10) NOT NULL DEFAULT 'medium' CHECK (severity IN ('low', 'medium', 'high', 'critical')),
   status VARCHAR(20) NOT NULL DEFAULT 'pending_review' CHECK (status IN ('pending_review', 'reviewed', 'dismissed', 'resolved')),
@@ -101,11 +106,12 @@ CREATE TABLE IF NOT EXISTS provider_report_configs (
 );
 
 -- Insert default configurations for each provider (disabled by default for security)
+-- download_method must satisfy the CHECK constraint ('api', 'manual').
 INSERT INTO provider_report_configs (provider, is_enabled, download_method)
 VALUES
-  ('mtn', false, 'sftp'),
-  ('airtel', false, 'api'),
-  ('orange', false, 'email')
+  ('mtn', false, 'manual'),
+  ('airtel', false, 'manual'),
+  ('orange', false, 'manual')
 ON CONFLICT (provider) DO NOTHING;
 
 -- Auto-update updated_at on provider_report_configs

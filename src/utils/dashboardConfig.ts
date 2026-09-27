@@ -108,3 +108,91 @@ export const DASHBOARD_CONFIG_VALIDATION_ERRORS = [
   "Each widget must have: id (string), type (string), position (number), size (small/medium/large), visible (boolean)",
   "Optional fields: theme (string), refreshInterval (number)",
 ];
+
+/**
+ * Reorder widgets in a dashboard configuration (supports drag-and-drop).
+ * Moves the widget at fromIndex to toIndex and updates all positions.
+ */
+export const reorderWidgets = (
+  config: DashboardConfig,
+  fromIndex: number,
+  toIndex: number,
+): DashboardConfig => {
+  if (fromIndex === toIndex) return config;
+  const widgets = [...config.widgets];
+  const [moved] = widgets.splice(fromIndex, 1);
+  widgets.splice(toIndex, 0, moved);
+  // Normalize positions sequentially
+  const updated = widgets.map((w, i) => ({ ...w, position: i }));
+  return { ...config, widgets: updated };
+};
+
+/**
+ * Toggle a widget's visibility.
+ */
+export const toggleWidgetVisibility = (
+  config: DashboardConfig,
+  widgetId: string,
+): DashboardConfig => {
+  const widgets = config.widgets.map((w) =>
+    w.id === widgetId ? { ...w, visible: !w.visible } : w,
+  );
+  return { ...config, widgets };
+};
+
+/**
+ * Set a specific refresh rate for a widget (seconds, minimum 5s).
+ * @param refreshRateSecs - refresh rate in seconds (min 5, 0 = no refresh)
+ */
+export const setWidgetRefreshRate = (
+  config: DashboardConfig,
+  widgetId: string,
+  refreshRateSecs: number,
+): DashboardConfig => {
+  const normalizedRate = refreshRateSecs === 0 ? 0 : Math.max(5, Math.floor(refreshRateSecs));
+  const widgets = config.widgets.map((w) =>
+    w.id === widgetId ? { ...w, refreshRate: normalizedRate } : w,
+  );
+  return { ...config, widgets };
+};
+
+/**
+ * Merge a partial widget update into the config.
+ */
+export const updateWidget = (
+  config: DashboardConfig,
+  widgetId: string,
+  updates: Partial<DashboardWidget>,
+): DashboardConfig => {
+  const widgets = config.widgets.map((w) =>
+    w.id === widgetId ? { ...w, ...updates, id: w.id } : w,
+  );
+  return { ...config, widgets };
+};
+
+/**
+ * Add a widget to the configuration.
+ */
+export const addWidget = (
+  config: DashboardConfig,
+  widget: Omit<DashboardWidget, 'position'>,
+): DashboardConfig => {
+  const position = config.widgets.length;
+  return {
+    ...config,
+    widgets: [...config.widgets, { ...widget, position }],
+  };
+};
+
+/**
+ * Remove a widget from the config and re-normalize positions.
+ */
+export const removeWidget = (
+  config: DashboardConfig,
+  widgetId: string,
+): DashboardConfig => {
+  const filtered = config.widgets
+    .filter((w) => w.id !== widgetId)
+    .map((w, i) => ({ ...w, position: i }));
+  return { ...config, widgets: filtered };
+};

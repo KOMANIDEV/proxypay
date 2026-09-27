@@ -47,6 +47,13 @@ export interface UserSettings {
   notifications: NotificationPreferences;
   /** ISO-8601 timestamp of the last update. */
   updatedAt: string;
+  /**
+   * Monotonic version of this user's preferences. Incremented on every
+   * successful mutation and used for optimistic concurrency control: a
+   * client that read vN must submit expectedVersion = N to update, so
+   * concurrent sessions cannot silently overwrite each other.
+   */
+  version: number;
 }
 
 export type PartialUserSettings = Partial<
@@ -67,6 +74,7 @@ export const DEFAULT_SETTINGS: Readonly<UserSettings> = Object.freeze({
     quietMode: false,
   }),
   updatedAt: new Date(0).toISOString(),
+  version: 0,
 });
 
 // ---------------------------------------------------------------------------
@@ -98,7 +106,9 @@ export interface ValidationError {
  * Validates a partial settings update and returns a list of errors.
  * An empty array means the input is valid.
  */
-export function validateSettings(input: PartialUserSettings): ValidationError[] {
+export function validateSettings(
+  input: PartialUserSettings,
+): ValidationError[] {
   const errors: ValidationError[] = [];
 
   if (input.theme !== undefined && !VALID_THEMES.has(input.theme)) {
@@ -121,7 +131,10 @@ export function validateSettings(input: PartialUserSettings): ValidationError[] 
   if (input.notifications !== undefined) {
     const { toastDensity, quietMode } = input.notifications;
 
-    if (toastDensity !== undefined && !VALID_TOAST_DENSITIES.has(toastDensity)) {
+    if (
+      toastDensity !== undefined &&
+      !VALID_TOAST_DENSITIES.has(toastDensity)
+    ) {
       errors.push({
         field: "notifications.toastDensity",
         message: `Invalid toastDensity "${toastDensity}". Must be one of: ${[...VALID_TOAST_DENSITIES].join(", ")}.`,
@@ -212,18 +225,45 @@ export function getSettings(userId: string): UserSettings {
       ...DEFAULT_SETTINGS.notifications,
       ...stored.notifications,
     },
+    // Guard against legacy persisted records that predate versioning.
+    version: typeof stored.version === "number" ? stored.version : 0,
   };
+}
+
+export type SettingsUpdateResult =
+  | { settings: UserSettings }
+  | { errors: ValidationError[] }
+  | { conflict: true; current: UserSettings; expectedVersion: number };
+
+export interface SettingsUpdateOptions {
+  /**
+   * The version the caller believes the preferences are at (from a prior
+   * GET). When provided and out of date, the update is rejected with a
+   * conflict instead of silently clobbering concurrent changes.
+   */
+  expectedVersion?: number;
+  /** Optional audit source tag recorded in the change log (e.g. "api"). */
+  source?: string;
+  /** Optional actor id (admin/user) recorded in the change log. */
+  actorId?: string;
 }
 
 /**
  * Apply a partial update to a user's settings.
  *
- * @returns The updated settings, or a list of validation errors.
+ * With `options.expectedVersion` set, the update is optimistic-concurrency
+ * controlled: if the stored version differs from the expected one, a
+ * `{ conflict: true, current }` result is returned instead of overwriting
+ * the newer state. Callers can then surface the current settings and let
+ * the user merge/retry via `resolveSettingsConflict`.
+ *
+ * @returns The updated settings, a list of validation errors, or a conflict.
  */
 export function updateSettings(
   userId: string,
   patch: PartialUserSettings,
-): { settings: UserSettings } | { errors: ValidationError[] } {
+  options: SettingsUpdateOptions = {},
+): SettingsUpdateResult {
   const errors = validateSettings(patch);
   if (errors.length > 0) {
     return { errors };
@@ -233,13 +273,107 @@ export function updateSettings(
 
   const current = getSettings(userId);
 
+  if (
+    options.expectedVersion !== undefined &&
+    current.version !== options.expectedVersion
+  ) {
+    return {
+      conflict: true,
+      current,
+      expectedVersion: options.expectedVersion,
+    };
+  }
+
+  const previousVersion = current.version;
+  const updated = applyPatch(current, patch);
+
+  cache.set(userId, updated);
+  persistToDisk();
+
+  emitChangeEvent({
+    userId,
+    actorId: options.actorId ?? null,
+    action: "update",
+    previousVersion,
+    newVersion: updated.version,
+    changes: patch as unknown as Record<string, unknown>,
+    source: options.source ?? "api",
+  });
+
+  return { settings: updated };
+}
+
+/**
+ * Resolve a version conflict explicitly with a chosen strategy.
+ *
+ *   - "server-wins": discard the incoming patch, keep the stored settings.
+ *   - "client-wins": apply the incoming patch over the stored settings.
+ *   - "merge":       apply only the fields present in the patch, keeping
+ *                    everything else from the stored settings.
+ *
+ * All strategies advance the version so the conflict is permanently
+ * resolved (subsequent updates with the returned version succeed).
+ */
+export function resolveSettingsConflict(
+  userId: string,
+  patch: PartialUserSettings,
+  strategy: ConflictResolutionStrategy,
+  options: SettingsUpdateOptions = {},
+): { settings: UserSettings } | { errors: ValidationError[] } {
+  const errors = validateSettings(patch);
+  if (errors.length > 0) {
+    return { errors };
+  }
+
+  hydrateFromDisk();
+  const current = getSettings(userId);
+  const previousVersion = current.version;
+
+  let updated: UserSettings;
+  if (strategy === "server-wins") {
+    updated = { ...current, version: current.version + 1 };
+  } else {
+    // "client-wins" and "merge" both layer the patch on top of the stored
+    // state; the difference is that merge is applied field-by-field through
+    // applyPatch (which is what updateSettings does anyway).
+    updated = applyPatch(current, patch);
+  }
+
+  cache.set(userId, updated);
+  persistToDisk();
+
+  emitChangeEvent({
+    userId,
+    actorId: options.actorId ?? null,
+    action: "update",
+    previousVersion,
+    newVersion: updated.version,
+    changes: {
+      ...(patch as unknown as Record<string, unknown>),
+      _resolutionStrategy: strategy,
+    },
+    source: options.source ?? "api",
+  });
+
+  return { settings: updated };
+}
+
+export type ConflictResolutionStrategy =
+  | "server-wins"
+  | "client-wins"
+  | "merge";
+
+function applyPatch(
+  current: UserSettings,
+  patch: PartialUserSettings,
+): UserSettings {
   // Normalise currency to uppercase before storing.
   const normalisedCurrency =
     patch.currency !== undefined
-      ? normaliseCurrency(patch.currency) ?? current.currency
+      ? (normaliseCurrency(patch.currency) ?? current.currency)
       : current.currency;
 
-  const updated: UserSettings = {
+  return {
     theme: patch.theme ?? current.theme,
     currency: normalisedCurrency,
     notifications: {
@@ -249,28 +383,40 @@ export function updateSettings(
         patch.notifications?.quietMode ?? current.notifications.quietMode,
     },
     updatedAt: new Date().toISOString(),
+    version: current.version + 1,
   };
-
-  cache.set(userId, updated);
-  persistToDisk();
-
-  return { settings: updated };
 }
 
 /**
- * Reset a user's settings to the application defaults.
+ * Reset a user's settings to the application defaults. The version is still
+ * advanced so concurrent sessions that read the old version conflict.
  */
-export function resetSettings(userId: string): UserSettings {
+export function resetSettings(
+  userId: string,
+  options: SettingsUpdateOptions = {},
+): UserSettings {
   hydrateFromDisk();
+  const previousVersion = getSettings(userId).version;
 
   const defaults: UserSettings = {
     ...DEFAULT_SETTINGS,
     notifications: { ...DEFAULT_SETTINGS.notifications },
     updatedAt: new Date().toISOString(),
+    version: previousVersion + 1,
   };
 
   cache.set(userId, defaults);
   persistToDisk();
+
+  emitChangeEvent({
+    userId,
+    actorId: options.actorId ?? null,
+    action: "reset",
+    previousVersion,
+    newVersion: defaults.version,
+    changes: { reset: true },
+    source: options.source ?? "api",
+  });
 
   return defaults;
 }
@@ -278,10 +424,65 @@ export function resetSettings(userId: string): UserSettings {
 /**
  * Remove all settings for a user (e.g. on account deletion).
  */
-export function deleteSettings(userId: string): void {
+export function deleteSettings(
+  userId: string,
+  options: SettingsUpdateOptions = {},
+): void {
   hydrateFromDisk();
+  const previousVersion = getSettings(userId).version;
   cache.delete(userId);
   persistToDisk();
+
+  emitChangeEvent({
+    userId,
+    actorId: options.actorId ?? null,
+    action: "delete",
+    previousVersion,
+    newVersion: previousVersion,
+    changes: { deleted: true },
+    source: options.source ?? "api",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Change events (audit trail + webhook notifications)
+// ---------------------------------------------------------------------------
+
+export interface SettingsChangeEvent {
+  userId: string;
+  actorId: string | null;
+  action: "update" | "reset" | "delete";
+  previousVersion: number;
+  newVersion: number;
+  changes: Record<string, unknown>;
+  source: string;
+}
+
+/** Registered listeners are invoked (synchronously) after each mutation. */
+type SettingsChangeListener = (event: SettingsChangeEvent) => void;
+
+const changeListeners = new Set<SettingsChangeListener>();
+
+/**
+ * Register a listener invoked after every settings mutation. Used by the
+ * API layer to write the audit trail and enqueue change webhooks.
+ * Returns an unsubscribe function.
+ */
+export function onSettingsChanged(
+  listener: SettingsChangeListener,
+): () => void {
+  changeListeners.add(listener);
+  return () => changeListeners.delete(listener);
+}
+
+function emitChangeEvent(event: SettingsChangeEvent): void {
+  for (const listener of changeListeners) {
+    try {
+      listener(event);
+    } catch {
+      // A failing listener must never break the settings mutation itself.
+    }
+  }
 }
 
 /**
@@ -293,10 +494,11 @@ export const SETTINGS_OPTIONS = Object.freeze({
 });
 
 /**
- * Reset the in-memory cache and hydration flag.
+ * Reset the in-memory cache, hydration flag and change listeners.
  * Intended for use in tests only.
  */
 export function _resetStoreForTesting(): void {
   cache.clear();
   hydrated = false;
+  changeListeners.clear();
 }

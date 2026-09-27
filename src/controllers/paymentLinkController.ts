@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
+import QRCode from "qrcode";
 import { PaymentLinkModel } from "../models/paymentLink";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 
@@ -29,6 +30,7 @@ export async function createPaymentLinkHandler(
       redirectSuccessUrl,
       redirectFailUrl,
       expiresIn, // in seconds
+      timezone,  // optional IANA timezone name, e.g. "Africa/Lagos"
     } = req.body;
 
     // Validate inputs
@@ -48,6 +50,24 @@ export async function createPaymentLinkHandler(
         });
     }
 
+    // Issue #644 – validate the timezone string early so the merchant gets a
+    // clear error rather than a silent miscalculation.
+    if (timezone !== undefined && timezone !== null) {
+      if (typeof timezone !== "string" || timezone.trim() === "") {
+        return res.status(400).json({
+          error: "timezone must be a non-empty IANA timezone string (e.g. \"Africa/Lagos\")",
+        });
+      }
+      // Verify the timezone is recognised by the runtime.
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: timezone });
+      } catch {
+        return res.status(400).json({
+          error: `Unknown timezone: "${timezone}". Use a valid IANA timezone name.`,
+        });
+      }
+    }
+
     // Get active merchant ID from the authenticated session
     const merchantId = (req as any).user?.id || req.body.merchantId;
     if (!merchantId) {
@@ -57,9 +77,14 @@ export async function createPaymentLinkHandler(
     // Generate unique random token
     const token = crypto.randomBytes(16).toString("hex");
 
-    const expiresAt = expiresIn
-      ? new Date(Date.now() + Number(expiresIn) * 1000)
-      : undefined;
+    // Issue #644 – calculate expiration in the merchant's timezone when provided.
+    // `expiresIn` is an offset in seconds from "now"; we compute the UTC
+    // timestamp that corresponds to that many seconds later, but also record the
+    // timezone so displays can render it in the correct local time.
+    let expiresAt: Date | undefined;
+    if (expiresIn) {
+      expiresAt = new Date(Date.now() + Number(expiresIn) * 1000);
+    }
 
     const link = await paymentLinkModel.create({
       merchantId,
@@ -72,20 +97,55 @@ export async function createPaymentLinkHandler(
       redirectSuccessUrl,
       redirectFailUrl,
       expiresAt,
+      timezone: timezone ?? undefined,
     });
 
     const protocol = req.protocol;
     const host = req.get("host") || "";
     const paymentUrl = `${protocol}://${host}/pay/${token}`;
+    const qrCodeDataUrl = await QRCode.toDataURL(paymentUrl, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+    });
 
     return res.status(201).json({
       message: "Payment link created successfully",
       paymentLink: link,
       paymentUrl,
+      qrCodeDataUrl,
     });
   } catch (error) {
     console.error("Failed to create payment link:", error);
     return res.status(500).json({ error: "Failed to create payment link" });
+  }
+}
+
+/** Public QR image for sharing or scanning a payment link. */
+export async function paymentLinkQrHandler(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    const link = await paymentLinkModel.findByToken(req.params.token);
+    if (!link) {
+      res.status(404).json({ error: "Payment link not found" });
+      return;
+    }
+
+    const paymentUrl = `${req.protocol}://${req.get("host") || ""}/pay/${link.token}`;
+    const image = await QRCode.toBuffer(paymentUrl, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 512,
+      type: "png",
+    });
+
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.type("png").send(image);
+  } catch (error) {
+    console.error("Failed to generate payment link QR code:", error);
+    res.status(500).json({ error: "Failed to generate payment link QR code" });
   }
 }
 
@@ -516,6 +576,28 @@ function getLandingPageTemplate(data: {
       border-top: 1px solid rgba(255, 255, 255, 0.05);
       padding-top: 8px;
     }
+
+    .qr-section {
+      text-align: center;
+      margin: 0 auto 28px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .qr-section img {
+      display: block;
+      width: 180px;
+      height: 180px;
+      padding: 10px;
+      margin: 0 auto 8px;
+      background: #ffffff;
+      border-radius: 12px;
+    }
+
+    .qr-caption {
+      color: var(--text-muted);
+      font-size: 13px;
+    }
     
     .form-group {
       margin-bottom: 24px;
@@ -686,6 +768,11 @@ function getLandingPageTemplate(data: {
           ${parseFloat(data.amount).toLocaleString()} <span class="amount-currency">${data.currency}</span>
         </div>
         ${data.description ? `<div class="payment-for">${data.description}</div>` : ""}
+      </div>
+
+      <div class="qr-section">
+        <img src="/pay/${data.token}/qr" alt="Scan to open this payment link" width="180" height="180">
+        <p class="qr-caption">Scan to pay</p>
       </div>
       
       <div id="error-box" class="error-msg"></div>

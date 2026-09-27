@@ -15,6 +15,41 @@ const redisOptions: any = {
 let subscriber: IORedis | null = null;
 
 /**
+ * Handle a transaction update delivered over Redis pub/sub.
+ *
+ * The same logical update is published to both the broadcast channel
+ * (`transaction.updated`) and the per-transaction channel
+ * (`TRANSACTION_UPDATED:<id>`), so this runs twice per status change.
+ * `NotificationRouter` deduplicates identical events, so only the first
+ * invocation actually sends notifications.
+ */
+async function handleTransactionUpdate(rawMessage: string): Promise<void> {
+  try {
+    const payload = JSON.parse(rawMessage) as {
+      id?: string;
+      status?: string;
+      [key: string]: any;
+    };
+
+    const txId = payload.id;
+    const status = payload.status;
+    if (!txId || !status) return;
+
+    const txModel = new TransactionModel();
+    const tx = await txModel.findById(txId);
+    if (!tx) return;
+
+    if (status === "completed") {
+      await notificationRouter.routeTransactionNotification(tx, "completed");
+    } else if (status === "failed") {
+      await notificationRouter.routeTransactionNotification(tx, "failed", payload.error);
+    }
+  } catch (err) {
+    console.error("NotificationWorker: failed to handle message:", err);
+  }
+}
+
+/**
  * Notification worker — subscribes to transaction update channels in Redis
  * and routes user-facing notifications (email/sms/push/etc.) via
  * `NotificationRouter`. This replaces DB polling for notification triggers.
@@ -40,59 +75,15 @@ export async function startNotificationWorker(): Promise<void> {
   await subscriber.subscribe(SubscriptionChannels.TRANSACTION_UPDATED);
   await subscriber.psubscribe("TRANSACTION_UPDATED:*");
 
-  subscriber.on("message", async (_channel: string, rawMessage: string) => {
-    try {
-      const payload = JSON.parse(rawMessage) as {
-        id?: string;
-        status?: string;
-        [key: string]: any;
-      };
-
-      const txId = payload.id;
-      const status = payload.status;
-      if (!txId || !status) return;
-
-      const txModel = new TransactionModel();
-      const tx = await txModel.findById(txId);
-      if (!tx) return;
-
-      if (status === "completed") {
-        await notificationRouter.routeTransactionNotification(tx, "completed");
-      } else if (status === "failed") {
-        await notificationRouter.routeTransactionNotification(tx, "failed", payload.error);
-      }
-    } catch (err) {
-      console.error("NotificationWorker: failed to handle message:", err);
-    }
+  subscriber.on("message", (_channel: string, rawMessage: string) => {
+    void handleTransactionUpdate(rawMessage);
   });
 
   // pmessage handles pattern subscriptions (TRANSACTION_UPDATED:<id>)
   subscriber.on(
     "pmessage",
-    async (_pattern: string, _channel: string, rawMessage: string) => {
-      try {
-        const payload = JSON.parse(rawMessage) as {
-          id?: string;
-          status?: string;
-          [key: string]: any;
-        };
-
-        const txId = payload.id;
-        const status = payload.status;
-        if (!txId || !status) return;
-
-        const txModel = new TransactionModel();
-        const tx = await txModel.findById(txId);
-        if (!tx) return;
-
-        if (status === "completed") {
-          await notificationRouter.routeTransactionNotification(tx, "completed");
-        } else if (status === "failed") {
-          await notificationRouter.routeTransactionNotification(tx, "failed", payload.error);
-        }
-      } catch (err) {
-        console.error("NotificationWorker: failed to handle pmessage:", err);
-      }
+    (_pattern: string, _channel: string, rawMessage: string) => {
+      void handleTransactionUpdate(rawMessage);
     },
   );
 

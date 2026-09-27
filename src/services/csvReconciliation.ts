@@ -6,6 +6,7 @@ import { DiscrepancyType } from "../models/reconciliation";
 export interface ProviderCSVRow {
   reference_number?: string;
   reference_id?: string;
+  provider_reference?: string;
   amount?: string;
   status?: string;
   phone_number?: string;
@@ -23,6 +24,7 @@ export interface ReconciliationMatch {
   db_record?: {
     id: string;
     reference_number: string;
+    provider_reference?: string;
     amount: string;
     status: string;
     phone_number: string;
@@ -97,6 +99,208 @@ function normalizeAmount(amount?: string): string | null {
   return amount.replace(/[^0-9.]/g, "").trim();
 }
 
+export interface CSVValidationError {
+  row: number;
+  field: string;
+  value: unknown;
+  message: string;
+  severity: "error" | "warning";
+}
+
+export interface CSVValidationResult {
+  isValid: boolean;
+  errors: CSVValidationError[];
+  warnings: CSVValidationError[];
+  summary: {
+    totalRows: number;
+    validRows: number;
+    errorRows: number;
+    warningRows: number;
+  };
+}
+
+export interface CSVImportPreview {
+  preview: ReconciliationResult;
+  validation: CSVValidationResult;
+  estimatedChanges: {
+    matched: number;
+    discrepancies: number;
+    orphanedProvider: number;
+    orphanedDb: number;
+  };
+}
+
+export interface CSVImportRollback {
+  importId: string;
+  rolledBackAt: string;
+  recordsRestored: number;
+}
+
+const REQUIRED_FIELDS = ["reference_number", "amount", "status", "phone_number", "provider"];
+const VALID_STATUSES = ["completed", "pending", "failed", "cancelled"];
+const PHONE_REGEX = /^\+?[1-9]\d{1,14}$/;
+const AMOUNT_REGEX = /^\d+(\.\d+)?$/;
+
+export function validateCSVSchema(rows: ProviderCSVRow[]): CSVValidationResult {
+  const errors: CSVValidationError[] = [];
+  const warnings: CSVValidationError[] = [];
+  let errorRows = 0;
+  let warningRows = 0;
+
+  if (rows.length === 0) {
+    return {
+      isValid: true,
+      errors: [],
+      warnings: [],
+      summary: { totalRows: 0, validRows: 0, errorRows: 0, warningRows: 0 },
+    };
+  }
+
+  const sampleKeys = Object.keys(rows[0]);
+  for (const field of REQUIRED_FIELDS) {
+    if (!sampleKeys.includes(field) && !sampleKeys.includes("reference_id")) {
+      errors.push({
+        row: 0,
+        field: "schema",
+        value: sampleKeys,
+        message: `Missing required field: ${field}`,
+        severity: "error",
+      });
+    }
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rowNumber = i + 2;
+    let rowHasError = false;
+    let rowHasWarning = false;
+
+    const ref = row.reference_number || row.reference_id;
+    if (!ref || ref.trim() === "") {
+      errors.push({ row: rowNumber, field: "reference_number", value: ref, message: "Reference number is required", severity: "error" });
+      rowHasError = true;
+    }
+
+    if (!row.amount || row.amount.trim() === "") {
+      errors.push({ row: rowNumber, field: "amount", value: row.amount, message: "Amount is required", severity: "error" });
+      rowHasError = true;
+    } else if (!AMOUNT_REGEX.test(row.amount.trim())) {
+      errors.push({ row: rowNumber, field: "amount", value: row.amount, message: "Amount must be a valid number", severity: "error" });
+      rowHasError = true;
+    }
+
+    if (!row.status || row.status.trim() === "") {
+      errors.push({ row: rowNumber, field: "status", value: row.status, message: "Status is required", severity: "error" });
+      rowHasError = true;
+    } else if (!VALID_STATUSES.includes(row.status.toLowerCase().trim())) {
+      warnings.push({
+        row: rowNumber,
+        field: "status",
+        value: row.status,
+        message: `Non-standard status: ${row.status}. Expected one of: ${VALID_STATUSES.join(", ")}`,
+        severity: "warning",
+      });
+      rowHasWarning = true;
+    }
+
+    if (!row.phone_number || row.phone_number.trim() === "") {
+      errors.push({ row: rowNumber, field: "phone_number", value: row.phone_number, message: "Phone number is required", severity: "error" });
+      rowHasError = true;
+    } else if (!PHONE_REGEX.test(row.phone_number.trim())) {
+      warnings.push({
+        row: rowNumber,
+        field: "phone_number",
+        value: row.phone_number,
+        message: "Phone number format may be invalid",
+        severity: "warning",
+      });
+      rowHasWarning = true;
+    }
+
+    if (!row.provider || row.provider.trim() === "") {
+      errors.push({ row: rowNumber, field: "provider", value: row.provider, message: "Provider is required", severity: "error" });
+      rowHasError = true;
+    }
+
+    if (rowHasError) errorRows++;
+    if (rowHasWarning) warningRows++;
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings,
+    summary: {
+      totalRows: rows.length,
+      validRows: rows.length - errorRows,
+      errorRows,
+      warningRows,
+    },
+  };
+}
+
+export async function previewCSVImport(buffer: Buffer, dateRange?: { start?: string; end?: string }): Promise<CSVImportPreview> {
+  const rows = await parseCSV(buffer);
+  const validation = validateCSVSchema(rows);
+  const preview = validation.isValid ? await reconcileTransactions(rows, dateRange) : {
+    total_provider_rows: rows.length,
+    total_db_records: 0,
+    matched: [],
+    discrepancies: [],
+    orphaned_provider: [],
+    orphaned_db: [],
+    summary: { match_rate: "0.00%", total_matched: 0, total_discrepancies: 0, total_orphaned_provider: 0, total_orphaned_db: 0 },
+  };
+
+  return {
+    preview,
+    validation,
+    estimatedChanges: {
+      matched: preview.summary.total_matched,
+      discrepancies: preview.summary.total_discrepancies,
+      orphanedProvider: preview.summary.total_orphaned_provider,
+      orphanedDb: preview.summary.total_orphaned_db,
+    },
+  };
+}
+
+export async function rollbackCSVImport(importId: string): Promise<CSVImportRollback> {
+  const result = await queryRead("SELECT * FROM csv_imports WHERE id = $1", [importId]);
+  if (!result.rows.length) {
+    throw new Error("Import not found");
+  }
+
+  const importRecord = result.rows[0];
+  if (importRecord.rolled_back_at) {
+    throw new Error("Import has already been rolled back");
+  }
+
+  let recordsRestored = 0;
+  if (importRecord.backup_snapshot) {
+    const snapshot = importRecord.backup_snapshot as any[];
+    for (const record of snapshot) {
+      await queryWrite(
+        `INSERT INTO transactions (id, reference_number, amount, status, phone_number, provider, user_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (reference_number) DO UPDATE SET
+           amount = EXCLUDED.amount,
+           status = EXCLUDED.status,
+           updated_at = NOW()`,
+        [record.id, record.reference_number, record.amount, record.status, record.phone_number, record.provider, record.user_id, record.created_at, record.updated_at],
+      );
+      recordsRestored++;
+    }
+  }
+
+  await queryWrite(`UPDATE csv_imports SET rolled_back_at = NOW() WHERE id = $1`, [importId]);
+
+  return {
+    importId,
+    rolledBackAt: new Date().toISOString(),
+    recordsRestored,
+  };
+}
+
 /**
  * Reconcile provider CSV against database transactions
  */
@@ -109,6 +313,7 @@ export async function reconcileTransactions(
     SELECT 
       id, 
       reference_number, 
+      provider_reference,
       amount::text as amount, 
       status, 
       phone_number, 
@@ -134,14 +339,20 @@ export async function reconcileTransactions(
   const dbResult = await queryRead(query, params);
   const dbRecords = dbResult.rows;
 
-  // Create lookup maps
-  const dbByReference = new Map(
-    dbRecords.map((r) => [normalizeReferenceNumber(r.reference_number), r]),
-  );
+  // Create lookup maps – index by internal reference_number and provider_reference (#643)
+  const dbByReference = new Map<string, any>();
+  for (const r of dbRecords) {
+    const ref = normalizeReferenceNumber(r.reference_number);
+    if (ref) dbByReference.set(ref, r);
+    const provRef = normalizeReferenceNumber(r.provider_reference);
+    if (provRef) dbByReference.set(provRef, r);
+  }
 
   const providerByReference = new Map(
     providerRows.map((r) => [
-      normalizeReferenceNumber(r.reference_number || r.reference_id),
+      normalizeReferenceNumber(
+        r.provider_reference || r.reference_number || r.reference_id,
+      ),
       r,
     ]),
   );
@@ -151,14 +362,19 @@ export async function reconcileTransactions(
   const matchedDbRefs = new Set<string>();
   const matchedProviderRefs = new Set<string>();
 
-  // Match by reference number
+  // Match by reference number or provider reference
   for (const [refNum, providerRow] of providerByReference.entries()) {
     if (!refNum) continue;
 
     const dbRecord = dbByReference.get(refNum);
 
     if (dbRecord) {
-      matchedDbRefs.add(refNum);
+      if (dbRecord.reference_number) {
+        matchedDbRefs.add(normalizeReferenceNumber(dbRecord.reference_number)!);
+      }
+      if (dbRecord.provider_reference) {
+        matchedDbRefs.add(normalizeReferenceNumber(dbRecord.provider_reference)!);
+      }
       matchedProviderRefs.add(refNum);
 
       const dbAmount = normalizeAmount(dbRecord.amount);
@@ -195,7 +411,7 @@ export async function reconcileTransactions(
   // Find orphaned provider records (in CSV but not in DB)
   const orphaned_provider = providerRows.filter((row) => {
     const refNum = normalizeReferenceNumber(
-      row.reference_number || row.reference_id,
+      row.provider_reference || row.reference_number || row.reference_id,
     );
     return refNum && !matchedProviderRefs.has(refNum);
   });
@@ -203,7 +419,11 @@ export async function reconcileTransactions(
   // Find orphaned DB records (in DB but not in CSV)
   const orphaned_db = dbRecords.filter((record) => {
     const refNum = normalizeReferenceNumber(record.reference_number);
-    return refNum && !matchedDbRefs.has(refNum);
+    const provRef = normalizeReferenceNumber(record.provider_reference);
+    const isMatched =
+      (refNum && matchedDbRefs.has(refNum)) ||
+      (provRef && matchedDbRefs.has(provRef));
+    return !isMatched;
   });
 
   const totalMatched = matched.length;

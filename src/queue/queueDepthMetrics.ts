@@ -1,6 +1,8 @@
 import { Request, Response } from "express";
 import { providerBalanceAlertQueue } from "./providerBalanceAlertQueue";
 import { accountMergeQueue } from "./accountMergeQueue";
+import { syncQueue } from "./syncQueue";
+import { accountingTokenRefreshQueue } from "./accountingTokenRefreshQueue";
 import { getQueueStats } from "./transactionQueue";
 import { redisClient } from "../config/redis";
 import { Queue } from "bullmq";
@@ -42,8 +44,14 @@ export async function getQueueStatsAggregate(): Promise<QueueDepthMetrics> {
     providerActive,
     mergeWaiting,
     mergeActive,
+    syncWaiting,
+    syncActive,
+    tokenRefreshWaiting,
+    tokenRefreshActive,
     providerLatency,
     mergeLatency,
+    syncLatency,
+    tokenRefreshLatency,
     redisInfo,
   ] = await Promise.all([
     getQueueStats(),
@@ -51,8 +59,14 @@ export async function getQueueStatsAggregate(): Promise<QueueDepthMetrics> {
     providerBalanceAlertQueue.getActiveCount(),
     accountMergeQueue.getWaitingCount(),
     accountMergeQueue.getActiveCount(),
-    getLatency(providerBalanceAlertQueue as any), // Cast if needed for compatibility
+    syncQueue.getWaitingCount(),
+    syncQueue.getActiveCount(),
+    accountingTokenRefreshQueue.getWaitingCount(),
+    accountingTokenRefreshQueue.getActiveCount(),
+    getLatency(providerBalanceAlertQueue as any),
     getLatency(accountMergeQueue),
+    getLatency(syncQueue),
+    getLatency(accountingTokenRefreshQueue),
     redisClient.info("memory"),
   ]);
 
@@ -81,6 +95,20 @@ export async function getQueueStatsAggregate(): Promise<QueueDepthMetrics> {
       active: mergeActive,
       depth: mergeWaiting + mergeActive,
       latency_ms: mergeLatency,
+    },
+    {
+      name: "accounting-sync",
+      waiting: syncWaiting,
+      active: syncActive,
+      depth: syncWaiting + syncActive,
+      latency_ms: syncLatency,
+    },
+    {
+      name: "accounting-token-refresh",
+      waiting: tokenRefreshWaiting,
+      active: tokenRefreshActive,
+      depth: tokenRefreshWaiting + tokenRefreshActive,
+      latency_ms: tokenRefreshLatency,
     },
   ];
 

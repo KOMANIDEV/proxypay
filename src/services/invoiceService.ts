@@ -1,10 +1,128 @@
 import PDFDocument from 'pdfkit';
+import Handlebars from 'handlebars';
 import { Transaction } from '../models/transaction';
 import { User } from '../models/users';
 import { maskPhoneNumber, maskStellarAddress } from '../utils/masking';
 import { currencyService } from './currency';
+import { InvoiceModel, InvoiceStatus, type Invoice } from '../models/invoice';
+import logger from '../utils/logger';
 
 export class InvoiceService {
+  private invoiceModel = new InvoiceModel();
+
+  /**
+   * Generate and store invoice for a user for a specific billing period
+   */
+  async generateAndStoreInvoice(
+    user: User,
+    month: number,
+    year: number,
+    transactions: Transaction[],
+    templateId?: string
+  ): Promise<Invoice> {
+    // Calculate summary by currency
+    const currencySummary = this.calculateCurrencySummary(transactions);
+
+    // Generate PDF
+    const pdfBuffer = await this.generateMonthlyInvoicePDF(
+      user,
+      month,
+      year,
+      transactions
+    );
+
+    // Create invoice record
+    const invoice = await this.invoiceModel.create({
+      userId: user.id,
+      merchantId: undefined,
+      templateId,
+      billingMonth: month,
+      billingYear: year,
+      currencySummary,
+      status: InvoiceStatus.Generated,
+      pdfSizeBytes: pdfBuffer.length,
+      generatedAt: new Date(),
+    });
+
+    logger.info(
+      { invoiceId: invoice.id, userId: user.id },
+      `Invoice generated: ${invoice.invoiceNumber}`
+    );
+
+    return invoice;
+  }
+
+  /**
+   * Mark invoice as sent
+   */
+  async markInvoiceAsSent(
+    invoiceId: string,
+    emailMessageId: string,
+    sentAt: Date = new Date()
+  ): Promise<Invoice> {
+    return this.invoiceModel.updateStatus(invoiceId, InvoiceStatus.Sent, {
+      sentAt,
+      emailMessageId,
+    });
+  }
+
+  /**
+   * Mark invoice as failed to send
+   */
+  async markInvoiceAsFailed(
+    invoiceId: string,
+    error: string
+  ): Promise<Invoice> {
+    return this.invoiceModel.updateStatus(invoiceId, InvoiceStatus.Failed, {
+      deliveryError: error,
+    });
+  }
+
+  /**
+   * Calculate currency summary from transactions
+   */
+  private calculateCurrencySummary(transactions: Transaction[]): Record<string, any> {
+    const summary: Record<string, any> = {};
+
+    transactions.forEach((tx) => {
+      const currency = tx.currency || 'USD';
+      if (!summary[currency]) {
+        summary[currency] = {
+          deposits: 0,
+          withdrawals: 0,
+          fees: 0,
+          total: 0,
+          count: 0,
+        };
+      }
+
+      const amount = parseFloat(String(tx.amount)) || 0;
+      const fee = tx.fee ? parseFloat(String(tx.fee)) : 0;
+
+      summary[currency].count++;
+      summary[currency].fees += fee;
+
+      if (tx.type === 'deposit') {
+        summary[currency].deposits += amount;
+        summary[currency].total += amount;
+      } else if (tx.type === 'withdrawal') {
+        summary[currency].withdrawals += amount;
+        summary[currency].total -= amount;
+      }
+    });
+
+    // Format amounts to 2 decimal places
+    Object.keys(summary).forEach((currency) => {
+      const stats = summary[currency];
+      stats.deposits = parseFloat(stats.deposits.toFixed(2));
+      stats.withdrawals = parseFloat(stats.withdrawals.toFixed(2));
+      stats.fees = parseFloat(stats.fees.toFixed(2));
+      stats.total = parseFloat(stats.total.toFixed(2));
+    });
+
+    return summary;
+  }
+
   async generateMonthlyInvoicePDF(
     user: User,
     month: number,

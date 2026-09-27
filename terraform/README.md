@@ -15,9 +15,24 @@ Internet → ALB (public subnets) → ECS Fargate (private subnets) → RDS Post
 |--------|---------|
 | `modules/vpc` | VPC, public/private subnets, IGW, NAT, route tables |
 | `modules/security` | Security groups for ALB, app, database, Redis |
-| `modules/database` | RDS PostgreSQL 16 with encryption and automated backups |
+| `modules/database` | RDS PostgreSQL 16 with encryption and automated backups; optional cross-region read replica (DR) |
 | `modules/redis` | ElastiCache Redis 7 replication group |
 | `modules/web` | ALB + ECS Fargate cluster with auto-scaling |
+
+## Cross-Region Replication (DR)
+
+Set `enable_cross_region_replica = true` to provision a warm read replica of
+RDS in `dr_region` (default `us-west-2`) for disaster recovery. The replica is
+created via `replicate_source_db` using a second provider alias (`aws.dr`).
+
+```bash
+terraform apply -var-file="environments/production.tfvars"
+terraform output dr_db_endpoint
+terraform output dr_db_connection_url
+```
+
+Point the app's `READ_REPLICA_URL` at the replica. Failover/promotion
+procedures are in `../docs/runbooks/11-database-failover.md`.
 
 ## Prerequisites
 
@@ -64,6 +79,8 @@ After `terraform apply`, these values are available:
 |--------|-------------|
 | `alb_dns_name` | ALB DNS — point your domain here |
 | `db_endpoint` | RDS PostgreSQL host:port |
+| `dr_db_endpoint` | Cross-region replica host:port (empty when disabled) |
+| `dr_db_arn` | ARN of the cross-region replica (promotion target) |
 | `redis_endpoint` | ElastiCache primary endpoint |
 | `ecs_cluster_name` | ECS cluster name |
 

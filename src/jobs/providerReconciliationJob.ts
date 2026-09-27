@@ -74,8 +74,17 @@ export async function runDailyProviderReconciliation(): Promise<void> {
     if (criticalAlerts.length > 0 || highAlerts.length > 0) {
       logger.warn(`[Daily Provider Reconciliation] Found ${criticalAlerts.length} critical and ${highAlerts.length} high priority alerts requiring review`);
 
-      // Here you could add notification logic (email, Slack, PagerDuty, etc.)
-      // For now, just log the alert counts
+      // TODO: Add notification logic (email, Slack, PagerDuty, etc.)
+      // For now, log detailed alert information
+      for (const alert of [...criticalAlerts, ...highAlerts]) {
+        logger.warn(`[Alert] ${alert.alert_type} (${alert.severity}) - Ref: ${alert.reference_number}, Transaction: ${alert.transaction_id}`);
+      }
+    }
+
+    // Check for unreconciled transactions that may need attention
+    const unreconciled = await providerReconciliationService.getUnreconciledTransactions(7);
+    if (unreconciled.length > 0) {
+      logger.warn(`[Daily Provider Reconciliation] Found ${unreconciled.length} transactions older than 7 days without reconciliation`);
     }
 
   } catch (error) {
@@ -102,4 +111,14 @@ export async function runManualProviderReconciliation(
     logger.error(error, `[Manual Provider Reconciliation] Failed`);
     throw error;
   }
+}
+
+/**
+ * Get daily reconciliation summary for reporting/alerting
+ */
+export async function getReconciliationSummary(date?: Date): Promise<any> {
+  const targetDate = date || new Date();
+  targetDate.setDate(targetDate.getDate() - 1); // Default to yesterday
+
+  return providerReconciliationService.getDailyReconciliationSummary(targetDate);
 }

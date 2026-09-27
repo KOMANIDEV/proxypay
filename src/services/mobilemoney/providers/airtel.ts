@@ -8,6 +8,10 @@ import axios, {
 import logger from "../../../utils/logger";
 import { maskPII } from "../../../utils/masking";
 import { formatPhoneForProvider } from "../../../utils/phoneUtils";
+import {
+  SessionRequestQueue,
+  SessionTimeoutError,
+} from "../sessionRequestQueue";
 
 // ============================================================================
 // TYPES & INTERFACES
@@ -88,6 +92,8 @@ interface AirtelProviderOptions extends Partial<AirtelProviderConfig> {
   proxyHttpClient?: AirtelHttpClient;
   directHttpClient?: AirtelHttpClient;
   clock?: () => number;
+  /** Optional shared queue; one is created per provider when omitted. */
+  sessionRequestQueue?: SessionRequestQueue;
 }
 
 const DEFAULT_SESSION_TTL_MS = 20 * 60 * 1000;
@@ -108,11 +114,14 @@ export class AirtelService {
   private session: AirtelSessionState | null = null;
   private sessionPromise: Promise<AirtelSessionState> | null = null;
   private readonly clock: () => number;
+  private readonly sessionRequestQueue: SessionRequestQueue;
 
   constructor(options: AirtelProviderOptions = {}) {
     this.clock = options.clock ?? Date.now;
     this.config = this.buildConfig(options);
     this.mode = this.resolveMode();
+    this.sessionRequestQueue =
+      options.sessionRequestQueue ?? new SessionRequestQueue();
 
     this.client =
       options.httpClient ??
@@ -394,6 +403,98 @@ export class AirtelService {
       : this.mode === "web"
         ? this.getBalanceViaWebSession()
         : this.getBalanceViaDirect();
+  }
+
+  /**
+   * Returns a snapshot of the current web session's expiry timestamp (ms since
+   * epoch) and the active operation mode.  Returns `null` when no session is
+   * cached or the provider is not in web/session-based mode.
+   *
+   * Used by the proactive session-refresh job to determine how much time
+   * remains before the session expires without having to trigger a real request.
+   */
+  getSessionInfo(): { expiresAt: number; mode: AirtelMode } | null {
+    if (this.mode !== "web") {
+      return null;
+    }
+    if (!this.session) {
+      return null;
+    }
+    return { expiresAt: this.session.expiresAt, mode: this.mode };
+  }
+
+  /**
+   * Proactively refreshes the web session.  Attempts a session refresh first;
+   * falls back to a full re-login on failure.  Does nothing when the provider
+   * is not in web mode.
+   *
+   * Called by the background session-refresh job when the session is
+   * approaching its expiry window (default: 1 hour before expiry).
+   */
+  async proactivelyRefreshSession(): Promise<{
+    success: boolean;
+    reloggedIn?: boolean;
+    error?: unknown;
+  }> {
+    if (this.mode !== "web") {
+      return { success: true };
+    }
+
+    try {
+      const current = this.session ?? this.loadSession();
+      if (current && !this.isExpired(current)) {
+        // Attempt a lightweight session refresh first.
+        await this.refreshSession(current);
+        return { success: true, reloggedIn: false };
+      }
+
+      // No live session — perform a full login.
+      await this.ensureSession(true);
+      return { success: true, reloggedIn: true };
+    } catch (error) {
+      // Refresh failed — attempt full re-login as fallback.
+      try {
+        this.session = null;
+        await this.ensureSession(true);
+        return { success: true, reloggedIn: true };
+      } catch (loginError) {
+        return { success: false, reloggedIn: true, error: loginError };
+      }
+    }
+  }
+
+  /**
+   * Probes whether the configured credentials/session are still accepted by
+   * Airtel. In direct mode this fetches a fresh OAuth token; in web mode it
+   * ensures a valid session (re-logging in if needed); proxy mode is skipped
+   * because the proxy owns the credentials. Used by the provider token
+   * watchdog to detect revoked/expired credentials before they interrupt
+   * service.
+   */
+  async checkAuth(): Promise<{
+    success: boolean;
+    invalidCredentials?: boolean;
+    error?: unknown;
+  }> {
+    try {
+      if (this.mode === "proxy") {
+        return { success: true };
+      }
+
+      if (this.mode === "web") {
+        await this.ensureSession();
+        return { success: true };
+      }
+
+      const token = await this.authenticateDirect();
+      return { success: Boolean(token) };
+    } catch (error: any) {
+      return {
+        success: false,
+        invalidCredentials: isInvalidCredentialsError(error),
+        error,
+      };
+    }
   }
 
   // =========================================================================
@@ -749,7 +850,43 @@ export class AirtelService {
     return this.toProviderResult(response, reference);
   }
 
+  /**
+   * Serializes session-backed requests through a per-session queue so
+   * concurrent callers cannot corrupt shared cookie/CSRF state (Issue #631).
+   * If the session expires while a request is queued, the cached session is
+   * dropped and the request is retried once with a fresh login.
+   */
   private async requestWithSessionAndRetry(
+    request: AxiosRequestConfig,
+    operation: "payment" | "payout",
+  ): Promise<AxiosResponse> {
+    const sessionKey = this.sessionQueueKey();
+
+    for (let guard = 0; guard <= 1; guard++) {
+      try {
+        return await this.sessionRequestQueue.enqueue(
+          sessionKey,
+          () => this.performRequestWithSessionAndRetry(request, operation),
+          { sessionExpiresAt: this.session?.expiresAt, operation },
+        );
+      } catch (error) {
+        if (error instanceof SessionTimeoutError && guard === 0) {
+          // Session died while queued — force a fresh login on the retry.
+          this.session = null;
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error("Airtel request failed after session re-authentication");
+  }
+
+  private sessionQueueKey(): string {
+    return `airtel:${this.mode}:${this.config.webBaseUrl}`;
+  }
+
+  private async performRequestWithSessionAndRetry(
     request: AxiosRequestConfig,
     operation: "payment" | "payout",
   ): Promise<AxiosResponse> {
@@ -1213,4 +1350,20 @@ export class AirtelService {
   private async delay(attempt: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
   }
+}
+
+/**
+ * Classifies an error as invalid credentials (401/403). Providers using
+ * `validateStatus: () => true` throw plain Errors with the HTTP status in the
+ * message (e.g. "Airtel direct auth failed with status 401"), while axios
+ * rejections carry `error.response.status`.
+ */
+function isInvalidCredentialsError(error: unknown): boolean {
+  if (!error) return false;
+
+  const anyError = error as { response?: { status?: number }; message?: string };
+  const status = anyError.response?.status;
+  if (status === 401 || status === 403) return true;
+
+  return /status\s+(401|403)\b/i.test(anyError.message ?? "");
 }

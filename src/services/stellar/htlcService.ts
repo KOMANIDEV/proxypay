@@ -1,5 +1,6 @@
 import * as StellarSdk from "stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../../config/stellar";
+import { recordSorobanInteraction } from "./sorobanInteractionLogger";
 
 export interface HtlcLockParams {
   senderAddress: string;
@@ -57,12 +58,32 @@ export class HtlcService {
           StellarSdk.nativeToScVal(params.receiverAddress, { type: "address" }),
           StellarSdk.nativeToScVal(params.tokenAddress, { type: "address" }),
           StellarSdk.nativeToScVal(BigInt(params.amount), { type: "u64" }),
-          StellarSdk.nativeToScVal(Buffer.from(params.hashlock, "hex"), { type: "bytesN" }),
-          StellarSdk.nativeToScVal(params.timelock, { type: "u32" })
-        )
+          StellarSdk.nativeToScVal(Buffer.from(params.hashlock, "hex"), {
+            type: "bytesN",
+          }),
+          StellarSdk.nativeToScVal(params.timelock, { type: "u32" }),
+        ),
       )
       .setTimeout(30)
       .build();
+
+    await recordSorobanInteraction({
+      contractId: params.contractId,
+      method: "initialize",
+      sourceAccount: params.senderAddress,
+      stateChange: true,
+      arguments: {
+        sender: params.senderAddress,
+        receiver: params.receiverAddress,
+        token: params.tokenAddress,
+        amount: params.amount,
+        hashlock: "[REDACTED]",
+        timelock: params.timelock,
+      },
+      transactionXdr: tx.toXDR("base64"),
+      transactionHash: tx.hash().toString("hex"),
+      status: "built",
+    });
 
     return tx;
   }
@@ -78,40 +99,68 @@ export class HtlcService {
       .addOperation(
         contract.call(
           "claim",
-          StellarSdk.nativeToScVal(Buffer.from(params.preimage, "hex"), { type: "bytesN" })
-        )
+          StellarSdk.nativeToScVal(Buffer.from(params.preimage, "hex"), {
+            type: "bytesN",
+          }),
+        ),
       )
       .setTimeout(30)
       .build();
 
+    await recordSorobanInteraction({
+      contractId: params.contractId,
+      method: "claim",
+      sourceAccount: params.claimerAddress,
+      stateChange: true,
+      arguments: { preimage: "[REDACTED]" },
+      transactionXdr: tx.toXDR("base64"),
+      transactionHash: tx.hash().toString("hex"),
+      status: "built",
+    });
+
     return tx;
   }
 
-  async buildRefundTx(params: HtlcRefundParams): Promise<StellarSdk.Transaction> {
-    const refunderAccount = await this.server.loadAccount(params.refunderAddress);
+  async buildRefundTx(
+    params: HtlcRefundParams,
+  ): Promise<StellarSdk.Transaction> {
+    const refunderAccount = await this.server.loadAccount(
+      params.refunderAddress,
+    );
 
     const contract = new StellarSdk.Contract(params.contractId);
     const tx = new StellarSdk.TransactionBuilder(refunderAccount, {
       fee: StellarSdk.BASE_FEE,
       networkPassphrase: this.networkPassphrase,
     })
-      .addOperation(
-        contract.call("refund")
-      )
+      .addOperation(contract.call("refund"))
       .setTimeout(30)
       .build();
+
+    await recordSorobanInteraction({
+      contractId: params.contractId,
+      method: "refund",
+      sourceAccount: params.refunderAddress,
+      stateChange: true,
+      arguments: {},
+      transactionXdr: tx.toXDR("base64"),
+      transactionHash: tx.hash().toString("hex"),
+      status: "built",
+    });
 
     return tx;
   }
 
   async getHtlcState(contractId: string): Promise<HtlcState> {
     const contract = new StellarSdk.Contract(contractId);
-    
+
     // Query the contract state
     // This would need proper implementation based on your contract's state structure
     // For now, returning a placeholder that matches the interface
     // In a real implementation, you would call contract.call("get_state") or similar
-    
-    throw new Error("getHtlcState not yet implemented - requires contract state query");
+
+    throw new Error(
+      "getHtlcState not yet implemented - requires contract state query",
+    );
   }
 }

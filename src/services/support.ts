@@ -128,6 +128,362 @@ interface IntercomConversationResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Ticket Template System
+// ---------------------------------------------------------------------------
+
+export type TicketTemplateType =
+  | "transaction_dispute"
+  | "unauthorized_transaction"
+  | "settlement_delay"
+  | "kyc_verification_issue"
+  | "general_inquiry"
+  | (string & {});
+
+export interface TicketTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  type: TicketTemplateType;
+  subjectTemplate: string;
+  bodyTemplate: string;
+  requiredVariables: string[];
+  tags?: string[];
+  defaultPriority?: "low" | "medium" | "high" | "critical";
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export function substituteTemplateVariables(
+  templateStr: string,
+  variables: Record<string, any>,
+): string {
+  // Supports {{variable}}, {{ variable }}, and ${variable}
+  return templateStr.replace(/(?:\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}|\$\{([a-zA-Z0-9_.]+)\})/g, (_match, p1, p2) => {
+    const key = p1 || p2;
+    const keys = key.split(".");
+    let val: any = variables;
+    for (const k of keys) {
+      if (val !== undefined && val !== null && typeof val === "object") {
+        val = val[k];
+      } else {
+        val = undefined;
+        break;
+      }
+    }
+    if (val === undefined || val === null) {
+      return variables[key] !== undefined && variables[key] !== null ? String(variables[key]) : "";
+    }
+    return String(val);
+  });
+}
+
+export function buildTemplateVariables(
+  txn: TransactionMetadata,
+  dispute: DisputeMetadata,
+): Record<string, any> {
+  return {
+    transactionId: txn.transactionId,
+    referenceNumber: txn.referenceNumber,
+    transactionType: txn.type.toUpperCase(),
+    amount: txn.amount,
+    currency: txn.currency || "XAF",
+    status: txn.status,
+    provider: txn.provider,
+    maskedPhone: maskSensitiveData(txn.phoneNumber, "phone"),
+    maskedStellarAddress: maskSensitiveData(txn.stellarAddress, "stellar"),
+    transactionCreatedAt: new Date(txn.createdAt).toISOString(),
+    userId: txn.userId || "N/A",
+    userIdLine: txn.userId ? `- User ID: ${txn.userId}` : "",
+    disputeId: dispute.disputeId,
+    disputeReason: dispute.reason,
+    priority: dispute.priority.toUpperCase(),
+    category: dispute.category || "",
+    categoryLine: dispute.category ? `- Category: ${dispute.category}` : "",
+    reportedBy: dispute.reportedBy || "Customer",
+    reportedByLine: dispute.reportedBy ? `- Reported By: ${dispute.reportedBy}` : "",
+    disputeCreatedAt: new Date(dispute.createdAt).toISOString(),
+    // Also include nested dispute and transaction objects
+    dispute: {
+      id: dispute.disputeId,
+      reason: dispute.reason,
+      priority: dispute.priority,
+      category: dispute.category,
+      reportedBy: dispute.reportedBy,
+      createdAt: dispute.createdAt,
+    },
+    transaction: {
+      id: txn.transactionId,
+      referenceNumber: txn.referenceNumber,
+      type: txn.type,
+      amount: txn.amount,
+      currency: txn.currency,
+      provider: txn.provider,
+      status: txn.status,
+    },
+  };
+}
+
+export const DEFAULT_TICKET_TEMPLATES: TicketTemplate[] = [
+  {
+    id: "transaction_dispute",
+    name: "Standard Transaction Dispute",
+    description: "Template for general transaction disputes filed by users",
+    type: "transaction_dispute",
+    subjectTemplate: "[DISPUTE] Transaction {{referenceNumber}} - {{disputeReason}}",
+    bodyTemplate: `
+**Dispute Details**
+- Dispute ID: {{disputeId}}
+- Reason: {{disputeReason}}
+- Priority: {{priority}}
+{{categoryLine}}
+{{reportedByLine}}
+- Created: {{disputeCreatedAt}}
+
+---
+
+**Transaction Details**
+- Reference: {{referenceNumber}}
+- Type: {{transactionType}}
+- Amount: {{amount}} {{currency}}
+- Status: {{status}}
+- Provider: {{provider}}
+- Phone: {{maskedPhone}}
+- Stellar Address: {{maskedStellarAddress}}
+- Created: {{transactionCreatedAt}}
+{{userIdLine}}
+
+---
+
+**Internal Reference**
+- Transaction ID: {{transactionId}}
+- Dispute ID: {{disputeId}}
+`.trim(),
+    requiredVariables: ["referenceNumber", "disputeReason", "disputeId"],
+    tags: ["dispute", "transaction"],
+    defaultPriority: "medium",
+  },
+  {
+    id: "unauthorized_transaction",
+    name: "Unauthorized Transaction / Fraud Alert",
+    description: "High priority template for suspected fraudulent or unauthorized transactions",
+    type: "unauthorized_transaction",
+    subjectTemplate: "[FRAUD ALERT] Unauthorized Transaction {{referenceNumber}}",
+    bodyTemplate: `
+**URGENT: Unauthorized Transaction Reported**
+- Dispute ID: {{disputeId}}
+- Reason: {{disputeReason}}
+- Priority: CRITICAL
+- Reporter: {{reportedBy}}
+- Reported At: {{disputeCreatedAt}}
+
+---
+
+**Affected Transaction Details**
+- Reference Number: {{referenceNumber}}
+- Amount: {{amount}} {{currency}}
+- Transaction Type: {{transactionType}}
+- Status: {{status}}
+- Originating Provider: {{provider}}
+- Customer Phone: {{maskedPhone}}
+- Stellar Address: {{maskedStellarAddress}}
+- Timestamp: {{transactionCreatedAt}}
+
+---
+
+**Recommended Actions**
+1. Immediately place hold on linked account if pending
+2. Trace transaction on provider portal ({{provider}})
+3. Verify customer identity and device session
+`.trim(),
+    requiredVariables: ["referenceNumber", "disputeId", "amount"],
+    tags: ["fraud", "unauthorized", "urgent"],
+    defaultPriority: "critical",
+  },
+  {
+    id: "settlement_delay",
+    name: "Settlement / Payout Delay",
+    description: "Template for merchant or user payout delays beyond SLA",
+    type: "settlement_delay",
+    subjectTemplate: "[SETTLEMENT DELAY] Delayed Settlement for Transaction {{referenceNumber}}",
+    bodyTemplate: `
+**Settlement Delay Notice**
+- Reference Number: {{referenceNumber}}
+- Provider: {{provider}}
+- Amount: {{amount}} {{currency}}
+- Current Status: {{status}}
+- Dispute Reason: {{disputeReason}}
+
+---
+
+**Transaction Context**
+- Transaction ID: {{transactionId}}
+- Stellar Address: {{maskedStellarAddress}}
+- Initiation Date: {{transactionCreatedAt}}
+- Expected Settlement: SLA Exceeded
+
+---
+
+**Action Required**
+Check liquidity provider and webhook settlement queue for reconciliation.
+`.trim(),
+    requiredVariables: ["referenceNumber", "provider"],
+    tags: ["settlement", "payout", "sla"],
+    defaultPriority: "high",
+  },
+  {
+    id: "kyc_verification_issue",
+    name: "KYC Verification Issue",
+    description: "Template for tier upgrade or identity verification inquiries",
+    type: "kyc_verification_issue",
+    subjectTemplate: "[KYC ISSUE] Customer Verification Problem - User {{userId}}",
+    bodyTemplate: `
+**KYC / Compliance Ticket**
+- User ID: {{userId}}
+- Issue Type: Identity Verification Delay / Failure
+- Associated Reference: {{referenceNumber}}
+- Dispute / Inquiry: {{disputeReason}}
+
+---
+
+**Compliance Summary**
+- User Phone: {{maskedPhone}}
+- Registered Address / Stellar: {{maskedStellarAddress}}
+- Date Reported: {{disputeCreatedAt}}
+`.trim(),
+    requiredVariables: ["userId"],
+    tags: ["kyc", "compliance"],
+    defaultPriority: "medium",
+  },
+  {
+    id: "general_inquiry",
+    name: "General Support Inquiry",
+    description: "General support question regarding a transaction",
+    type: "general_inquiry",
+    subjectTemplate: "[SUPPORT] Inquiry regarding Transaction {{referenceNumber}}",
+    bodyTemplate: `
+**Customer Support Inquiry**
+- Reference: {{referenceNumber}}
+- Subject: {{disputeReason}}
+- Customer Contact: {{reportedBy}}
+
+---
+
+**Transaction Summary**
+- Amount: {{amount}} {{currency}}
+- Provider: {{provider}}
+- Status: {{status}}
+- Date: {{transactionCreatedAt}}
+`.trim(),
+    requiredVariables: ["referenceNumber"],
+    tags: ["support", "general"],
+    defaultPriority: "low",
+  },
+];
+
+export class TicketTemplateLibrary {
+  private templates: Map<string, TicketTemplate> = new Map();
+
+  constructor() {
+    this.resetDefaults();
+  }
+
+  resetDefaults(): void {
+    this.templates.clear();
+    const now = new Date();
+    for (const t of DEFAULT_TICKET_TEMPLATES) {
+      this.templates.set(t.id, {
+        ...t,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  }
+
+  getTemplate(idOrType: string): TicketTemplate | undefined {
+    if (this.templates.has(idOrType)) {
+      return this.templates.get(idOrType);
+    }
+    for (const template of this.templates.values()) {
+      if (template.type === idOrType) {
+        return template;
+      }
+    }
+    return undefined;
+  }
+
+  hasTemplate(idOrType: string): boolean {
+    return this.getTemplate(idOrType) !== undefined;
+  }
+
+  registerTemplate(template: TicketTemplate): void {
+    const now = new Date();
+    this.templates.set(template.id, {
+      ...template,
+      createdAt: template.createdAt || now,
+      updatedAt: now,
+    });
+  }
+
+  updateTemplate(id: string, updates: Partial<Omit<TicketTemplate, "id">>): TicketTemplate {
+    const existing = this.templates.get(id);
+    if (!existing) {
+      throw new Error(`Template '${id}' not found`);
+    }
+    const updated: TicketTemplate = {
+      ...existing,
+      ...updates,
+      updatedAt: new Date(),
+    };
+    this.templates.set(id, updated);
+    return updated;
+  }
+
+  deleteTemplate(id: string): boolean {
+    return this.templates.delete(id);
+  }
+
+  listTemplates(filter?: { type?: string; tag?: string }): TicketTemplate[] {
+    let list = Array.from(this.templates.values());
+    if (filter?.type) {
+      list = list.filter((t) => t.type === filter.type);
+    }
+    if (filter?.tag) {
+      list = list.filter((t) => t.tags?.includes(filter.tag!));
+    }
+    return list;
+  }
+
+  render(
+    templateIdOrType: string,
+    variables: Record<string, any>,
+  ): { subject: string; body: string } {
+    const template = this.getTemplate(templateIdOrType);
+    if (!template) {
+      throw new Error(`Template '${templateIdOrType}' not found in template library`);
+    }
+
+    // Check for missing required variables
+    const missing = template.requiredVariables.filter((key) => {
+      const val = variables[key];
+      return val === undefined || val === null || val === "";
+    });
+
+    if (missing.length > 0) {
+      console.warn(
+        `[TicketTemplateLibrary] Template '${template.id}' rendered with missing variables: ${missing.join(", ")}`,
+      );
+    }
+
+    return {
+      subject: substituteTemplateVariables(template.subjectTemplate, variables),
+      body: substituteTemplateVariables(template.bodyTemplate, variables),
+    };
+  }
+}
+
+export const ticketTemplateLibrary = new TicketTemplateLibrary();
+
+// ---------------------------------------------------------------------------
 // Utility Functions
 // ---------------------------------------------------------------------------
 
@@ -226,6 +582,8 @@ async function createZendeskTicket(
   transaction: TransactionMetadata,
   dispute: DisputeMetadata,
   requesterEmail?: string,
+  templateIdOrType?: string,
+  customVariables?: Record<string, any>,
 ): Promise<CreateTicketResult> {
   const { zendesk, timeout, retryAttempts, retryDelayMs } = config;
 
@@ -237,7 +595,19 @@ async function createZendeskTicket(
     };
   }
 
-  const ticketBody = `
+  let ticketBody: string;
+  let subject: string;
+
+  if (templateIdOrType && ticketTemplateLibrary.hasTemplate(templateIdOrType)) {
+    const vars = {
+      ...buildTemplateVariables(transaction, dispute),
+      ...(customVariables || {}),
+    };
+    const rendered = ticketTemplateLibrary.render(templateIdOrType, vars);
+    subject = rendered.subject;
+    ticketBody = rendered.body;
+  } else {
+    ticketBody = `
 ${formatDisputeDetails(dispute)}
 
 ---
@@ -250,10 +620,12 @@ ${formatTransactionDetails(transaction)}
 - Transaction ID: ${transaction.transactionId}
 - Dispute ID: ${dispute.disputeId}
 `.trim();
+    subject = `[DISPUTE] Transaction ${transaction.referenceNumber} - ${dispute.reason.slice(0, 50)}`;
+  }
 
   const ticketData = {
     ticket: {
-      subject: `[DISPUTE] Transaction ${transaction.referenceNumber} - ${dispute.reason.slice(0, 50)}`,
+      subject,
       comment: {
         body: ticketBody,
         public: false,
@@ -344,6 +716,8 @@ async function createIntercomConversation(
   transaction: TransactionMetadata,
   dispute: DisputeMetadata,
   userExternalId?: string,
+  templateIdOrType?: string,
+  customVariables?: Record<string, any>,
 ): Promise<CreateTicketResult> {
   const { intercom, timeout, retryAttempts, retryDelayMs } = config;
 
@@ -355,7 +729,19 @@ async function createIntercomConversation(
     };
   }
 
-  const messageBody = `
+  let messageBody: string;
+  let subject: string;
+
+  if (templateIdOrType && ticketTemplateLibrary.hasTemplate(templateIdOrType)) {
+    const vars = {
+      ...buildTemplateVariables(transaction, dispute),
+      ...(customVariables || {}),
+    };
+    const rendered = ticketTemplateLibrary.render(templateIdOrType, vars);
+    subject = rendered.subject;
+    messageBody = rendered.body;
+  } else {
+    messageBody = `
 New Dispute Created
 
 ${formatDisputeDetails(dispute)}
@@ -374,6 +760,8 @@ ${formatTransactionDetails(transaction)}
 _Dispute ID: ${dispute.disputeId}_
 _Transaction ID: ${transaction.transactionId}_
 `.trim();
+    subject = `[DISPUTE] ${transaction.referenceNumber}`;
+  }
 
   const conversationData = userExternalId
     ? {
@@ -394,7 +782,7 @@ _Transaction ID: ${transaction.transactionId}_
       },
       message_type: "inapp",
       body: messageBody,
-      subject: `[DISPUTE] ${transaction.referenceNumber}`,
+      subject,
     };
 
   const url = "https://api.intercom.io/conversations";
@@ -469,6 +857,8 @@ export class SupportService {
     transaction: Transaction,
     requesterEmail?: string,
     userExternalId?: string,
+    templateIdOrType?: string,
+    customVariables?: Record<string, any>,
   ): Promise<{
     results: CreateTicketResult[];
     primaryTicketId?: string;
@@ -506,6 +896,8 @@ export class SupportService {
           transactionMeta,
           disputeMeta,
           requesterEmail,
+          templateIdOrType,
+          customVariables,
         );
         results.push(result);
         if (result.success && result.ticket) {
@@ -520,6 +912,8 @@ export class SupportService {
           transactionMeta,
           disputeMeta,
           userExternalId,
+          templateIdOrType,
+          customVariables,
         );
         results.push(result);
         if (result.success && result.ticket) {
@@ -530,8 +924,22 @@ export class SupportService {
 
       case "both": {
         const [zendeskResult, intercomResult] = await Promise.allSettled([
-          createZendeskTicket(this.config, transactionMeta, disputeMeta, requesterEmail),
-          createIntercomConversation(this.config, transactionMeta, disputeMeta, userExternalId),
+          createZendeskTicket(
+            this.config,
+            transactionMeta,
+            disputeMeta,
+            requesterEmail,
+            templateIdOrType,
+            customVariables,
+          ),
+          createIntercomConversation(
+            this.config,
+            transactionMeta,
+            disputeMeta,
+            userExternalId,
+            templateIdOrType,
+            customVariables,
+          ),
         ]);
 
         if (zendeskResult.status === "fulfilled") {
@@ -714,6 +1122,17 @@ export class SupportService {
         configured: !!intercom.accessToken,
       },
     };
+  }
+
+  getTemplateLibrary(): TicketTemplateLibrary {
+    return ticketTemplateLibrary;
+  }
+
+  renderTemplate(
+    templateIdOrType: string,
+    variables: Record<string, any>,
+  ): { subject: string; body: string } {
+    return ticketTemplateLibrary.render(templateIdOrType, variables);
   }
 }
 

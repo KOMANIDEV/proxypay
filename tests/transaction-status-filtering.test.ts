@@ -10,6 +10,7 @@ import {
   getPaginationInfo,
 } from "../src/utils/transactionFilters";
 import { listTransactionsHandler } from "../src/controllers/transactionController";
+import { errorHandler } from "../src/middleware/errorHandler";
 import { TransactionModel } from "../src/models/transaction";
 import { TimeoutPresets, haltOnTimedout } from "../src/middleware/timeout";
 
@@ -42,7 +43,7 @@ describe("Transaction Status Filtering - Utility Functions", () => {
 
     it("should return empty array for empty string", () => {
       const result = parseStatusFilter("");
-      expect(result).toEqual(VALID_STATUSES);
+      expect(result).toEqual([]);
     });
 
     it("should filter out empty values", () => {
@@ -340,8 +341,11 @@ describe("Transaction Status Filtering - Handler Integration", () => {
   const mockTransactionModel = TransactionModel as jest.MockedClass<
     typeof TransactionModel
   >;
-  const controllerTransactionModel = mockTransactionModel.mock
-    .instances[0] as jest.Mocked<TransactionModel>;
+  // The controller module constructs its own instance at import time; it is
+  // the last TransactionModel instantiated during the import graph.
+  const controllerTransactionModel = mockTransactionModel.mock.instances[
+    mockTransactionModel.mock.instances.length - 1
+  ] as jest.Mocked<TransactionModel>;
 
   beforeEach(() => {
     app = express();
@@ -471,8 +475,12 @@ describe("Transaction Status Filtering - Handler Integration", () => {
       controllerTransactionModel.countByStatuses.mockResolvedValue(1);
 
       const router = Router();
-      router.get("/", validateTransactionFilters, listTransactionsHandler);
+      // Forward async rejections to Express the same way the app bootstrap does.
+      router.get("/", validateTransactionFilters, (req, res, next) => {
+        Promise.resolve(listTransactionsHandler(req, res)).catch(next);
+      });
       app.use(router);
+      app.use(errorHandler);
 
       const res = await request(app).get("/?status=pending").expect(500);
 

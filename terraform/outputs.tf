@@ -26,6 +26,22 @@ output "db_connection_url" {
   sensitive   = true
 }
 
+output "dr_db_endpoint" {
+  description = "Cross-region replica endpoint (host:port); empty when cross-region replication is disabled"
+  value       = module.database.dr_db_endpoint
+}
+
+output "dr_db_arn" {
+  description = "ARN of the cross-region replica (promotion target during failover)"
+  value       = module.database.dr_db_arn
+}
+
+output "dr_db_connection_url" {
+  description = "PostgreSQL connection URL for the cross-region replica (sensitive)"
+  value       = module.database.dr_db_connection_url
+  sensitive   = true
+}
+
 # ── Redis ──────────────────────────────────────────────────────────────────
 output "redis_endpoint" {
   description = "ElastiCache Redis primary endpoint"

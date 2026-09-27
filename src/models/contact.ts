@@ -54,16 +54,33 @@ export class ContactModel {
     return mapRow(result.rows[0]);
   }
 
-  async listByUser(userId: string): Promise<UserContact[]> {
-    const result = await queryRead(
-      `SELECT id, user_id, destination_type, destination_value, nickname, created_at, updated_at
-       FROM user_contacts
-       WHERE user_id = $1
-       ORDER BY created_at DESC`,
-      [userId],
-    );
+  async listByUser(userId: string, options?: { limit?: number; cursor?: string; search?: string }): Promise<{ contacts: UserContact[]; nextCursor?: string }> {
+    const limit = options?.limit ?? 50;
+    const cursor = options?.cursor;
+    const search = options?.search?.trim();
 
-    return result.rows.map(mapRow);
+    let query = `SELECT id, user_id, destination_type, destination_value, nickname, created_at, updated_at
+        FROM user_contacts
+        WHERE user_id = $1`;
+    const params: unknown[] = [userId];
+
+    if (search) {
+      query += ` AND (nickname ILIKE $${params.length + 1} OR destination_value ILIKE $${params.length + 2})`;
+      params.push(`%${search}%`, `%${search}%`);
+    }
+
+    if (cursor) {
+      query += ` AND created_at <= (SELECT created_at FROM user_contacts WHERE id = $${params.length + 1} AND user_id = $1)`;
+      params.push(cursor);
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+    params.push(limit);
+
+    const result = await queryRead(query, params);
+    const contacts = result.rows.map(mapRow);
+    const nextCursor = contacts.length === limit ? contacts[contacts.length - 1]?.id : undefined;
+    return { contacts, nextCursor };
   }
 
   async findByIdForUser(

@@ -28,7 +28,9 @@ import {
   resetSettings,
   SETTINGS_OPTIONS,
   PartialUserSettings,
+  onSettingsChanged,
 } from "../utils/settingsPanel";
+import { createPreferenceChangeHandler } from "../services/preferenceChangeService";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 
@@ -36,6 +38,10 @@ const router = Router();
 
 // All settings routes require authentication.
 router.use(requireAuth);
+
+// Every settings mutation is appended to the preference change audit trail
+// and enqueues a `preference.changed` webhook notification.
+onSettingsChanged(createPreferenceChangeHandler());
 
 // ---------------------------------------------------------------------------
 // GET /api/settings
@@ -63,13 +69,34 @@ router.patch("/", (req: Request, res: Response): void => {
     });
   }
 
-  const patch = req.body as PartialUserSettings;
-  const result = updateSettings(userId, patch);
+  const { expectedVersion, ...patchFields } =
+    req.body as PartialUserSettings & {
+      expectedVersion?: number;
+    };
+  const patch = patchFields as PartialUserSettings;
+  const result = updateSettings(userId, patch, {
+    expectedVersion:
+      typeof expectedVersion === "number" ? expectedVersion : undefined,
+    source: "api",
+    actorId: userId,
+  });
 
   if ("errors" in result) {
     throw createError(ERROR_CODES.UNPROCESSABLE_CONTENT, "Validation failed", {
       details: result.errors,
     });
+  }
+
+  if ("conflict" in result) {
+    throw createError(
+      ERROR_CODES.CONFLICT,
+      "Settings were modified by another session",
+      {
+        current: result.current,
+        expectedVersion: result.expectedVersion,
+        message: `Re-fetch settings (now at version ${result.current.version}) and retry with the latest version`,
+      },
+    );
   }
 
   res.json({ settings: result.settings });
@@ -86,7 +113,7 @@ router.delete("/", (req: Request, res: Response): void => {
     });
   }
 
-  const settings = resetSettings(userId);
+  const settings = resetSettings(userId, { source: "api", actorId: userId });
   res.json({ settings });
 });
 

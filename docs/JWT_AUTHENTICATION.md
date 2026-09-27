@@ -12,9 +12,12 @@ Add the following to your `.env` file:
 
 ```env
 JWT_SECRET=your_super_secret_jwt_key_change_this_in_production
+JWT_MAX_CONCURRENT_SESSIONS=5
 ```
 
 **Important**: Use a strong, unique secret key in production environments.
+`JWT_MAX_CONCURRENT_SESSIONS` limits active access-token sessions per user. When
+the limit is exceeded, the oldest session is revoked.
 
 ## Token Generation
 
@@ -23,19 +26,20 @@ JWT_SECRET=your_super_secret_jwt_key_change_this_in_production
 Creates a JWT token with user information.
 
 ```typescript
-import { generateToken } from '../auth/jwt';
+import { generateToken } from "../auth/jwt";
 
 const token = generateToken({
   userId: "123",
-  email: "user@example.com"
+  email: "user@example.com",
 });
 ```
 
 **Payload Structure:**
+
 ```typescript
 {
-  userId: string;    // User's unique identifier
-  email: string;     // User's email address
+  userId: string; // User's unique identifier
+  email: string; // User's email address
 }
 ```
 
@@ -48,24 +52,25 @@ const token = generateToken({
 Validates a JWT token and returns the decoded payload.
 
 ```typescript
-import { verifyToken } from '../auth/jwt';
+import { verifyToken } from "../auth/jwt";
 
 try {
   const payload = verifyToken(token);
-  console.log('User ID:', payload.userId);
-  console.log('Email:', payload.email);
+  console.log("User ID:", payload.userId);
+  console.log("Email:", payload.email);
 } catch (error) {
-  console.error('Invalid token:', error.message);
+  console.error("Invalid token:", error.message);
 }
 ```
 
 **Returned Payload:**
+
 ```typescript
 {
   userId: string;
   email: string;
-  iat: number;  // Issued at timestamp
-  exp: number;  // Expiration timestamp
+  iat: number; // Issued at timestamp
+  exp: number; // Expiration timestamp
 }
 ```
 
@@ -76,18 +81,28 @@ try {
 Protects routes by requiring a valid JWT token in the `Authorization` header.
 
 **Usage:**
-```typescript
-import { authenticateToken } from '../middleware/auth';
 
-router.post('/protected-route', authenticateToken, handler);
+```typescript
+import { authenticateToken } from "../middleware/auth";
+
+router.post("/protected-route", authenticateToken, handler);
 ```
 
 **Header Format:**
+
 ```
 Authorization: Bearer <jwt_token>
+X-Device-ID: <stable-client-device-id>
 ```
 
+Login tokens are bound to the device ID and user-agent. The device ID header is
+optional, but clients should provide a stable, non-sensitive identifier so a
+stolen token cannot be replayed from another device. Authenticated requests are
+checked against the Redis session record, including password-change invalidation
+and concurrent-session limits.
+
 **Error Responses:**
+
 - `401` - No token provided
 - `401` - Token expired
 - `401` - Invalid token
@@ -98,10 +113,11 @@ Authorization: Bearer <jwt_token>
 Attaches user information if a valid token is present, but doesn't block requests without tokens.
 
 **Usage:**
-```typescript
-import { optionalAuthentication } from '../middleware/auth';
 
-router.get('/public-route', optionalAuthentication, handler);
+```typescript
+import { optionalAuthentication } from "../middleware/auth";
+
+router.get("/public-route", optionalAuthentication, handler);
 ```
 
 ## Protected Routes
@@ -109,6 +125,7 @@ router.get('/public-route', optionalAuthentication, handler);
 The following endpoints require JWT authentication:
 
 ### Transaction Routes
+
 - `POST /api/transactions/deposit`
 - `POST /api/transactions/withdraw`
 - `GET /api/transactions/:id`
@@ -116,12 +133,14 @@ The following endpoints require JWT authentication:
 - `GET /api/transactions/search`
 
 ### Bulk Transaction Routes
+
 - `POST /api/transactions/bulk`
 - `GET /api/transactions/bulk/:jobId`
 
 ## Error Handling
 
 ### Token Expired
+
 ```json
 {
   "error": "Token expired",
@@ -130,6 +149,7 @@ The following endpoints require JWT authentication:
 ```
 
 ### Invalid Token
+
 ```json
 {
   "error": "Invalid token",
@@ -138,6 +158,7 @@ The following endpoints require JWT authentication:
 ```
 
 ### No Token
+
 ```json
 {
   "error": "Access denied",
@@ -151,7 +172,8 @@ The following endpoints require JWT authentication:
 2. **Short Expiration**: Tokens expire after 1 hour for security
 3. **Secret Rotation**: Regularly rotate your JWT_SECRET in production
 4. **Token Storage**: Store tokens securely on the client side (httpOnly cookies recommended)
-5. **Revocation**: Implement token revocation if needed for immediate logout
+5. **Revocation**: Redis-backed session records support password-change and
+   concurrent-session revocation
 
 ## Example Usage
 
@@ -160,26 +182,26 @@ The following endpoints require JWT authentication:
 ```javascript
 // Login and store token
 async function login(email, password) {
-  const response = await fetch('/api/auth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password })
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
   });
-  
+
   const { token } = await response.json();
-  localStorage.setItem('jwt_token', token);
+  localStorage.setItem("jwt_token", token);
 }
 
 // Make authenticated request
 async function getTransaction(id) {
-  const token = localStorage.getItem('jwt_token');
-  
+  const token = localStorage.getItem("jwt_token");
+
   const response = await fetch(`/api/transactions/${id}`, {
     headers: {
-      'Authorization': `Bearer ${token}`
-    }
+      Authorization: `Bearer ${token}`,
+    },
   });
-  
+
   return response.json();
 }
 ```
@@ -187,16 +209,16 @@ async function getTransaction(id) {
 ### Server-Side Handler Example
 
 ```typescript
-import { Request, Response } from 'express';
+import { Request, Response } from "express";
 
 export async function getUserTransactions(req: Request, res: Response) {
   // User information is available via req.jwtUser (set by middleware)
   const userId = req.jwtUser?.userId;
-  
+
   if (!userId) {
-    return res.status(401).json({ error: 'User not authenticated' });
+    return res.status(401).json({ error: "User not authenticated" });
   }
-  
+
   // Fetch user transactions
   const transactions = await getTransactionsByUserId(userId);
   res.json(transactions);
@@ -239,4 +261,3 @@ console.log(token);
 ## Migration Notes
 
 This JWT implementation replaces the previous admin API key authentication for protected routes. The existing `requireAuth` middleware (using X-API-Key) is still available for admin endpoints.
-

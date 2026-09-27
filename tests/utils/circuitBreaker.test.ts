@@ -12,8 +12,11 @@ jest.mock("../../src/services/mobilemoney/providers/healthCheck", () => ({
 }));
 
 import {
+  classifyCircuitBreakerFailure,
   executeWithCircuitBreaker,
   getCircuitBreakerCount,
+  getCircuitBreakerState,
+  resetCircuitBreaker,
   resetCircuitBreakers,
   checkAndResetCircuitBreaker,
 } from "../../src/utils/circuitBreaker";
@@ -115,6 +118,40 @@ describe("executeWithCircuitBreaker", () => {
     resetCircuitBreakers();
 
     expect(getCircuitBreakerCount()).toBe(0);
+  });
+
+  it("does not count business failures against the circuit", async () => {
+    const result = await executeWithCircuitBreaker({
+      provider: "gateway",
+      operation: "charge",
+      execute: async () => ({
+        success: false,
+        failureType: "business",
+        error: new Error("insufficient funds"),
+      }),
+    });
+
+    expect(result.success).toBe(false);
+    expect(getCircuitBreakerState("gateway", "charge")).toBe("closed");
+  });
+
+  it("classifies failures and supports integration-specific health checks", async () => {
+    expect(classifyCircuitBreakerFailure({ statusCode: 503 })).toBe("server");
+    expect(classifyCircuitBreakerFailure(new Error("ETIMEDOUT"))).toBe("timeout");
+
+    await expect(
+      executeWithCircuitBreaker({
+        provider: "compliance",
+        operation: "screen",
+        execute: async () => ({ success: false, error: new Error("service-down") }),
+      }),
+    ).rejects.toThrow("service-down");
+
+    const healthCheck = jest.fn().mockResolvedValue(true);
+    expect(await checkAndResetCircuitBreaker("compliance", "screen", healthCheck)).toBe(true);
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+    expect(resetCircuitBreaker("compliance", "screen")).toBe(true);
+    expect(getCircuitBreakerState("compliance", "screen")).toBe("not_found");
   });
 
   describe("checkAndResetCircuitBreaker", () => {

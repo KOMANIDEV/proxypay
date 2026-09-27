@@ -8,6 +8,7 @@ import {
 } from "./accountMergeQueue";
 import { getNetworkPassphrase, getStellarServer } from "../config/stellar";
 import { capturePersistentFailure } from "./dlq";
+import { instrumentWorker } from "./queueMetricsService";
 
 const ACCOUNT_MERGE_PREFIX = "[account-merge]";
 const STROOPS_PER_XLM = 10_000_000n;
@@ -286,6 +287,8 @@ export const accountMergeWorker = new Worker<
   },
   workerOptions,
 );
+
+instrumentWorker(ACCOUNT_MERGE_QUEUE_NAME, accountMergeWorker);
 
 accountMergeWorker.on("completed", (job) => {
   const result = job.returnvalue;

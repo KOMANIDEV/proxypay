@@ -19,6 +19,9 @@ import {
   feeStrategyEngine,
   CreateFeeStrategyRequest,
   UpdateFeeStrategyRequest,
+  getCacheStats,
+  resetCacheStats,
+  cacheInvalidateAll,
 } from "../services/feeStrategyEngine";
 import { authenticateToken } from "../middleware/auth";
 import { requirePermission } from "../middleware/rbac";
@@ -527,6 +530,77 @@ router.get(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch audit history",
       );
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache management endpoints (admin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/fee-strategies/cache/stats
+ *
+ * Return cache hit/miss ratios, TTL, and current version for monitoring.
+ */
+router.get(
+  "/cache/stats",
+  authenticateToken,
+  requirePermission("admin:system"),
+  async (_req: Request, res: Response) => {
+    try {
+      const stats = getCacheStats();
+      res.json({ success: true, data: stats });
+    } catch (error: any) {
+      console.error("[FeeStrategies] cache stats error:", error);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch cache stats");
+    }
+  },
+);
+
+/**
+ * POST /api/fee-strategies/cache/invalidate
+ *
+ * Manually invalidate all cached fee strategies and publish the event
+ * across all running instances via Redis Pub/Sub.
+ */
+router.post(
+  "/cache/invalidate",
+  authenticateToken,
+  requirePermission("admin:system"),
+  logAction("CACHE_INVALIDATE"),
+  async (req: Request, res: Response) => {
+    try {
+      await cacheInvalidateAll();
+      res.json({
+        success: true,
+        message: "Fee strategy cache invalidated. All instances will re-fetch on next request.",
+        cacheStats: getCacheStats(),
+      });
+    } catch (error: any) {
+      console.error("[FeeStrategies] cache invalidation error:", error);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to invalidate cache");
+    }
+  },
+);
+
+/**
+ * POST /api/fee-strategies/cache/reset-stats
+ *
+ * Reset the hit/miss counters (useful before a monitoring window starts).
+ */
+router.post(
+  "/cache/reset-stats",
+  authenticateToken,
+  requirePermission("admin:system"),
+  logAction("CACHE_RESET_STATS"),
+  async (_req: Request, res: Response) => {
+    try {
+      resetCacheStats();
+      res.json({ success: true, message: "Cache stats counters reset." });
+    } catch (error: any) {
+      console.error("[FeeStrategies] cache reset stats error:", error);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to reset cache stats");
     }
   },
 );

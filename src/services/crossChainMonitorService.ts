@@ -16,6 +16,30 @@ export interface ChainAssetSnapshot {
   capturedAt: Date;
 }
 
+export type ChainHealthStatus = "healthy" | "degraded" | "unhealthy";
+
+export interface ChainHealthReport {
+  chain: string;
+  status: ChainHealthStatus;
+  lastSnapshotAt: Date | null;
+  balanceCount: number;
+  totalBalanceValue: number;
+  anomaliesDetected: number;
+  previousDropPercentage: number | null;
+}
+
+export interface SystemHealthSummary {
+  overallStatus: ChainHealthStatus;
+  chains: ChainHealthReport[];
+  totalChains: number;
+  healthyChains: number;
+  degradedChains: number;
+  unhealthyChains: number;
+  lastSnapshotAt: Date | null;
+  snapshotAge: number | null;
+  alertsActive: number;
+}
+
 /**
  * Fetches the operational balance from a mobile money provider
  * @param provider - The mobile money provider (MTN, Airtel, Orange)
@@ -79,6 +103,8 @@ function getDropThreshold(): number {
 export class CrossChainMonitorService {
   private static instance: CrossChainMonitorService;
   private lastSnapshot: ChainAssetSnapshot[] = [];
+  private anomalyCounts: Map<string, number> = new Map();
+  private lastSnapshotAt: Date | null = null;
 
   static getInstance(): CrossChainMonitorService {
     if (!CrossChainMonitorService.instance) {
@@ -90,6 +116,7 @@ export class CrossChainMonitorService {
   async snapshot(): Promise<ChainAssetSnapshot[]> {
     const capturedAt = new Date();
     const results: ChainAssetSnapshot[] = [];
+    const currentAnomalies: Map<string, number> = new Map();
 
     // --- Stellar balances ---
     const server = getStellarServer();
@@ -170,6 +197,8 @@ export class CrossChainMonitorService {
               asset: snap.asset,
               reason,
             });
+            const key = `${snap.chain}:${snap.asset}`;
+            currentAnomalies.set(key, (currentAnomalies.get(key) || 0) + 1);
             logger.warn(
               {
                 chain: snap.chain,
@@ -188,11 +217,109 @@ export class CrossChainMonitorService {
       }
     }
 
+    this.anomalyCounts = currentAnomalies;
+    this.lastSnapshotAt = capturedAt;
     this.lastSnapshot = results;
     return results;
   }
 
   getLastSnapshot(): ChainAssetSnapshot[] {
     return this.lastSnapshot;
+  }
+
+  /**
+   * Get system-wide health summary across all chains.
+   * Aggregates balance data, anomalies, and snapshot freshness into a unified view.
+   */
+  getSystemHealthSummary(): SystemHealthSummary {
+    const chains = new Map<string, ChainHealthReport>();
+    const now = new Date();
+
+    for (const snap of this.lastSnapshot) {
+      if (!chains.has(snap.chain)) {
+        chains.set(snap.chain, {
+          chain: snap.chain,
+          status: "healthy",
+          lastSnapshotAt: snap.capturedAt,
+          balanceCount: 0,
+          totalBalanceValue: 0,
+          anomaliesDetected: 0,
+          previousDropPercentage: null,
+        });
+      }
+
+      const report = chains.get(snap.chain)!;
+      report.balanceCount++;
+      report.totalBalanceValue += parseFloat(snap.balance);
+
+      const anomalyKey = `${snap.chain}:${snap.asset}`;
+      const anomalies = this.anomalyCounts.get(anomalyKey) || 0;
+      report.anomaliesDetected += anomalies;
+    }
+
+    // Calculate snapshot age
+    const snapshotAge = this.lastSnapshotAt
+      ? now.getTime() - this.lastSnapshotAt.getTime()
+      : null;
+
+    // Determine chain health status based on anomalies and staleness
+    const STALENESS_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+    for (const report of chains.values()) {
+      if (report.anomaliesDetected > 3) {
+        report.status = "unhealthy";
+      } else if (report.anomaliesDetected > 0) {
+        report.status = "degraded";
+      }
+
+      if (snapshotAge !== null && snapshotAge > STALENESS_THRESHOLD_MS) {
+        report.status = "unhealthy";
+      }
+    }
+
+    // Calculate overall system status
+    let healthyChains = 0;
+    let degradedChains = 0;
+    let unhealthyChains = 0;
+
+    for (const report of chains.values()) {
+      switch (report.status) {
+        case "healthy":
+          healthyChains++;
+          break;
+        case "degraded":
+          degradedChains++;
+          break;
+        case "unhealthy":
+          unhealthyChains++;
+          break;
+      }
+    }
+
+    let overallStatus: ChainHealthStatus = "healthy";
+    if (unhealthyChains > 0) {
+      overallStatus = "unhealthy";
+    } else if (degradedChains > 0) {
+      overallStatus = "degraded";
+    }
+
+    return {
+      overallStatus,
+      chains: Array.from(chains.values()),
+      totalChains: chains.size,
+      healthyChains,
+      degradedChains,
+      unhealthyChains,
+      lastSnapshotAt: this.lastSnapshotAt,
+      snapshotAge,
+      alertsActive: unhealthyChains + degradedChains,
+    };
+  }
+
+  /**
+   * Get health report for a specific chain.
+   */
+  getChainHealth(chain: string): ChainHealthReport | null {
+    const summary = this.getSystemHealthSummary();
+    return summary.chains.find(c => c.chain === chain) ?? null;
   }
 }

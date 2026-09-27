@@ -31,6 +31,29 @@ export default {
 
     const requestUrl = new URL(request.url);
 
+    // Handle CORS preflight at the edge: short-circuiting avoids the active
+    // health check and origin round-trip, and Access-Control-Max-Age lets
+    // browsers cache the result so they skip the preflight on later requests.
+    if (request.method === "OPTIONS" && request.headers.has("Access-Control-Request-Method")) {
+      const allowMethods =
+        request.headers.get("Access-Control-Request-Method") ||
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+      const allowHeaders =
+        request.headers.get("Access-Control-Request-Headers") ||
+        "Content-Type, Authorization";
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": allowMethods,
+          "Access-Control-Allow-Headers": allowHeaders,
+          "Access-Control-Max-Age": "86400",
+          // Vary prevents shared caches from serving one preflight for every origin.
+          Vary: "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        },
+      });
+    }
+
     // Default to primary
     let targetOrigin = primary;
 

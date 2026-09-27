@@ -103,6 +103,11 @@ export interface ReportFilter {
   assignedTo?: string;
 }
 
+export interface AgentWorkload {
+  agentName: string;
+  activeDisputeCount: number;
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -584,5 +589,163 @@ export class DisputeModel {
     );
 
     return result.rows;
+  }
+
+  // ---------------------------------------------------------------------------
+  // #413 Evidence Organisation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Update the category field on a single evidence item.
+   * Returns null if the evidence item does not belong to the dispute.
+   */
+  async updateEvidenceCategory(
+    evidenceId: string,
+    disputeId: string,
+    category: string,
+  ): Promise<DisputeEvidence | null> {
+    const result = await queryWrite<DisputeEvidence>(
+      `UPDATE dispute_evidence
+          SET category   = $3,
+              updated_at = NOW()
+        WHERE id         = $1
+          AND dispute_id = $2
+        RETURNING
+          id,
+          dispute_id    AS "disputeId",
+          file_name     AS "fileName",
+          file_type     AS "fileType",
+          file_size     AS "fileSize",
+          s3_key        AS "s3Key",
+          s3_url        AS "s3Url",
+          uploaded_by   AS "uploadedBy",
+          description,
+          category,
+          created_at    AS "createdAt"`,
+      [evidenceId, disputeId, category],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  /**
+   * Update the display_order of multiple evidence items in a single transaction.
+   * Returns the number of rows updated.
+   */
+  async reorderEvidence(
+    disputeId: string,
+    order: Array<{ id: string; position: number }>,
+  ): Promise<number> {
+    let updated = 0;
+    for (const item of order) {
+      const result = await queryWrite(
+        `UPDATE dispute_evidence
+            SET display_order = $3,
+                updated_at    = NOW()
+          WHERE id            = $1
+            AND dispute_id    = $2`,
+        [item.id, disputeId, item.position],
+      );
+      updated += result.rowCount ?? 0;
+    }
+    return updated;
+  }
+
+  /**
+   * Search evidence by keyword (file name, description) and optional category.
+   */
+  async searchEvidence(
+    disputeId: string,
+    query: string,
+    category?: string,
+  ): Promise<DisputeEvidence[]> {
+    const conditions: string[] = ['dispute_id = $1'];
+    const params: unknown[] = [disputeId];
+    let p = 2;
+
+    if (query) {
+      conditions.push(
+        `(file_name ILIKE $${p} OR description ILIKE $${p})`,
+      );
+      params.push(`%${query}%`);
+      p++;
+    }
+
+    if (category) {
+      conditions.push(`category = $${p++}`);
+      params.push(category);
+    }
+
+    const where = conditions.join(' AND ');
+
+    const result = await queryRead<DisputeEvidence>(
+      `SELECT
+         id,
+         dispute_id    AS "disputeId",
+         file_name     AS "fileName",
+         file_type     AS "fileType",
+         file_size     AS "fileSize",
+         s3_key        AS "s3Key",
+         s3_url        AS "s3Url",
+         uploaded_by   AS "uploadedBy",
+         description,
+         category,
+         created_at    AS "createdAt"
+       FROM dispute_evidence
+       WHERE ${where}
+       ORDER BY COALESCE(display_order, 0) ASC, created_at ASC`,
+      params,
+    );
+    return result.rows;
+  }
+
+  /**
+   * Return active dispute counts per agent, ordered by workload ascending.
+   * Only disputes in 'open' or 'investigating' status are counted.
+   */
+  async getAgentWorkload(): Promise<AgentWorkload[]> {
+    const result = await queryRead<{ agentName: string; activeDisputeCount: string }>(
+      `SELECT assigned_to AS "agentName", COUNT(*) AS "activeDisputeCount"
+       FROM disputes
+       WHERE assigned_to IS NOT NULL
+         AND status IN ('open', 'investigating')
+       GROUP BY assigned_to
+       ORDER BY "activeDisputeCount" ASC`,
+    );
+    return result.rows.map(row => ({
+      agentName: row.agentName,
+      activeDisputeCount: parseInt(row.activeDisputeCount, 10),
+    }));
+  }
+
+  /**
+   * Find the agent with the fewest active disputes from a given list.
+   * Returns null if none of the provided agents have any workload data
+   * and the workload table is empty.
+   *
+   * @param availableAgents  List of agent identifiers to consider.
+   */
+  async findLeastLoadedAgent(availableAgents: string[]): Promise<string | null> {
+    if (availableAgents.length === 0) return null;
+
+    const workloads = await this.getAgentWorkload();
+
+    // Build a map of agentName → activeDisputeCount for quick lookup
+    const workloadMap = new Map<string, number>(
+      workloads.map(w => [w.agentName, w.activeDisputeCount]),
+    );
+
+    // Assign 0 to agents not yet in the workload table
+    let leastLoaded: string | null = null;
+    let lowestCount = Infinity;
+
+    for (const agent of availableAgents) {
+      const count = workloadMap.get(agent) ?? 0;
+      if (count < lowestCount) {
+        lowestCount = count;
+        leastLoaded = agent;
+      }
+    }
+
+    return leastLoaded;
   }
 }

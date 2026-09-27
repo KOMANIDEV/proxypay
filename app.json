@@ -1,0 +1,104 @@
+{
+  "name": "ProxyPay",
+  "description": "ProxyPay — Mobile Money to Stellar backend service. One-click Heroku deployment.",
+  "keywords": ["stellar", "mobile-money", "payment", "anchor", "api"],
+  "website": "https://github.com/Pidoko257/proxypay",
+  "repository": "https://github.com/Pidoko257/proxypay",
+  "success_url": "/health",
+  "scripts": {
+    "postdeploy": "npm run migrate:up"
+  },
+  "addons": [
+    {
+      "plan": "heroku-postgresql",
+      "options": {
+        "version": "16"
+      }
+    },
+    {
+      "plan": "heroku-redis",
+      "options": {
+        "maxmemory-policy": "allkeys-lru"
+      }
+    }
+  ],
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
+    }
+  ],
+  "env": {
+    "NODE_ENV": {
+      "description": "Node environment. Heroku controls this to `production` on one-click deploys.",
+      "value": "production"
+    },
+    "STELLAR_NETWORK": {
+      "description": "Stellar network to target. Use `testnet` for evaluation or `public` for mainnet.",
+      "value": "testnet"
+    },
+    "STELLAR_HORIZON_URL": {
+      "description": "Horizon endpoint(s). Single URL or comma-separated list (primary first, then fallbacks).",
+      "value": "https://horizon-testnet.stellar.org"
+    },
+    "STELLAR_FEDERATION_DOMAIN": {
+      "description": "Domain served in federation addresses, e.g. alice*example.com",
+      "value": "example.com"
+    },
+    "STELLAR_FEDERATION_SERVER_URL": {
+      "description": "Full base URL of this service (used in stellar.toml FEDERATION_SERVER line).",
+      "value": "https://YOUR-APP.herokuapp.com"
+    },
+    "ADMIN_API_KEY": {
+      "description": "Secret key protecting admin-only endpoints. Override with a strong random value.",
+      "value": "dev-admin-key"
+    },
+    "JWT_SECRET": {
+      "description": "Secret used to sign JWTs.",
+      "generator": "secret"
+    },
+    "OAUTH_JWT_SECRET": {
+      "description": "Dedicated secret used to sign OAuth JWTs.",
+      "generator": "secret"
+    },
+    "DB_ENCRYPTION_KEY": {
+      "description": "Global AES-256-GCM key material for encrypting PII fields (>=32 chars).",
+      "generator": "secret"
+    },
+    "PII_MASTER_KEY": {
+      "description": "Master key for per-user HKDF key derivation. Keep distinct from DB_ENCRYPTION_KEY.",
+      "generator": "secret"
+    },
+    "GRAPHQL_API_KEY": {
+      "description": "Optional API key for the /graphql endpoint (required in production).",
+      "required": false
+    },
+    "STELLAR_ISSUER_SECRET": {
+      "description": "Funded Stellar secret key for the anchor issuer account.",
+      "required": false
+    },
+    "STELLAR_SIGNING_KEY": {
+      "description": "Server signing secret key for SEP-10 challenge transactions.",
+      "required": false
+    },
+    "STELLAR_WEBHOOK_SECRET": {
+      "description": "Secret used to verify incoming Stellar webhook signatures.",
+      "required": false
+    },
+    "MTN_API_KEY": {
+      "description": "MTN Mobile Money API key.",
+      "required": false
+    },
+    "MTN_API_SECRET": {
+      "description": "MTN Mobile Money API secret.",
+      "required": false
+    },
+    "AIRTEL_API_KEY": {
+      "description": "Airtel Money API key.",
+      "required": false
+    },
+    "AIRTEL_API_SECRET": {
+      "description": "Airtel Money API secret.",
+      "required": false
+    }
+  }
+}

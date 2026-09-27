@@ -27,12 +27,12 @@ FeeCalculationContext
 
 ### Strategy Types
 
-| Type | Description |
-|------|-------------|
-| `flat` | Fixed fee amount regardless of transaction size |
-| `percentage` | Percentage of amount, clamped to `[feeMinimum, feeMaximum]` |
-| `time_based` | Overrides fee during specific days/hours (e.g. Fee-free Fridays). Falls through if condition not met. |
-| `volume_based` | Tiered fee based on transaction amount brackets |
+| Type           | Description                                                                                           |
+| -------------- | ----------------------------------------------------------------------------------------------------- |
+| `flat`         | Fixed fee amount regardless of transaction size                                                       |
+| `percentage`   | Percentage of amount, clamped to `[feeMinimum, feeMaximum]`                                           |
+| `time_based`   | Overrides fee during specific days/hours (e.g. Fee-free Fridays). Falls through if condition not met. |
+| `volume_based` | Tiered fee based on transaction amount brackets                                                       |
 
 ### Priority Hierarchy
 
@@ -55,6 +55,7 @@ POST /api/fee-strategies/calculate
 ```
 
 **Body:**
+
 ```json
 {
   "amount": 10000,
@@ -65,6 +66,7 @@ POST /api/fee-strategies/calculate
 ```
 
 **Response:**
+
 ```json
 {
   "success": true,
@@ -167,6 +169,7 @@ Marketing can create this via the API — no developer needed.
 `daysOfWeek` uses ISO weekday numbers: 1=Monday … 7=Sunday.
 
 To limit to business hours only:
+
 ```json
 {
   "daysOfWeek": [5],
@@ -204,9 +207,9 @@ Reduced fee for high-value transactions:
   "scope": "global",
   "priority": 50,
   "volumeTiers": [
-    { "minAmount": 0,       "maxAmount": 100000, "feePercentage": 1.5 },
-    { "minAmount": 100000,  "maxAmount": 500000, "feePercentage": 0.8 },
-    { "minAmount": 500000,  "maxAmount": null,   "feePercentage": 0.5 }
+    { "minAmount": 0, "maxAmount": 100000, "feePercentage": 1.5 },
+    { "minAmount": 100000, "maxAmount": 500000, "feePercentage": 0.8 },
+    { "minAmount": 500000, "maxAmount": null, "feePercentage": 0.5 }
   ]
 }
 ```
@@ -277,6 +280,7 @@ npm run migrate:up
 Migration file: `migrations/20260424_create_fee_strategies.sql`
 
 Tables created:
+
 - `fee_strategies` — strategy definitions
 - `fee_strategy_audit` — full audit trail of all changes
 
@@ -296,3 +300,52 @@ The existing fee config cache uses 1 hour. For a strategy engine that marketing 
 **Why store `evaluationTime` as a parameter?**
 This makes time-based strategies fully testable without mocking `Date.now()`. The `/calculate` endpoint accepts an optional `evaluationTime` so QA can verify Friday promotions on any day.
 
+---
+
+## Fee Calculation Verification (Issue #623)
+
+Every fee returned by `FeeStrategyEngine.calculateFee()` passes through a safety
+validation step before it is applied. This prevents negative fees or
+accidentally huge fees (for example a mis-typed `feePercentage` of `100` instead
+of `1`) from being charged silently.
+
+### Rules
+
+| #   | Rule                                  | Behaviour when violated                               |
+| --- | ------------------------------------- | ----------------------------------------------------- |
+| 1   | Fee must be finite and `>= 0`         | Fee falls back to `0`, `validation.invalid = true`    |
+| 2   | Fee must not exceed the effective cap | Fee is clamped to the cap, `validation.capped = true` |
+
+The **effective cap** is:
+
+- `strategy.feeMaximum` when the strategy declares one — an operator-authored
+  bound that is treated as pre-authorised; otherwise
+- **1% of the transaction amount** (`DEFAULT_MAX_FEE_RATE = 0.01`), the global
+  safety ceiling.
+
+Override the global ceiling with `FEE_STRATEGY_MAX_FEE_RATE` (e.g. `0.02` for
+2%) when a different regulatory cap applies.
+
+### `FeeCalculationResult.validation`
+
+```json
+{
+  "fee": 100,
+  "validation": {
+    "appliedFeeCap": 100,
+    "capped": true,
+    "invalid": false,
+    "warnings": [
+      "Calculated fee (1000) exceeds the maximum allowed fee cap (100); clamping to the cap"
+    ]
+  }
+}
+```
+
+### Audit trail
+
+Every applied fee emits a structured `fee_calculation` log line (timestamp,
+amount, fee, strategy, scope, user, provider, cap and adjustment flags), and
+every adjustment additionally emits a `fee_calculation_validation` warning. Both
+are picked up by the centralised pino logger, so fee decisions are traceable in
+Loki/stdout without extra infrastructure.

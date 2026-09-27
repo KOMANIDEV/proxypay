@@ -3,6 +3,7 @@ import {
   SubscriptionChannels,
   transactionChannel,
   paymentStatusChannel,
+  connectionLimitManager,
   type TransactionCreatedPayload,
   type TransactionUpdatedPayload,
   type PaymentStatusUpdatedPayload,
@@ -93,10 +94,37 @@ function formatBulkImportJobPayload(payload: BulkImportJobUpdatedPayload) {
 // Subscription resolvers factory
 // ---------------------------------------------------------------------------
 
-function requireWsAuth(context: { auth?: { authenticated?: boolean } }) {
-  if (!context?.auth?.authenticated) {
-    throw new Error("UNAUTHENTICATED: valid authToken required");
-  }
+/**
+ * Wraps a raw AsyncIterableIterator so that the per-user connection slot is
+ * released automatically when the subscription ends (either via return() or
+ * throw()).  This ensures the count is always decremented even if the client
+ * disconnects without an explicit unsubscribe.
+ */
+function withConnectionRelease<T>(
+  iterator: AsyncIterableIterator<T>,
+  release: () => void,
+): AsyncIterableIterator<T> {
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async next() {
+      try {
+        return await iterator.next();
+      } catch (err) {
+        release();
+        throw err;
+      }
+    },
+    async return(value?: any) {
+      release();
+      return iterator.return ? iterator.return(value) : { value, done: true };
+    },
+    async throw(err?: any) {
+      release();
+      return iterator.throw ? iterator.throw(err) : Promise.reject(err);
+    },
+  };
 }
 
 export function createSubscriptionResolvers(pubsub: TypedPubSub) {
@@ -107,10 +135,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // across horizontally scaled API instances.
       paymentStatusUpdated: {
         subscribe: (_parent: unknown, args: { id: string }, context: any) => {
-          requireWsAuth(context);
-          return pubsub.asyncIterator<PaymentStatusUpdatedPayload>(
+          if (!context?.auth?.authenticated) {
+            throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          const release = connectionLimitManager.acquire(
+            context.auth.subject ?? context.auth.userId ?? "anonymous",
+          );
+          const iterator = pubsub.asyncIterator<PaymentStatusUpdatedPayload>(
             paymentStatusChannel(args.id),
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: PaymentStatusUpdatedPayload) => ({
           id: payload.id,
@@ -125,12 +159,21 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // connection receives the event — no server-side filtering needed.
       transactionUpdated: {
         subscribe: (_parent: unknown, args: { id: string }, context: any) => {
-          requireWsAuth(context);
+          // Reject unauthenticated WS connections
+          if (!context?.auth?.authenticated) {
+            throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          // Enforce per-user connection limit (#627)
+          const release = connectionLimitManager.acquire(
+            context.auth.subject ?? context.auth.userId ?? "anonymous",
+          );
           // Subscribe to the per-transaction channel
           const channel = args.id
             ? transactionChannel(args.id)
             : SubscriptionChannels.TRANSACTION_UPDATED;
-          return pubsub.asyncIterator<TransactionUpdatedPayload>(channel);
+          const iterator =
+            pubsub.asyncIterator<TransactionUpdatedPayload>(channel);
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionUpdatedPayload) =>
           formatTransactionPayload(payload),
@@ -139,10 +182,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── transactionCreated ──────────────────────────────────────────────
       transactionCreated: {
         subscribe: (_parent: unknown, _args: unknown, context: any) => {
-          requireWsAuth(context);
-          return pubsub.asyncIterator<TransactionCreatedPayload>(
+          if (!context?.auth?.authenticated) {
+            throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          const release = connectionLimitManager.acquire(
+            context.auth.subject ?? context.auth.userId ?? "anonymous",
+          );
+          const iterator = pubsub.asyncIterator<TransactionCreatedPayload>(
             SubscriptionChannels.TRANSACTION_CREATED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionCreatedPayload) =>
           formatTransactionPayload(payload),
@@ -151,10 +200,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── transactionCompleted ────────────────────────────────────────────
       transactionCompleted: {
         subscribe: (_parent: unknown, _args: unknown, context: any) => {
-          requireWsAuth(context);
-          return pubsub.asyncIterator<TransactionUpdatedPayload>(
+          if (!context?.auth?.authenticated) {
+            throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          const release = connectionLimitManager.acquire(
+            context.auth.subject ?? context.auth.userId ?? "anonymous",
+          );
+          const iterator = pubsub.asyncIterator<TransactionUpdatedPayload>(
             SubscriptionChannels.TRANSACTION_COMPLETED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionUpdatedPayload) =>
           formatTransactionPayload(payload),
@@ -163,10 +218,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── transactionFailed ───────────────────────────────────────────────
       transactionFailed: {
         subscribe: (_parent: unknown, _args: unknown, context: any) => {
-          requireWsAuth(context);
-          return pubsub.asyncIterator<TransactionUpdatedPayload>(
+          if (!context?.auth?.authenticated) {
+            throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          const release = connectionLimitManager.acquire(
+            context.auth.subject ?? context.auth.userId ?? "anonymous",
+          );
+          const iterator = pubsub.asyncIterator<TransactionUpdatedPayload>(
             SubscriptionChannels.TRANSACTION_FAILED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionUpdatedPayload) =>
           formatTransactionPayload(payload),
@@ -175,10 +236,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── disputeCreated ──────────────────────────────────────────────────
       disputeCreated: {
         subscribe: (_parent: unknown, _args: unknown, context: any) => {
-          requireWsAuth(context);
-          return pubsub.asyncIterator<DisputeCreatedPayload>(
+          if (!context?.auth?.authenticated) {
+            throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          const release = connectionLimitManager.acquire(
+            context.auth.subject ?? context.auth.userId ?? "anonymous",
+          );
+          const iterator = pubsub.asyncIterator<DisputeCreatedPayload>(
             SubscriptionChannels.DISPUTE_CREATED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: DisputeCreatedPayload) =>
           formatDisputePayload(payload),
@@ -188,10 +255,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       disputeUpdated: {
         subscribe: withFilter(
           (_parent: unknown, _args: unknown, context: any) => {
-            requireWsAuth(context);
-            return pubsub.asyncIterator<DisputeUpdatedPayload>(
+            if (!context?.auth?.authenticated) {
+              throw new Error("UNAUTHENTICATED: valid authToken required");
+            }
+            const release = connectionLimitManager.acquire(
+              context.auth.subject ?? context.auth.userId ?? "anonymous",
+            );
+            const iterator = pubsub.asyncIterator<DisputeUpdatedPayload>(
               SubscriptionChannels.DISPUTE_UPDATED,
             );
+            return withConnectionRelease(iterator, release);
           },
           (payload: any, variables: any) => {
             if (!variables?.id) return true;
@@ -206,10 +279,16 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       disputeNoteAdded: {
         subscribe: withFilter(
           (_parent: unknown, _args: unknown, context: any) => {
-            requireWsAuth(context);
-            return pubsub.asyncIterator<DisputeNoteAddedPayload>(
+            if (!context?.auth?.authenticated) {
+              throw new Error("UNAUTHENTICATED: valid authToken required");
+            }
+            const release = connectionLimitManager.acquire(
+              context.auth.subject ?? context.auth.userId ?? "anonymous",
+            );
+            const iterator = pubsub.asyncIterator<DisputeNoteAddedPayload>(
               SubscriptionChannels.DISPUTE_NOTE_ADDED,
             );
+            return withConnectionRelease(iterator, release);
           },
           (payload: any, variables: any) => {
             if (!variables?.disputeId) return true;
@@ -224,10 +303,17 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       bulkImportJobUpdated: {
         subscribe: withFilter(
           (_parent: unknown, _args: unknown, context: any) => {
-            requireWsAuth(context);
-            return pubsub.asyncIterator<BulkImportJobUpdatedPayload>(
-              SubscriptionChannels.BULK_IMPORT_JOB_UPDATED,
+            if (!context?.auth?.authenticated) {
+              throw new Error("UNAUTHENTICATED: valid authToken required");
+            }
+            const release = connectionLimitManager.acquire(
+              context.auth.subject ?? context.auth.userId ?? "anonymous",
             );
+            const iterator =
+              pubsub.asyncIterator<BulkImportJobUpdatedPayload>(
+                SubscriptionChannels.BULK_IMPORT_JOB_UPDATED,
+              );
+            return withConnectionRelease(iterator, release);
           },
           (payload: any, variables: any) =>
             payload?.jobId === variables.jobId,

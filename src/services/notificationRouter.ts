@@ -3,8 +3,13 @@ import { SmsService, smsService } from "./sms";
 import { PushNotificationService, pushNotificationService } from "./push";
 import { WhatsappService, whatsappService } from "./whatsapp";
 import { PagerDutyService, pagerDutyService } from "./pagerDutyService";
+import {
+  hashDedupParts,
+  notificationDeduplicator,
+} from "./notificationDeduplicator";
 import { UserModel } from "../models/users";
 import { Transaction } from "../models/transaction";
+import { recordDeliveryAsync } from "./notificationHealthService";
 
 export type NotificationSeverity = "low" | "medium" | "high" | "critical";
 
@@ -20,6 +25,13 @@ export interface NotificationContext {
   message: string;
   data?: Record<string, any>;
   locale?: string;
+  /**
+   * Stable identity of the notification event used for deduplication.
+   * When omitted, one is derived from the context (category, entity id,
+   * or a hash of the content). Only the first send within the dedup window
+   * is delivered.
+   */
+  dedupKey?: string;
 }
 
 export interface DisputeNotificationContext {
@@ -193,6 +205,14 @@ export class NotificationRouter {
     channel: NotificationChannel,
     context: NotificationContext,
   ): Promise<void> {
+    // #479 – every channel attempt is recorded so notification health can be
+    // observed. Without this, a misconfigured provider is indistinguishable
+    // from a healthy one because errors are deliberately swallowed below.
+    const startedAt = Date.now();
+    const notificationKey =
+      context.dedupKey ??
+      `${context.category}:${context.transactionId ?? context.userId ?? "system"}`;
+
     try {
       switch (channel) {
         case "email":
@@ -211,8 +231,32 @@ export class NotificationRouter {
           await this.sendPagerDutyNotification(context);
           break;
       }
+
+      recordDeliveryAsync({
+        notificationKey,
+        channel,
+        status: "delivered",
+        durationMs: Date.now() - startedAt,
+        category: context.category,
+        severity: context.severity,
+        userId: context.userId ?? null,
+        transactionId: context.transactionId ?? null,
+      });
     } catch (error) {
       console.error(`Failed to send ${channel} notification:`, error);
+
+      recordDeliveryAsync({
+        notificationKey,
+        channel,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        category: context.category,
+        severity: context.severity,
+        userId: context.userId ?? null,
+        transactionId: context.transactionId ?? null,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+
       // Don't throw - we don't want one channel failure to stop others
     }
   }
@@ -330,12 +374,56 @@ export class NotificationRouter {
   }
 
   /**
+   * Derive a stable dedup key from the context when none was supplied.
+   * Prefers a real entity id (subscription, dispute, transaction, …) so
+   * distinct events for the same entity are not conflated; falls back to
+   * hashing the content so exact repeats are still suppressed.
+   */
+  private buildDedupKey(context: NotificationContext): string | null {
+    if (context.category === "transaction") {
+      return context.transactionId
+        ? `tx:${context.transactionId}:${context.severity}`
+        : null;
+    }
+
+    const entity =
+      context.data?.subscriptionId ??
+      context.data?.disputeId ??
+      context.data?.transactionId ??
+      context.data?.provider ??
+      context.data?.userId;
+
+    if (entity) {
+      return `sys:${context.category}:${context.severity}:${String(entity)}`;
+    }
+
+    return `sys:${context.category}:${context.severity}:${hashDedupParts([
+      context.category,
+      context.severity,
+      context.title,
+      context.message,
+    ])}`;
+  }
+
+  /**
    * Route and send notification based on severity
    */
   async routeNotification(context: NotificationContext): Promise<void> {
     const rule = this.routingRules[context.severity];
     if (!rule) {
       console.warn(`No routing rule found for severity: ${context.severity}`);
+      return;
+    }
+
+    // Deduplicate: the same logical event can arrive through multiple paths
+    // (queue worker, Redis pub/sub broadcast + per-transaction channels,
+    // multiple worker instances). Only the first claim within the window is
+    // delivered.
+    const dedupKey = context.dedupKey ?? this.buildDedupKey(context);
+    if (dedupKey && !(await notificationDeduplicator.claim(dedupKey))) {
+      console.log(
+        `Skipping duplicate notification: ${dedupKey} (${context.category}/${context.severity})`,
+      );
       return;
     }
 
@@ -363,11 +451,16 @@ export class NotificationRouter {
    */
   async routeTransactionNotification(
     transaction: Transaction,
-    status: "completed" | "failed",
+    status: "completed" | "failed" | "retrying",
     errorMessage?: string,
   ): Promise<void> {
     const severity: NotificationSeverity = status === "failed" ? "high" : "medium";
-    const title = status === "failed" ? "Transaction Failed" : "Transaction Completed";
+    const title =
+      status === "failed"
+        ? "Transaction Failed"
+        : status === "retrying"
+          ? "Transaction Retry Scheduled"
+          : "Transaction Completed";
     const message = errorMessage || `Your ${transaction.type} of ${transaction.amount} ${transaction.provider.toUpperCase()} has ${status}`;
 
     await this.routeNotification({
@@ -379,6 +472,7 @@ export class NotificationRouter {
       title,
       message,
       locale: "en", // Could be retrieved from user preferences
+      dedupKey: `tx:${transaction.id}:${status}`,
     });
   }
 
@@ -391,6 +485,7 @@ export class NotificationRouter {
     title: string,
     message: string,
     data?: Record<string, any>,
+    dedupKey?: string,
   ): Promise<void> {
     await this.routeNotification({
       severity,
@@ -398,6 +493,7 @@ export class NotificationRouter {
       title,
       message,
       data,
+      dedupKey,
     });
   }
 
@@ -418,6 +514,7 @@ export class NotificationRouter {
         status: context.status,
         ...context.metadata,
       },
+      `dispute:${context.disputeId}:${context.event}`,
     );
   }
 }

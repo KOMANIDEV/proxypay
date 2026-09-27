@@ -12,6 +12,8 @@ import { queryRead, queryWrite, pool } from "../config/database";
 import { KYCLevel, TRANSACTION_LIMITS } from "../config/limits";
 import { EmailService } from "./email";
 import { pushNotificationService } from "./push";
+import { sanctionService } from "./sanctionService";
+import { logKycTierOverride } from "./complianceAuditService";
 
 // Fraction of the daily limit that triggers an upgrade flag (80%)
 const UPGRADE_THRESHOLD_PCT = parseFloat(
@@ -242,11 +244,97 @@ export interface ApproveUpgradeOptions {
   notes?: string;
 }
 
+export interface EligibilityValidationResult {
+  eligible: boolean;
+  reasons: string[];
+}
+
+/**
+ * Re-validates user eligibility at upgrade approval time.
+ * Checks account status, sanctions/compliance, and fraud/dispute history.
+ */
+export async function validateUserEligibilityForUpgrade(
+  userId: string,
+  requestedLevel: KYCLevel,
+  client?: any,
+): Promise<EligibilityValidationResult> {
+  const db = client ?? pool;
+  const reasons: string[] = [];
+
+  // 1. Check user account status
+  const userResult = await db.query(
+    `SELECT id, status, kyc_level, first_name, last_name, name, email FROM users WHERE id = $1`,
+    [userId],
+  );
+  if (userResult.rows.length === 0) {
+    return { eligible: false, reasons: ["User record not found"] };
+  }
+  const user = userResult.rows[0];
+  if (user.status !== "active") {
+    reasons.push(`User account status is '${user.status}' (must be active)`);
+  }
+
+  // 2. Re-check compliance / sanctions status
+  const fullName =
+    [user.first_name, user.last_name].filter(Boolean).join(" ") ||
+    user.name ||
+    "";
+  if (fullName) {
+    try {
+      const sanctionMatches = await sanctionService.searchSanctions(fullName);
+      if (sanctionMatches && sanctionMatches.length > 0) {
+        reasons.push(
+          `User flagged in sanctions/compliance screening: ${sanctionMatches[0].name} (${sanctionMatches[0].source})`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        "[kyc-tier-upgrade] Sanctions screening error during eligibility re-validation:",
+        err,
+      );
+    }
+  }
+
+  // 3. Re-verify transaction history for fraud patterns and disputes
+  try {
+    const alertResult = await db.query(
+      `SELECT COUNT(*) as count FROM fraud_alerts
+       WHERE user_id = $1 AND status IN ('flagged', 'confirmed')`,
+      [userId],
+    );
+    const activeAlerts = parseInt(alertResult.rows[0]?.count || "0", 10);
+    if (activeAlerts > 0) {
+      reasons.push(`User has ${activeAlerts} unresolved or confirmed fraud alert(s)`);
+    }
+
+    const disputeResult = await db.query(
+      `SELECT COUNT(*) as count FROM transactions
+       WHERE user_id = $1 AND status = 'dispute'`,
+      [userId],
+    );
+    const disputes = parseInt(disputeResult.rows[0]?.count || "0", 10);
+    if (disputes > 0) {
+      reasons.push(`User has ${disputes} active transaction dispute(s)`);
+    }
+  } catch (err) {
+    console.warn(
+      "[kyc-tier-upgrade] Fraud check error during eligibility re-validation:",
+      err,
+    );
+  }
+
+  return {
+    eligible: reasons.length === 0,
+    reasons,
+  };
+}
+
 /**
  * Approves a KYC tier upgrade request:
  *  1. Validates the request is in a reviewable state
- *  2. Updates users.kyc_level to the requested level
- *  3. Marks the request as approved
+ *  2. Re-validates user eligibility at approval time
+ *  3. Updates users.kyc_level to the requested level
+ *  4. Marks the request as approved
  *
  * All changes are wrapped in a single transaction.
  */
@@ -259,16 +347,20 @@ export async function approveKycUpgrade(
   try {
     await client.query("BEGIN");
 
-    // Fetch and lock the request row
+    // Fetch and lock the request row (plus the user's current KYC tier so the
+    // override can be recorded with before/after values).
     const reqResult = await client.query<{
       id: string;
       user_id: string;
       requested_level: string;
       status: string;
+      previous_level: string | null;
     }>(
-      `SELECT id, user_id, requested_level, status
-       FROM kyc_tier_upgrade_requests
-       WHERE id = $1
+      `SELECT r.id, r.user_id, r.requested_level, r.status,
+              u.kyc_level AS previous_level
+       FROM kyc_tier_upgrade_requests r
+       JOIN users u ON u.id = r.user_id
+       WHERE r.id = $1
        FOR UPDATE`,
       [requestId],
     );
@@ -286,6 +378,41 @@ export async function approveKycUpgrade(
     }
 
     const newKycLevel = req.requested_level as KYCLevel;
+
+    // Re-validate user eligibility at approval time
+    const eligibility = await validateUserEligibilityForUpgrade(
+      req.user_id,
+      newKycLevel,
+      client,
+    );
+
+    if (!eligibility.eligible) {
+      const rejectionReason = `Ineligible at approval time: ${eligibility.reasons.join("; ")}`;
+      // Automatically reject/block upgrade request
+      await client.query(
+        `UPDATE kyc_tier_upgrade_requests
+         SET status           = 'rejected',
+             reviewed_by      = $1,
+             reviewed_at      = CURRENT_TIMESTAMP,
+             review_notes     = $2,
+             rejection_reason = $3
+         WHERE id = $4`,
+        [
+          reviewedBy,
+          notes
+            ? `${notes} (Eligibility re-validation failed)`
+            : "Eligibility re-validation failed",
+          rejectionReason,
+          requestId,
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      throw new Error(
+        `KYC tier upgrade blocked: user is no longer eligible. ${rejectionReason}`,
+      );
+    }
 
     // Update the user's KYC level
     await client.query(
@@ -306,6 +433,18 @@ export async function approveKycUpgrade(
        WHERE id = $3`,
       [reviewedBy, notes ?? null, requestId],
     );
+
+    // Compliance audit trail for the admin KYC tier override (#640). Written
+    // with the same client so the audit row commits atomically with the change.
+    await logKycTierOverride({
+      userId: req.user_id,
+      previousLevel: req.previous_level,
+      newLevel: newKycLevel,
+      adminId: reviewedBy,
+      reason: notes ?? null,
+      source: "admin",
+      client,
+    });
 
     await client.query("COMMIT");
 

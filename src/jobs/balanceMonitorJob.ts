@@ -2,6 +2,7 @@ import * as StellarSdk from "stellar-sdk";
 import { getStellarServer } from "../config/stellar";
 import { notifySlackAlert } from "../services/loggers";
 import { calculateStellarReserve, formatReserveInfo } from "../utils/stellarReserveCalculator";
+import { redisClient } from "../config/redis";
 
 /**
  * Balance Monitor Job
@@ -10,18 +11,96 @@ import { calculateStellarReserve, formatReserveInfo } from "../utils/stellarRese
  * Also warns admins if XLM reserve falls below threshold.
  */
 
-interface BalanceThreshold {
+export interface BalanceThreshold {
   asset: string; // "XLM" or asset code like "USDC"
   threshold: number;
 }
 
-interface WalletBalance {
+export interface WalletBalance {
   publicKey: string;
   balances: Array<{
     asset: string;
     balance: number;
   }>;
 }
+
+export const BALANCE_MONITOR_LOCK_KEY = "lock:job:balance-monitor";
+export const BALANCE_MONITOR_LOCK_TTL = parseInt(
+  process.env.BALANCE_MONITOR_LOCK_TTL || "240",
+  10
+);
+export const BALANCE_BROADCAST_CHANNEL = "balance:monitor:broadcast";
+export const BALANCE_CACHE_TTL_SECONDS = 300;
+
+export async function acquireBalanceMonitorLock(): Promise<boolean> {
+  if (!redisClient?.isOpen) {
+    return true; // Single-instance fallback when Redis is not running
+  }
+  try {
+    const res = await redisClient.set(
+      BALANCE_MONITOR_LOCK_KEY,
+      process.env.HOSTNAME || "instance",
+      {
+        NX: true,
+        EX: BALANCE_MONITOR_LOCK_TTL,
+      }
+    );
+    return res !== null;
+  } catch (err) {
+    console.warn("[balance-monitor] Redis lock check failed:", err);
+    return true;
+  }
+}
+
+export async function releaseBalanceMonitorLock(): Promise<void> {
+  if (!redisClient?.isOpen) {
+    return;
+  }
+  try {
+    await redisClient.del(BALANCE_MONITOR_LOCK_KEY);
+  } catch (err) {
+    console.warn("[balance-monitor] Redis lock release failed:", err);
+  }
+}
+
+export async function broadcastWalletBalance(
+  walletKey: string,
+  balance: WalletBalance
+): Promise<void> {
+  if (!redisClient?.isOpen) return;
+  try {
+    await redisClient.setEx(
+      `balance:wallet:${walletKey}`,
+      BALANCE_CACHE_TTL_SECONDS,
+      JSON.stringify(balance)
+    );
+    await redisClient.publish(
+      BALANCE_BROADCAST_CHANNEL,
+      JSON.stringify({
+        type: "BALANCE_UPDATED",
+        walletKey,
+        balances: balance,
+        timestamp: new Date().toISOString(),
+      })
+    );
+  } catch (err) {
+    console.warn("[balance-monitor] Failed to broadcast wallet balance:", err);
+  }
+}
+
+export async function getCachedWalletBalance(
+  publicKey: string
+): Promise<WalletBalance | null> {
+  if (!redisClient?.isOpen) return null;
+  try {
+    const raw = await redisClient.get(`balance:wallet:${publicKey}`);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.warn("[balance-monitor] Failed to get cached wallet balance:", err);
+    return null;
+  }
+}
+
 
 function getHotWalletPublicKeys(): string[] {
   const keys = process.env.HOT_WALLET_PUBLIC_KEYS;
@@ -94,6 +173,14 @@ async function getWalletBalances(publicKey: string): Promise<WalletBalance> {
 }
 
 async function checkBalancesAndAlert(): Promise<void> {
+  const lockAcquired = await acquireBalanceMonitorLock();
+  if (!lockAcquired) {
+    console.log(
+      "[balance-monitor] Another instance is currently checking balances or holds the cluster lock; skipping redundant operation"
+    );
+    return;
+  }
+
   const wallets = getHotWalletPublicKeys();
   const thresholds = getBalanceThresholds();
   const minBalanceThreshold = getStellarMinimumBalanceThreshold();
@@ -112,6 +199,7 @@ async function checkBalancesAndAlert(): Promise<void> {
   for (const walletKey of wallets) {
     try {
       const walletBalance = await getWalletBalances(walletKey);
+      await broadcastWalletBalance(walletKey, walletBalance);
 
       for (const threshold of thresholds) {
         const balance = walletBalance.balances.find(b => b.asset === threshold.asset);

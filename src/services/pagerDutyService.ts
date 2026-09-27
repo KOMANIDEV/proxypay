@@ -309,6 +309,16 @@ export class PagerDutyService {
     };
   }
 
+  async sendEvent(event: PagerDutyEvent): Promise<void> {
+    if (!this.config.enabled) return;
+
+    try {
+      await this.client.post("", event);
+    } catch (error) {
+      console.error("Failed to send PagerDuty event:", error);
+    }
+  }
+
   /**
    * Generate a deduplication key for PagerDuty
    * Ensures that multiple events for the same provider are treated as the same incident

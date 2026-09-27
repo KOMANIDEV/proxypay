@@ -3,6 +3,7 @@ import { Transaction } from "../models/transaction";
 import { DailySnapshot } from "../models/snapshot";
 import { GrowthMetrics } from "./snapshotService";
 import { resolveLocale, translate } from "../utils/i18n";
+import { receiptTemplateService } from "./receiptTemplateService";
 
 export interface LockoutEmailOptions {
   minutesRemaining: number;
@@ -17,6 +18,9 @@ export interface EmailOptions {
   to: string;
   templateId: string;
   dynamicTemplateData: Record<string, any>;
+  html?: string;
+  text?: string;
+  subject?: string;
   attachments?: Array<{
     content: string;
     filename: string;
@@ -52,13 +56,25 @@ export class EmailService {
     }
 
     try {
-      await sgMail.send({
+      const message: any = {
         from: process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>',
         to: options.to,
-        templateId: options.templateId,
         dynamicTemplateData: options.dynamicTemplateData,
-        attachments: options.attachments,
-      });
+      };
+
+      if (options.html || options.text) {
+        if (options.html) message.html = options.html;
+        if (options.text) message.text = options.text;
+        if (options.subject) message.subject = options.subject;
+      } else {
+        message.templateId = options.templateId;
+      }
+
+      if (options.attachments) {
+        message.attachments = options.attachments;
+      }
+
+      await sgMail.send(message);
     } catch (error) {
       console.error("Email delivery failed:", error);
       // We don't throw here to prevent blocking the transaction flow
@@ -71,9 +87,33 @@ export class EmailService {
     transaction: Transaction,
     locale = "en",
     merchantDisplayName?: string | null,
+    merchantId?: string | null,
+    branding?: { businessName?: string | null; logoUrl?: string | null; primaryColor?: string | null },
   ): Promise<void> {
     const resolvedLocale = resolveLocale(locale);
     const transactionHash = transaction.transactionHash;
+
+    const render = await receiptTemplateService.renderReceipt({
+      transaction,
+      merchantId: merchantId ?? null,
+      merchantDisplayName: merchantDisplayName ?? null,
+      businessName: branding?.businessName ?? null,
+      logoUrl: branding?.logoUrl ?? null,
+      primaryColor: branding?.primaryColor ?? null,
+      locale: resolvedLocale,
+    });
+
+    if (render.renderingEngine === "handlebars" && render.template) {
+      await this.sendEmail({
+        to: email,
+        templateId: "",
+        dynamicTemplateData: {},
+        html: render.html,
+        text: render.plain,
+      });
+      return;
+    }
+
     await this.sendEmail({
       to: email,
       templateId: this.resolveTemplateId(

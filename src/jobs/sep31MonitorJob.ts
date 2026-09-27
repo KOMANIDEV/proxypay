@@ -2,16 +2,20 @@ import { pool } from "../config/database";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { Sep31Status, mapToSep31Status, isValidTransition } from "../stellar/sep31";
 import { getStellarServer } from "../config/stellar";
+import { MobileMoneyService } from "../services/mobilemoney/mobileMoneyService";
 import * as StellarSdk from "stellar-sdk";
+import logger from "../utils/logger";
 
 /**
  * SEP-31 Transaction Monitor Job
  * Schedule: Every minute
  * Monitors SEP-31 transactions for payment receipt and status updates.
+ * Initiates payouts when transactions reach pending_receiver status.
  */
 export async function runSep31MonitorJob(): Promise<void> {
   const transactionModel = new TransactionModel();
   const server = getStellarServer();
+  const mobileMoneyService = new MobileMoneyService();
 
   try {
     // Find all pending SEP-31 transactions
@@ -23,7 +27,7 @@ export async function runSep31MonitorJob(): Promise<void> {
         AND metadata->'sep31' IS NOT NULL
     `);
 
-    console.log(`[sep31-monitor] Found ${result.rows.length} SEP-31 transactions to check`);
+    logger.info({ count: result.rows.length }, '[sep31-monitor] Found SEP-31 transactions to check');
 
     for (const row of result.rows) {
       try {
@@ -44,7 +48,7 @@ export async function runSep31MonitorJob(): Promise<void> {
             const newStatus = Sep31Status.PendingStellar;
             if (isValidTransition(currentStatus, newStatus)) {
               await updateSep31Status(row.id, newStatus, metadata);
-              console.log(`[sep31-monitor] Transaction ${row.id} payment received, status: ${newStatus}`);
+              logger.info({ transactionId: row.id, newStatus }, '[sep31-monitor] Transaction payment received, status updated');
             }
           }
         }
@@ -52,23 +56,17 @@ export async function runSep31MonitorJob(): Promise<void> {
         // For pending_stellar, we could add logic to check Stellar network confirmation
         // For now, we'll assume it moves to pending_receiver after payment confirmation
 
-        // For pending_receiver, trigger payout (this would integrate with mobile money service)
+        // For pending_receiver, trigger payout (integrate with mobile money service)
         if (currentStatus === Sep31Status.PendingReceiver) {
-          // TODO: Implement payout logic
-          // For now, mark as completed after some time
-          const newStatus = Sep31Status.Completed;
-          if (isValidTransition(currentStatus, newStatus)) {
-            await updateSep31Status(row.id, newStatus, metadata);
-            console.log(`[sep31-monitor] Transaction ${row.id} completed, status: ${newStatus}`);
-          }
+          await processSep31Payout(row, sep31Meta, mobileMoneyService, transactionModel);
         }
 
       } catch (error) {
-        console.error(`[sep31-monitor] Error processing transaction ${row.id}:`, error);
+        logger.error({ err: error, transactionId: row.id }, '[sep31-monitor] Error processing transaction');
       }
     }
   } catch (error) {
-    console.error("[sep31-monitor] Job failed:", error);
+    logger.error({ err: error }, '[sep31-monitor] Job failed');
   }
 }
 
@@ -134,4 +132,112 @@ async function updateSep31Status(
   }
 
   await transactionModel.updateStatus(transactionId, transactionStatus);
+}
+
+/**
+ * Process SEP-31 payout when transaction reaches pending_receiver status.
+ * Uses MobileMoneyService to send payout to the destination.
+ */
+async function processSep31Payout(
+  row: any,
+  sep31Meta: any,
+  mobileMoneyService: MobileMoneyService,
+  transactionModel: TransactionModel
+): Promise<void> {
+  const transactionId = row.id;
+  const amount = row.amount;
+  const metadata = row.metadata as any;
+
+  // Extract payout details from metadata
+  const receiverAccount = sep31Meta.receiver_account_number;
+  const receiverRouting = sep31Meta.receiver_routing_number;
+  const payoutType = sep31Meta.payout_type || "mobile_money";
+  const amountOut = sep31Meta.amount_out || row.amount;
+
+  if (!receiverAccount) {
+    logger.warn({ transactionId }, '[sep31-monitor] No receiver account number, cannot process payout');
+    return;
+  }
+
+  // Determine provider based on routing number or default
+  const provider = determineProvider(receiverRouting, payoutType);
+
+  try {
+    logger.info({ transactionId, provider, receiverAccount, amount: amountOut }, '[sep31-monitor] Initiating payout');
+
+    // Send payout via mobile money service
+    const payoutResult = await mobileMoneyService.sendPayout(provider, receiverAccount, amountOut);
+
+    if (payoutResult.success) {
+      // Update status to completed
+      const newStatus = Sep31Status.Completed;
+      if (isValidTransition(Sep31Status.PendingReceiver, newStatus)) {
+        await updateSep31Status(transactionId, newStatus, metadata);
+        
+        // Store payout reference in metadata
+        const updatedMetadata = {
+          ...metadata,
+          sep31: {
+            ...metadata.sep31,
+            status: newStatus,
+            payout_reference: payoutResult.data?.reference || payoutResult.data?.transactionId,
+            payout_provider: provider,
+            completed_at: new Date().toISOString(),
+          },
+        };
+        await transactionModel.updateMetadata(transactionId, updatedMetadata);
+        
+        logger.info({ transactionId, provider, payoutRef: payoutResult.data?.reference }, '[sep31-monitor] Payout completed successfully');
+      }
+    } else {
+      // Payout failed - update to error status
+      const newStatus = Sep31Status.Error;
+      if (isValidTransition(Sep31Status.PendingReceiver, newStatus)) {
+        await updateSep31Status(transactionId, newStatus, metadata);
+        logger.error({ transactionId, provider, error: payoutResult.error }, '[sep31-monitor] Payout failed');
+      }
+    }
+  } catch (error) {
+    logger.error({ err: error, transactionId, provider }, '[sep31-monitor] Payout error');
+    // Update to error status on exception
+    const newStatus = Sep31Status.Error;
+    if (isValidTransition(Sep31Status.PendingReceiver, newStatus)) {
+      await updateSep31Status(transactionId, newStatus, metadata);
+    }
+  }
+}
+
+/**
+ * Determine mobile money provider based on routing number and payout type
+ */
+function determineProvider(routingNumber: string | null | undefined, payoutType: string): string {
+  if (payoutType !== "mobile_money") {
+    return "mtn"; // Default fallback
+  }
+  
+  // Map common routing prefixes to providers
+  if (routingNumber) {
+    const prefix = routingNumber.substring(0, 4);
+    switch (prefix) {
+      case "024":
+      case "054":
+      case "055":
+      case "059":
+        return "mtn";
+      case "027":
+      case "057":
+        return "airtel";
+      case "020":
+      case "050":
+        return "orange";
+      case "023":
+      case "053":
+        return "vodacom";
+      case "026":
+      case "056":
+        return "tigo";
+    }
+  }
+  
+  return "mtn"; // Default fallback
 }

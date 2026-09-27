@@ -10,6 +10,10 @@ jest.mock("bullmq", () => ({
     getJobs: jest.fn().mockResolvedValue([]),
     close: jest.fn().mockResolvedValue(undefined),
   })),
+  QueueEvents: jest.fn().mockImplementation(() => ({
+    on: jest.fn(),
+    close: jest.fn().mockResolvedValue(undefined),
+  })),
   Worker: jest.fn().mockImplementation(() => ({
     on: jest.fn(),
     close: jest.fn().mockResolvedValue(undefined),
@@ -66,11 +70,12 @@ afterEach(() => {
 describe("runCleanupJob", () => {
   it("deletes old transactions and logs count", async () => {
     mockQuery
-      .mockResolvedValueOnce({ rowCount: 3 });
+      .mockResolvedValueOnce({ rowCount: 3 })
+      .mockResolvedValueOnce({ rowCount: 0 });
     mockQueryWrite.mockResolvedValueOnce({ rows: [{ released: 4 }] });
     await runCleanupJob();
     expect(mockQueryWrite).toHaveBeenCalledTimes(1);
-    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining("Deleted 3"),
     );
@@ -111,6 +116,27 @@ describe("runReportJob", () => {
     await runReportJob();
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining("deposit"),
+    );
+  });
+
+  it("stores a daily report snapshot for the previous day", async () => {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const reportDate = yesterday.toISOString().split("T")[0];
+
+    mockQuery
+      .mockResolvedValueOnce({
+        rows: [{ type: "transfer", status: "pending", count: 2, total_amount: "250" }],
+      })
+      .mockResolvedValueOnce({ rows: [{ total_user_fees: "500" }] })
+      .mockResolvedValueOnce({ rows: [{ total_provider_fees: "100" }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await runReportJob();
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO daily_pnl_snapshots"),
+      [reportDate, 500, 100, 400],
     );
   });
 });
@@ -184,7 +210,7 @@ describe("startJobs", () => {
   it("schedules all valid jobs", () => {
     (cron.validate as jest.Mock).mockReturnValue(true);
     startJobs();
-    expect(cron.schedule).toHaveBeenCalledTimes(18);
+    expect(cron.schedule).toHaveBeenCalledTimes(23);
   });
 
   it("skips jobs with invalid cron expressions", () => {

@@ -22,6 +22,11 @@ export interface PostedEntry {
   credit: number;
 }
 
+export interface ReversalResult {
+  alreadyReversed: boolean;
+  entries: PostedEntry[];
+}
+
 export interface AccountBalance {
   account_id: string;
   code: string;
@@ -158,42 +163,132 @@ export class LedgerService {
     
     try {
       await client.query('BEGIN');
-
-      // Validate entries
-      if (!entries || entries.length < 2) {
-        throw new Error('At least 2 entries required for double-entry');
-      }
-
-      // Calculate totals for client-side validation
-      const totalDebits = entries.reduce((sum, e) => sum + (e.debit_amount || 0), 0);
-      const totalCredits = entries.reduce((sum, e) => sum + (e.credit_amount || 0), 0);
-
-      if (Math.abs(totalDebits - totalCredits) > 0.0000001) {
-        throw new Error(
-          `Transaction not balanced: debits=${totalDebits} credits=${totalCredits}`
-        );
-      }
-
-      // Call the database function to post atomically
-      const result = await client.query(
-        `SELECT * FROM post_transaction($1, $2, $3, $4, $5)`,
-        [
-          referenceNumber,
-          description,
-          transactionId || null,
-          postedBy || null,
-          JSON.stringify(entries)
-        ]
+      const result = await this.postTransactionWithClient(
+        client,
+        referenceNumber,
+        description,
+        entries,
+        transactionId,
+        postedBy,
       );
 
       await client.query('COMMIT');
 
-      return result.rows.map(row => ({
-        entry_id: row.entry_id,
-        account_code: row.account_code,
-        debit: parseFloat(row.debit),
-        credit: parseFloat(row.credit)
-      }));
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async postTransactionWithClient(
+    client: PoolClient,
+    referenceNumber: string,
+    description: string,
+    entries: LedgerEntry[],
+    transactionId?: string,
+    postedBy?: string,
+  ): Promise<PostedEntry[]> {
+    if (!entries || entries.length < 2) {
+      throw new Error('At least 2 entries required for double-entry');
+    }
+
+    const totalDebits = entries.reduce((sum, entry) => sum + (entry.debit_amount || 0), 0);
+    const totalCredits = entries.reduce((sum, entry) => sum + (entry.credit_amount || 0), 0);
+
+    if (Math.abs(totalDebits - totalCredits) > 0.0000001) {
+      throw new Error(`Transaction not balanced: debits=${totalDebits} credits=${totalCredits}`);
+    }
+
+    const result = await client.query(
+      `SELECT * FROM post_transaction($1, $2, $3, $4, $5)`,
+      [
+        referenceNumber,
+        description,
+        transactionId || null,
+        postedBy || null,
+        JSON.stringify(entries),
+      ],
+    );
+
+    return result.rows.map((row) => ({
+      entry_id: row.entry_id,
+      account_code: row.account_code,
+      debit: parseFloat(row.debit),
+      credit: parseFloat(row.credit),
+    }));
+  }
+
+  /**
+   * Post the exact inverse of a transaction's ledger entries.
+   * The deterministic reference and transaction lock make retries idempotent.
+   */
+  async postReversal(
+    transactionId: string,
+    referenceNumber: string,
+    reason: string,
+    postedBy?: string,
+  ): Promise<ReversalResult> {
+    const reversalReference = `REV-${referenceNumber}`;
+    const client = await this.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [reversalReference]);
+
+      const existing = await client.query(
+        `SELECT id, account_id, debit_amount, credit_amount
+         FROM ledger_entries
+         WHERE transaction_id = $1 AND reference_number = $2
+         LIMIT 1`,
+        [transactionId, reversalReference],
+      );
+
+      if (existing.rowCount) {
+        await client.query('COMMIT');
+        return { alreadyReversed: true, entries: [] };
+      }
+
+      const original = await client.query(
+        `SELECT a.code AS account_code, le.debit_amount, le.credit_amount,
+                le.description
+         FROM ledger_entries le
+         JOIN accounts a ON a.id = le.account_id
+         WHERE le.transaction_id = $1
+           AND le.reference_number <> $2
+         ORDER BY le.created_at, le.id`,
+        [transactionId, reversalReference],
+      );
+
+      if (!original.rowCount) {
+        throw new Error(`No ledger entries found for transaction ${transactionId}`);
+      }
+
+      const entries: LedgerEntry[] = original.rows.map((entry) => {
+        const debit = Number(entry.debit_amount);
+        const credit = Number(entry.credit_amount);
+        return {
+          account_code: entry.account_code,
+          debit_amount: credit > 0 ? credit : undefined,
+          credit_amount: debit > 0 ? debit : undefined,
+          description: `Reversal: ${entry.description}`,
+          metadata: { reversalOf: referenceNumber, reason },
+        };
+      });
+
+      const postedEntries = await this.postTransactionWithClient(
+        client,
+        reversalReference,
+        `Reversal of ${referenceNumber}: ${reason}`,
+        entries,
+        transactionId,
+        postedBy,
+      );
+
+      await client.query('COMMIT');
+      return { alreadyReversed: false, entries: postedEntries };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

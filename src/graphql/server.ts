@@ -7,7 +7,7 @@ import {
 // @ts-expect-error ESM module
 import { makeExecutableSchema } from "@graphql-tools/schema";
 import { WebSocketServer } from "ws";
-import { useServer } from "graphql-ws/use/ws";
+import { useServer, type ServerCleanup } from "graphql-ws/use/ws";
 import { typeDefs } from "./schema";
 import { resolvers, subscriptionResolvers } from "./resolvers";
 import { buildGraphqlContext } from "./context";
@@ -30,7 +30,7 @@ const mergedResolvers = {
 export async function startApolloServer(
   app: Application,
   httpServer: Server,
-): Promise<void> {
+): Promise<ServerCleanup | null> {
   const schema = makeExecutableSchema({
     typeDefs,
     resolvers: mergedResolvers,
@@ -170,4 +170,6 @@ export async function startApolloServer(
     },
     wsServer,
   );
+
+  return serverCleanup;
 }

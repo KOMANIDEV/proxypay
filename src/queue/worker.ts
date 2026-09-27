@@ -1,5 +1,5 @@
 import { Message as AmqpMessage } from "amqplib";
-import { TransactionJobData, TransactionJobResult } from "./transactionQueue";
+import { TransactionJobData, TransactionJobResult, addTransactionJob } from "./transactionQueue";
 import { rabbitMQManager, EXCHANGES, ROUTING_KEYS, QUEUES } from "./rabbitmq";
 import {
   natsManager,
@@ -23,6 +23,7 @@ import { capturePersistentFailure } from "./dlq";
 import { queryRead, queryWrite } from "../config/database";
 import subscriptionModel from "../models/subscription";
 import logger from "../utils/logger";
+import { isCircuitBreakerOpenError } from "../utils/circuitBreaker";
 
 const transactionModel = new TransactionModel();
 const mobileMoneyService = new MobileMoneyService();
@@ -36,6 +37,20 @@ const CONCURRENCY = Math.max(
   1,
   parseInt(process.env.TRANSACTION_WORKER_CONCURRENCY || "5", 10),
 );
+
+const MAX_PROVIDER_REQUEUE_ATTEMPTS = Math.max(
+  0,
+  parseInt(process.env.MAX_PROVIDER_REQUEUE_ATTEMPTS || "5", 10),
+);
+
+// Configurable per provider (e.g. MTN_PROVIDER_REQUEUE_DELAY_MS), falls back
+// to a global default. Used when a provider is down (circuit breaker open)
+// so the transaction is queued for a later retry instead of failing outright.
+function getProviderRequeueDelayMs(provider: string): number {
+  const perProviderEnv = `${provider.toUpperCase()}_PROVIDER_REQUEUE_DELAY_MS`;
+  const configured = process.env[perProviderEnv] || process.env.PROVIDER_REQUEUE_DELAY_MS;
+  return Math.max(1000, parseInt(configured || "60000", 10));
+}
 
 export async function handleSubscriptionFailure(
   subscriptionId: string,
@@ -460,6 +475,22 @@ async function processTransaction(
       if (!mobileMoneyResult.success) {
         throw new Error(getProviderFailureMessage(mobileMoneyResult));
       }
+
+      // Issue #643 – persist the provider-issued reference so reconciliation can
+      // map provider confirmations back to ProxyPay transactions bidirectionally.
+      if (mobileMoneyResult.providerReference) {
+        await transactionModel.updateProviderReference(
+          transactionId,
+          mobileMoneyResult.providerReference,
+        ).catch((err: unknown) =>
+          log.warn({ err }, "Failed to store provider reference after payout"),
+        );
+        log.info(
+          { providerReference: mobileMoneyResult.providerReference },
+          "Provider reference stored for withdrawal",
+        );
+      }
+
       await updateProgress(transactionId, 90);
 
       await transactionModel.updateStatus(
@@ -494,6 +525,47 @@ async function processTransaction(
       return { success: true, transactionId };
     }
   } catch (error) {
+    if (isCircuitBreakerOpenError(error)) {
+      const existing = await transactionModel.findById(transactionId);
+      const requeueCount = ((existing?.metadata as any)?.providerRequeueCount || 0) + 1;
+
+      if (requeueCount <= MAX_PROVIDER_REQUEUE_ATTEMPTS) {
+        const delayMs = getProviderRequeueDelayMs(provider);
+        log.warn(
+          { provider, requeueCount, delayMs },
+          "Provider unavailable, queuing transaction for later retry",
+        );
+
+        await (transactionModel as any).patchMetadata(transactionId, {
+          providerRequeueCount: requeueCount,
+          providerRequeuedAt: new Date().toISOString(),
+        });
+
+        if (existing) {
+          await notificationRouter.routeTransactionNotification(
+            existing,
+            "retrying",
+            `${provider.toUpperCase()} is temporarily unavailable. We'll automatically retry your ${type} shortly.`,
+          );
+        }
+
+        setTimeout(() => {
+          addTransactionJob(data, { jobId: transactionId }).catch((err) =>
+            log.error({ err }, "Failed to requeue transaction after provider outage"),
+          );
+        }, delayMs);
+
+        // Transaction stays Pending; do not throw so this message is acked
+        // and not sent to the DLQ — it will be reprocessed once requeued.
+        return { success: false, transactionId, error: "provider_unavailable_requeued" };
+      }
+
+      log.error(
+        { provider, requeueCount },
+        "Provider still unavailable after max requeue attempts, failing transaction",
+      );
+    }
+
     log.error({ error }, "Transaction failed");
     await transactionModel.updateStatus(
       transactionId,

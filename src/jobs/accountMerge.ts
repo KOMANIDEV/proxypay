@@ -1,10 +1,22 @@
 import * as StellarSdk from "stellar-sdk";
 import { getNetworkPassphrase, getStellarServer } from "../config/stellar";
 import { addAccountMergeJob, addBatchAccountMergeJobs } from "../queue/accountMergeQueue";
+import { pool } from "../config/database";
+import logger from "../utils/logger";
 
 const ACCOUNT_MERGE_PREFIX = "[account-merge]";
 const STROOPS_PER_XLM = 10_000_000n;
 const BASE_FEE_STROOPS = BigInt(StellarSdk.BASE_FEE.toString());
+
+export interface MergeSafetyCheckResult {
+  eligible: boolean;
+  hasActiveDisputes: boolean;
+  hasPendingTransactions: boolean;
+  requiresManualReview: boolean;
+  activeDisputeCount: number;
+  pendingTransactionCount: number;
+  reasons: string[];
+}
 
 export interface AccountMergeCandidate {
   nativeBalance: string;
@@ -74,6 +86,145 @@ export function stroopsToXlm(stroops: bigint): string {
     .replace(/0+$/, "");
 
   return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
+/**
+ * Check if an account has active disputes that block merging.
+ */
+export async function checkActiveDisputes(
+  stellarAddress: string,
+): Promise<{ hasActiveDisputes: boolean; count: number }> {
+  try {
+    const res = await pool.query(
+      `SELECT COUNT(*) FROM disputes d
+       JOIN transactions t ON d.transaction_id = t.id
+       WHERE t.stellar_address = $1
+         AND d.status IN ('open', 'investigating')`,
+      [stellarAddress],
+    );
+    const count = parseInt(res.rows[0].count, 10);
+    return { hasActiveDisputes: count > 0, count };
+  } catch (err) {
+    logger.error({ error: err, stellarAddress }, "Failed to check active disputes");
+    return { hasActiveDisputes: false, count: 0 };
+  }
+}
+
+/**
+ * Check if an account has pending transactions that block merging.
+ */
+export async function checkPendingTransactions(
+  stellarAddress: string,
+): Promise<{ hasPendingTransactions: boolean; count: number }> {
+  try {
+    const res = await pool.query(
+      `SELECT COUNT(*) FROM transactions
+       WHERE stellar_address = $1
+         AND status IN ('pending', 'processing')`,
+      [stellarAddress],
+    );
+    const count = parseInt(res.rows[0].count, 10);
+    return { hasPendingTransactions: count > 0, count };
+  } catch (err) {
+    logger.error({ error: err, stellarAddress }, "Failed to check pending transactions");
+    return { hasPendingTransactions: false, count: 0 };
+  }
+}
+
+/**
+ * Check if an account requires manual review before merging.
+ * Manual review is required when:
+ * - The account has recent disputes (resolved within last 7 days)
+ * - The account has a balance above a configured threshold
+ * - The account has been flagged for compliance review
+ */
+export async function checkManualReviewRequired(
+  stellarAddress: string,
+): Promise<{ requiresManualReview: boolean; reasons: string[] }> {
+  const reasons: string[] = [];
+  const MANUAL_REVIEW_THRESHOLD_XLM = parseFloat(
+    process.env.ACCOUNT_MERGE_MANUAL_REVIEW_THRESHOLD || "100",
+  );
+  const REVIEW_LOOKBACK_DAYS = 7;
+
+  try {
+    const balanceCheck = await pool.query(
+      `SELECT native_balance FROM account_merge_candidates
+       WHERE stellar_address = $1`,
+      [stellarAddress],
+    );
+
+    if (balanceCheck.rows[0]) {
+      const balance = parseFloat(balanceCheck.rows[0].native_balance || "0");
+      if (balance > MANUAL_REVIEW_THRESHOLD_XLM) {
+        reasons.push(`Balance ${balance} XLM exceeds manual review threshold of ${MANUAL_REVIEW_THRESHOLD_XLM} XLM`);
+      }
+    }
+
+    const recentDisputes = await pool.query(
+      `SELECT COUNT(*) FROM disputes d
+       JOIN transactions t ON d.transaction_id = t.id
+       WHERE t.stellar_address = $1
+         AND d.status IN ('resolved', 'reversed', 'upheld')
+         AND d.updated_at >= NOW() - INTERVAL '1 day' * $2`,
+      [stellarAddress, REVIEW_LOOKBACK_DAYS],
+    );
+
+    if (parseInt(recentDisputes.rows[0].count, 10) > 0) {
+      reasons.push(`Has ${recentDisputes.rows[0].count} recently resolved disputes within last ${REVIEW_LOOKBACK_DAYS} days`);
+    }
+
+    const complianceFlag = await pool.query(
+      `SELECT COUNT(*) FROM aml_alerts
+       WHERE stellar_address = $1
+         AND status IN ('open', 'investigating')`,
+      [stellarAddress],
+    );
+
+    if (parseInt(complianceFlag.rows[0].count, 10) > 0) {
+      reasons.push("Has active AML/compliance alerts");
+    }
+  } catch (err) {
+    logger.error({ error: err, stellarAddress }, "Failed to check manual review requirements");
+  }
+
+  return { requiresManualReview: reasons.length > 0, reasons };
+}
+
+/**
+ * Run all safety checks for a Stellar account before allowing merge.
+ */
+export async function runMergeSafetyChecks(
+  stellarAddress: string,
+): Promise<MergeSafetyCheckResult> {
+  const [disputes, pending, manualReview] = await Promise.all([
+    checkActiveDisputes(stellarAddress),
+    checkPendingTransactions(stellarAddress),
+    checkManualReviewRequired(stellarAddress),
+  ]);
+
+  const reasons: string[] = [];
+  if (disputes.hasActiveDisputes) {
+    reasons.push(`Has ${disputes.count} active dispute(s)`);
+  }
+  if (pending.hasPendingTransactions) {
+    reasons.push(`Has ${pending.count} pending transaction(s)`);
+  }
+  if (manualReview.requiresManualReview) {
+    reasons.push(...manualReview.reasons);
+  }
+
+  const eligible = !disputes.hasActiveDisputes && !pending.hasPendingTransactions && !manualReview.requiresManualReview;
+
+  return {
+    eligible,
+    hasActiveDisputes: disputes.hasActiveDisputes,
+    hasPendingTransactions: pending.hasPendingTransactions,
+    requiresManualReview: manualReview.requiresManualReview,
+    activeDisputeCount: disputes.count,
+    pendingTransactionCount: pending.count,
+    reasons,
+  };
 }
 
 export function evaluateAccountMergeCandidate(
@@ -175,6 +326,8 @@ function isNotFoundError(error: unknown): boolean {
 /**
  * Queue account merge jobs for all configured auxiliary accounts.
  * This function runs as a scheduled job and queues individual merge jobs to BullMQ.
+ * Before queuing, safety checks are performed for each account to prevent
+ * merging accounts with active disputes, pending transactions, or requiring manual review.
  */
 export async function runAccountMergeJob(): Promise<void> {
   const sourceSecrets = parseAuxiliaryAccountSecrets();
@@ -196,24 +349,94 @@ export async function runAccountMergeJob(): Promise<void> {
     10,
   );
   const dryRun = process.env.ACCOUNT_MERGE_DRY_RUN === "true";
+  const skipSafetyChecks = process.env.ACCOUNT_MERGE_SKIP_SAFETY_CHECKS === "true";
 
   console.log(
-    `${ACCOUNT_MERGE_PREFIX} Queuing ${sourceSecrets.length} account merge jobs (dryRun=${dryRun})`,
+    `${ACCOUNT_MERGE_PREFIX} Queuing ${sourceSecrets.length} account merge jobs (dryRun=${dryRun}, skipSafetyChecks=${skipSafetyChecks})`,
   );
 
-  // Queue all merge jobs to BullMQ
-  const jobs = sourceSecrets.map((secret) => ({
-    sourceSecret: secret,
-    destinationPublicKey: destination,
-    inactivityDays,
-    dryRun,
-  }));
+  const qualifiedJobs: Array<{
+    sourceSecret: string;
+    destinationPublicKey: string;
+    inactivityDays: number;
+    dryRun: boolean;
+  }> = [];
 
-  const queuedJobs = await addBatchAccountMergeJobs(jobs);
+  let safetyBlockedCount = 0;
+  const safetyCheckResults: Array<{
+    address: string;
+    eligible: boolean;
+    reasons: string[];
+  }> = [];
+
+  for (const secret of sourceSecrets) {
+    const keypair = StellarSdk.Keypair.fromSecret(secret);
+    const publicKey = keypair.publicKey();
+
+    if (!skipSafetyChecks) {
+      try {
+        const safetyResult = await runMergeSafetyChecks(publicKey);
+        safetyCheckResults.push({
+          address: publicKey,
+          eligible: safetyResult.eligible,
+          reasons: safetyResult.reasons,
+        });
+
+        if (!safetyResult.eligible) {
+          safetyBlockedCount++;
+          logger.warn(
+            {
+              address: publicKey,
+              reasons: safetyResult.reasons,
+              hasActiveDisputes: safetyResult.hasActiveDisputes,
+              hasPendingTransactions: safetyResult.hasPendingTransactions,
+              requiresManualReview: safetyResult.requiresManualReview,
+            },
+            `${ACCOUNT_MERGE_PREFIX} Account merge blocked by safety checks`,
+          );
+          continue;
+        }
+      } catch (err) {
+        logger.error(
+          { error: err, address: publicKey },
+          `${ACCOUNT_MERGE_PREFIX} Safety check failed; skipping account`,
+        );
+        continue;
+      }
+    }
+
+    qualifiedJobs.push({
+      sourceSecret: secret,
+      destinationPublicKey: destination,
+      inactivityDays,
+      dryRun,
+    });
+  }
+
+  if (qualifiedJobs.length === 0) {
+    console.log(
+      `${ACCOUNT_MERGE_PREFIX} No accounts passed safety checks (${safetyBlockedCount} blocked)`,
+    );
+    return;
+  }
+
+  const queuedJobs = await addBatchAccountMergeJobs(qualifiedJobs);
 
   console.log(
-    `${ACCOUNT_MERGE_PREFIX} Queued ${queuedJobs.length} account merge jobs for processing`,
+    `${ACCOUNT_MERGE_PREFIX} Queued ${queuedJobs.length} account merge jobs for processing (${safetyBlockedCount} blocked by safety checks)`,
   );
+
+  if (safetyCheckResults.length > 0) {
+    logger.info(
+      {
+        total: sourceSecrets.length,
+        qualified: qualifiedJobs.length,
+        blocked: safetyBlockedCount,
+        details: safetyCheckResults,
+      },
+      `${ACCOUNT_MERGE_PREFIX} Safety check summary`,
+    );
+  }
 }
 
 /**

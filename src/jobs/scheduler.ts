@@ -13,7 +13,9 @@ import { MonitoringService } from "../services/monitoringService";
 import { createPagerDutyService } from "../services/pagerDutyService";
 import { runProviderBalanceAlertJob } from "./balances";
 import { runProviderHealthCheckJob } from "./providerHealthCheck";
+import { runProviderTokenWatchdogJob } from "./providerTokenWatchdog";
 import { runKycTierUpgradeJob } from "./kycTierUpgradeJob";
+import { runTranslationGapDetectionJob } from "./translationGapDetectionJob";
 import { runLiquidityRebalanceJob } from "./liquidityRebalanceJob";
 import { runCrossChainMonitorJob } from "./crossChainMonitorJob";
 import { runDailyProviderReconciliation } from "./providerReconciliationJob";
@@ -23,9 +25,26 @@ import { runDatabaseBackupVerifyJob } from "./databaseBackupVerifyJob";
 import {
   INDEX_REINDEX_CRON,
   INDEX_REINDEX_JOB_ENABLED,
+  INDEX_BLOAT_MONITOR_CRON,
+  INDEX_BLOAT_MONITOR_ENABLED,
+  LEDGER_INTEGRITY_CRON,
+  LEDGER_INTEGRITY_JOB_ENABLED,
+  DB_OPTIMIZATION_CRON,
+  DB_OPTIMIZATION_JOB_ENABLED,
 } from "../config/env";
 import { runIndexReindexJob } from "./indexReindexJob";
+import { runIndexBloatMonitorJob } from "./indexBloatMonitorJob";
+import { runLedgerIntegrityJob } from "./ledgerIntegrityJob";
+import { runDatabaseOptimizationJob } from "./databaseOptimizationJob";
+import { runMlFraudTrainingJob } from "./mlFraudTrainingJob";
 import { runSanctionSyncJob } from "./sanctionSyncJob";
+import { runRetentionPurgeJob } from "./retentionPurgeJob";
+import { runTravelRuleAuditReportJob } from "./travelRuleAuditReportJob";
+import { runRedisKeyExpirationMonitorJob } from "./redisKeyExpirationJob";
+import { runIdempotencyCleanupJob } from "./idempotencyCleanupJob";
+import { runNotificationHealthCheckJob } from "./notificationHealthCheckJob";
+import { runComplianceExpiryAlertJob } from "./complianceExpiryAlertJob";
+import { runProviderSessionRefreshJob } from "./providerSessionRefreshJob";
 import { startNotificationWorker } from "../workers/notificationWorker";
 
 interface JobConfig {
@@ -40,6 +59,12 @@ const JOBS: JobConfig[] = [
     // Daily at 1:00 AM - syncs internal sanction list with global lists
     schedule: process.env.SANCTION_SYNC_CRON || "0 1 * * *",
     handler: runSanctionSyncJob,
+  },
+  {
+    name: "retention-purge",
+    // Daily at 1:30 AM - enforces the configured GDPR retention period per data type
+    schedule: process.env.RETENTION_PURGE_CRON || "30 1 * * *",
+    handler: runRetentionPurgeJob,
   },
   {
     name: "cleanup",
@@ -102,6 +127,13 @@ const JOBS: JobConfig[] = [
     handler: runProviderHealthCheckJob,
   },
   {
+    name: "provider-token-watchdog",
+    // Every 5 minutes - detects expired/revoked provider credentials and dead
+    // or stale accounting OAuth tokens before they interrupt service
+    schedule: process.env.PROVIDER_TOKEN_WATCHDOG_CRON || "*/5 * * * *",
+    handler: runProviderTokenWatchdogJob,
+  },
+  {
     name: "provider-reconciliation",
     // Daily at 4:00 AM - runs automated reconciliation against provider CSV reports
     schedule: process.env.PROVIDER_RECONCILIATION_CRON || "0 4 * * *",
@@ -120,6 +152,17 @@ const JOBS: JobConfig[] = [
           // Daily at 3:00 AM by default - reindexes bloated indexes during low traffic
           schedule: INDEX_REINDEX_CRON,
           handler: runIndexReindexJob,
+        },
+      ]
+    : []),
+  ...(DB_OPTIMIZATION_JOB_ENABLED
+    ? [
+        {
+          name: "database-optimization",
+          // Daily at 3:30 AM by default - vacuum/analyze, fragment and
+          // reorganize indexes, and maintain the query plan cache
+          schedule: DB_OPTIMIZATION_CRON,
+          handler: runDatabaseOptimizationJob,
         },
       ]
     : []),
@@ -149,6 +192,45 @@ const JOBS: JobConfig[] = [
     // Daily at 3:00 AM
     schedule: process.env.DATABASE_BACKUP_VERIFY_CRON || "0 3 * * *",
     handler: runDatabaseBackupVerifyJob,
+  },
+  {
+    name: "travel-rule-audit-report",
+    // Monthly on the 2nd at 5:00 AM - generates previous month's Travel Rule coverage report
+    schedule: process.env.TRAVEL_RULE_AUDIT_REPORT_CRON || "0 5 2 * *",
+    handler: runTravelRuleAuditReportJob,
+  },
+  {
+    name: "redis-key-expiration-monitor",
+    // Every 10 minutes - monitors Redis memory/eviction and cleans up orphaned keys
+    schedule: process.env.REDIS_EXPIRY_MONITOR_CRON || "*/10 * * * *",
+    handler: runRedisKeyExpirationMonitorJob,
+  },
+  {
+    name: "idempotency-cleanup",
+    // Daily at 3:00 AM - purges expired idempotency keys in batches
+    schedule: process.env.IDEMPOTENCY_CLEANUP_CRON || "0 3 * * *",
+    handler: runIdempotencyCleanupJob,
+  },
+  {
+    name: "notification-health-check",
+    // Every 5 minutes - evaluates per-channel delivery health and escalates
+    // only on state transitions (#479)
+    schedule: process.env.NOTIFICATION_HEALTH_CHECK_CRON || "*/5 * * * *",
+    handler: runNotificationHealthCheckJob,
+  },
+  {
+    name: "compliance-expiry-alert",
+    // Daily at 08:00 – escalates compliance certifications that are lapsing
+    // or have lapsed (#481)
+    schedule: process.env.COMPLIANCE_EXPIRY_ALERT_CRON || "0 8 * * *",
+    handler: runComplianceExpiryAlertJob,
+  },
+  {
+    name: "provider-session-refresh",
+    // Every 5 minutes — proactively refreshes Airtel/Orange web sessions
+    // 1 hour before expiry so live requests never hit an expired session.
+    schedule: process.env.PROVIDER_SESSION_REFRESH_CRON || "*/5 * * * *",
+    handler: async () => { await runProviderSessionRefreshJob(); },
   },
 ];
 

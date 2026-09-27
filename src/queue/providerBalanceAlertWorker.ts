@@ -7,6 +7,7 @@ import {
   ProviderBalanceAlertJobData,
 } from "./providerBalanceAlertQueue";
 import { traceIdFromJob, childLoggerWithTrace } from "./trace";
+import { instrumentWorker } from "./queueMetricsService";
 
 let providerBalanceAlertWorker: Worker<ProviderBalanceAlertJobData> | null = null;
 
@@ -27,6 +28,8 @@ export function startProviderBalanceAlertWorker(): void {
       concurrency: 1,
     },
   );
+
+  instrumentWorker(PROVIDER_BALANCE_ALERT_QUEUE_NAME, providerBalanceAlertWorker);
 
   providerBalanceAlertWorker.on("completed", (job) => {
     console.log(`[${PROVIDER_BALANCE_ALERT_JOB_NAME}] Completed job ${job.id}`);

@@ -36,6 +36,7 @@ export class FederationService {
     if (!parsed) return null;
 
     const domain = (process.env.STELLAR_FEDERATION_DOMAIN || "proxypay.com").toLowerCase().trim();
+    if (parsed.domain.toLowerCase().trim() !== domain) {
       return null;
     }
 

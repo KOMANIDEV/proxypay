@@ -5,6 +5,7 @@ import {
   createPaymentLinkHandler,
   renderPaymentLinkLandingHandler,
   processPaymentHandler,
+  paymentLinkQrHandler,
   renderSuccessHandler,
   renderFailHandler,
 } from "../controllers/paymentLinkController";
@@ -26,6 +27,13 @@ paymentLinkRoutes.get(
   TimeoutPresets.quick,
   haltOnTimedout,
   renderPaymentLinkLandingHandler,
+);
+
+paymentLinkRoutes.get(
+  "/pay/:token/qr",
+  TimeoutPresets.quick,
+  haltOnTimedout,
+  paymentLinkQrHandler,
 );
 
 paymentLinkRoutes.post(

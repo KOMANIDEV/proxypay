@@ -180,7 +180,20 @@ export class KYCService {
   async createApplicant(applicantData: z.infer<typeof CreateApplicantSchema>): Promise<KYCApplicant> {
     try {
       const validatedData = CreateApplicantSchema.parse(applicantData);
-      
+
+      // Deduplication check: return existing record if same name + DOB already exists
+      const existing = await this.findDuplicateApplicant(
+        validatedData.first_name,
+        validatedData.last_name,
+        validatedData.dob,
+      );
+      if (existing) {
+        console.log(
+          `[KYCService] Duplicate applicant detected for ${validatedData.first_name} ${validatedData.last_name} (dob: ${validatedData.dob ?? 'n/a'}) — returning existing record ${existing.id}`,
+        );
+        return existing;
+      }
+
       const response = await this.api.post('/applicants', validatedData);
       const applicant = response.data as KYCApplicant;
 
@@ -392,6 +405,38 @@ export class KYCService {
   }
 
   // Private helper methods
+
+  private async findDuplicateApplicant(
+    firstName: string,
+    lastName: string,
+    dob?: string,
+  ): Promise<KYCApplicant | null> {
+    try {
+      const query = `
+        SELECT applicant_data
+        FROM kyc_applicants
+        WHERE applicant_data->>'first_name' = $1
+          AND applicant_data->>'last_name'  = $2
+          AND ($3::text IS NULL OR applicant_data->>'dob' = $3)
+          AND (is_duplicate IS NULL OR is_duplicate = false)
+        ORDER BY created_at ASC
+        LIMIT 1
+      `;
+
+      const result = await this.db.query(query, [firstName, lastName, dob ?? null]);
+
+      if (result.rows.length === 0) {
+        return null;
+      }
+
+      return result.rows[0].applicant_data as KYCApplicant;
+    } catch (error) {
+      console.error(
+        `[KYCService] findDuplicateApplicant error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+      return null;
+    }
+  }
 
   private async storeApplicantReference(applicant: KYCApplicant): Promise<void> {
     try {

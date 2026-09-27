@@ -1,10 +1,18 @@
 -- Migration: Travel Rule records for AML compliance
 -- Stores encrypted sender/receiver identity data for transactions >= $1000
 -- Per FATF Recommendation 16 ("Travel Rule")
+--
+-- NOTE: transaction_id is intentionally a plain column, not a FOREIGN KEY to
+-- transactions(id): since 009_partition_transactions, transactions is a
+-- partitioned table and PostgreSQL forbids FK references to it unless the
+-- referenced columns carry a UNIQUE constraint that includes the partition
+-- key (created_at). Referential integrity is enforced by the application
+-- layer. Restore an FK here if a UNIQUE (id, created_at) constraint is added
+-- to the parent and the referencing table stores transaction created_at.
 
 CREATE TABLE IF NOT EXISTS travel_rule_records (
   id                      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  transaction_id          UUID        NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+  transaction_id          UUID        NOT NULL,
   amount                  DECIMAL(20, 7) NOT NULL,
   currency                VARCHAR(10) NOT NULL DEFAULT 'USD',
 

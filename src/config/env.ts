@@ -47,6 +47,57 @@ export const env = cleanEnv(process.env, {
     default: 5,
     desc: "Maximum active queries allowed in the database before the automatic index reindex job is skipped",
   }),
+  INDEX_BLOAT_MONITOR_ENABLED: bool({
+    default: true,
+    desc: "Whether the index bloat monitoring job should run",
+  }),
+  INDEX_BLOAT_MONITOR_CRON: str({
+    default: "0 * * * *",
+    desc: "Cron schedule for the index bloat monitoring job",
+    example: "0 * * * *",
+  }),
+  INDEX_BLOAT_MIN_SIZE_MB: num({
+    default: 10,
+    desc: "Minimum size in MB for an index to be evaluated for bloat",
+  }),
+  INDEX_BLOAT_ALERT_THRESHOLD_PCT: num({
+    default: 30,
+    desc: "Bloat percentage that triggers an alert",
+  }),
+  DB_OPTIMIZATION_JOB_ENABLED: bool({
+    default: true,
+    desc: "Whether the automatic database optimization job should run",
+  }),
+  DB_OPTIMIZATION_CRON: str({
+    default: "30 3 * * *",
+    desc: "Cron schedule for the automatic database optimization job",
+    example: "30 3 * * *",
+  }),
+  DB_OPTIMIZATION_MIN_INDEX_SIZE_MB: num({
+    default: 1,
+    desc: "Minimum size in MB for an index to be measured for fragmentation",
+  }),
+  DB_OPTIMIZATION_REBUILD_THRESHOLD_PCT: num({
+    default: 40,
+    desc: "Fragmentation percentage at which an index is automatically reorganized",
+  }),
+  DB_OPTIMIZATION_REINDEX_COOLDOWN_HOURS: num({
+    default: 24,
+    desc: "Minimum hours before a reorganized index is eligible again",
+  }),
+  DB_OPTIMIZATION_PLAN_REGRESSION_RATIO: num({
+    default: 1.5,
+    desc: "Cost ratio over the cached plan that marks a query plan as regressed",
+  }),
+  LEDGER_INTEGRITY_JOB_ENABLED: bool({
+    default: true,
+    desc: "Whether the ledger entry integrity validation job should run",
+  }),
+  LEDGER_INTEGRITY_CRON: str({
+    default: "0 7 * * *",
+    desc: "Cron schedule for the ledger entry integrity validation job",
+    example: "0 7 * * *",
+  }),
   STELLAR_ISSUER_SECRET: str({
     desc: "Stellar secret key for the issuer account",
     example: "S...",
@@ -132,7 +183,67 @@ export const env = cleanEnv(process.env, {
   }),
   XERO_REDIRECT_URI: str({
     default: "http://localhost:3000/api/accounting/xero/callback",
-    desc: "Xero OAuth 2.0 Redirect URI",
+    desc: "Xero Online OAuth 2.0 Redirect URI",
+  }),
+  DB_POOL_MAX: num({
+    default: 1000,
+    desc: "Maximum number of connections in the primary read connection pool",
+    example: "1000",
+  }),
+  DB_POOL_MIN: num({
+    default: 0,
+    desc: "Minimum number of connections kept in the primary read connection pool",
+    example: "0",
+  }),
+  DB_POOL_IDLE_TIMEOUT_MS: num({
+    default: 30000,
+    desc: "Idle timeout in milliseconds before an idle read-pool connection is closed",
+    example: "30000",
+  }),
+  DB_POOL_CONNECTION_TIMEOUT_MS: num({
+    default: 500,
+    desc: "Maximum time in milliseconds to wait for a read-pool connection before erroring",
+    example: "500",
+  }),
+  DB_WRITE_POOL_MAX: num({
+    default: 1000,
+    desc: "Maximum number of connections in the dedicated write connection pool",
+    example: "1000",
+  }),
+  DB_WRITE_POOL_MIN: num({
+    default: 0,
+    desc: "Minimum number of connections kept in the dedicated write connection pool",
+    example: "0",
+  }),
+  DB_WRITE_POOL_IDLE_TIMEOUT_MS: num({
+    default: 30000,
+    desc: "Idle timeout in milliseconds before an idle write-pool connection is closed",
+    example: "30000",
+  }),
+  DB_WRITE_POOL_CONNECTION_TIMEOUT_MS: num({
+    default: 500,
+    desc: "Maximum time in milliseconds to wait for a write-pool connection before erroring",
+    example: "500",
+  }),
+  DB_REPLICA_POOL_MAX: num({
+    default: 100,
+    desc: "Maximum number of connections per individual read replica pool",
+    example: "100",
+  }),
+  DB_REPLICA_POOL_IDLE_TIMEOUT_MS: num({
+    default: 30000,
+    desc: "Idle timeout in milliseconds before an idle replica-pool connection is closed",
+    example: "30000",
+  }),
+  DB_REPLICA_POOL_CONNECTION_TIMEOUT_MS: num({
+    default: 500,
+    desc: "Maximum time in milliseconds to wait for a replica-pool connection before erroring",
+    example: "500",
+  }),
+  DB_POOL_MONITOR_INTERVAL_MS: num({
+    default: 5000,
+    desc: "How often (ms) pool utilization monitoring samples pool gauges",
+    example: "5000",
   }),
 });
 
@@ -156,10 +267,34 @@ export const {
   INDEX_REINDEX_MIN_SIZE_MB,
   INDEX_REINDEX_MAX_SCAN_COUNT,
   INDEX_REINDEX_MAX_ACTIVE_CONNECTIONS,
+  INDEX_BLOAT_MONITOR_ENABLED,
+  INDEX_BLOAT_MONITOR_CRON,
+  INDEX_BLOAT_MIN_SIZE_MB,
+  INDEX_BLOAT_ALERT_THRESHOLD_PCT,
+  DB_OPTIMIZATION_JOB_ENABLED,
+  DB_OPTIMIZATION_CRON,
+  DB_OPTIMIZATION_MIN_INDEX_SIZE_MB,
+  DB_OPTIMIZATION_REBUILD_THRESHOLD_PCT,
+  DB_OPTIMIZATION_REINDEX_COOLDOWN_HOURS,
+  DB_OPTIMIZATION_PLAN_REGRESSION_RATIO,
+  LEDGER_INTEGRITY_JOB_ENABLED,
+  LEDGER_INTEGRITY_CRON,
   QUICKBOOKS_CLIENT_ID,
   QUICKBOOKS_CLIENT_SECRET,
   QUICKBOOKS_REDIRECT_URI,
   XERO_CLIENT_ID,
   XERO_CLIENT_SECRET,
   XERO_REDIRECT_URI,
+  DB_POOL_MAX,
+  DB_POOL_MIN,
+  DB_POOL_IDLE_TIMEOUT_MS,
+  DB_POOL_CONNECTION_TIMEOUT_MS,
+  DB_WRITE_POOL_MAX,
+  DB_WRITE_POOL_MIN,
+  DB_WRITE_POOL_IDLE_TIMEOUT_MS,
+  DB_WRITE_POOL_CONNECTION_TIMEOUT_MS,
+  DB_REPLICA_POOL_MAX,
+  DB_REPLICA_POOL_IDLE_TIMEOUT_MS,
+  DB_REPLICA_POOL_CONNECTION_TIMEOUT_MS,
+  DB_POOL_MONITOR_INTERVAL_MS,
 } = env;
