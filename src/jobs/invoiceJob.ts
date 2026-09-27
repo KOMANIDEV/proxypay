@@ -3,6 +3,7 @@ import { TransactionModel } from '../models/transaction';
 import { UserModel } from '../models/users';
 import { EmailService } from '../services/email';
 import { InvoiceService } from '../services/invoiceService';
+import { InvoiceModel, InvoiceStatus } from '../models/invoice';
 import logger from '../utils/logger';
 
 export async function runMonthlyInvoiceJob() {
@@ -10,6 +11,7 @@ export async function runMonthlyInvoiceJob() {
   const userModel = new UserModel();
   const emailService = new EmailService();
   const invoiceService = new InvoiceService();
+  const invoiceModel = new InvoiceModel();
 
   // Determine previous month
   const now = new Date();
@@ -21,9 +23,12 @@ export async function runMonthlyInvoiceJob() {
 
   logger.info(`Starting monthly invoice job for ${month}/${year}`);
 
+  let processedCount = 0;
+  let successCount = 0;
+  let failureCount = 0;
+
   try {
     // 1. Fetch "Business Clients" (kyc_level = 'full' and email NOT NULL)
-    // We use a direct query here to find candidates
     const businessUsersResult = await pool.query(`
       SELECT id FROM users 
       WHERE kyc_level = 'full' 
@@ -36,12 +41,23 @@ export async function runMonthlyInvoiceJob() {
 
     for (const userId of userIds) {
       try {
+        processedCount++;
+
         const user = await userModel.findById(userId);
-        if (!user || !user.email) continue;
+        if (!user || !user.email) {
+          logger.debug(`Skipping user ${userId}: missing user or email`);
+          continue;
+        }
+
+        // Check if invoice already exists for this period
+        const existingInvoice = await invoiceModel.findByUserAndPeriod(userId, month, year);
+        if (existingInvoice) {
+          logger.debug(`Invoice already exists for user ${userId} in ${month}/${year}`);
+          continue;
+        }
 
         // 2. Fetch completed transactions for the previous month
         const transactions = await transactionModel.findCompletedByUserSince(userId, startDate);
-        // Filter those that are BEFORE endDate (since findCompletedByUserSince only has 'since')
         const monthTransactions = transactions.filter(tx => tx.createdAt <= endDate);
 
         if (monthTransactions.length === 0) {
@@ -49,36 +65,61 @@ export async function runMonthlyInvoiceJob() {
           continue;
         }
 
-        // 3. Generate PDF
-        const pdfBuffer = await invoiceService.generateMonthlyInvoicePDF(user, month, year, monthTransactions);
+        // 3. Generate and store invoice
+        const invoice = await invoiceService.generateAndStoreInvoice(
+          user,
+          month,
+          year,
+          monthTransactions
+        );
 
         // 4. Send Email
-        await emailService.sendEmail({
-          to: user.email,
-          templateId: process.env.SENDGRID_INVOICE_TEMPLATE_ID || 'd-generic-invoice-template',
-          dynamicTemplateData: {
-            month: new Date(year, month - 1).toLocaleString('default', { month: 'long' }),
-            year: year,
-            name: user.phoneNumber, // We don't have first_name in User model yet
-          },
-          attachments: [
-            {
-              content: pdfBuffer.toString('base64'),
-              filename: `Invoice_${month}_${year}.pdf`,
-              type: 'application/pdf',
-              disposition: 'attachment',
-            }
-          ]
-        });
+        try {
+          await emailService.sendEmail({
+            to: user.email,
+            templateId: process.env.SENDGRID_INVOICE_TEMPLATE_ID || 'd-generic-invoice-template',
+            dynamicTemplateData: {
+              month: new Date(year, month - 1).toLocaleString('default', { month: 'long' }),
+              year: year,
+              name: user.phoneNumber || 'User',
+              invoiceNumber: invoice.invoiceNumber,
+            },
+          });
 
-        logger.info(`Sent monthly invoice to user ${userId} (${user.email})`);
+          // Mark invoice as sent
+          await invoiceService.markInvoiceAsSent(
+            invoice.id,
+            `sent-${Date.now()}`
+          );
+
+          logger.info(
+            { invoiceId: invoice.id, userId: user.id },
+            `Invoice sent to ${user.email}`
+          );
+          successCount++;
+        } catch (emailErr) {
+          await invoiceService.markInvoiceAsFailed(
+            invoice.id,
+            String(emailErr instanceof Error ? emailErr.message : emailErr)
+          );
+          logger.warn(
+            { error: emailErr, invoiceId: invoice.id },
+            `Failed to send invoice email to ${user.email}`
+          );
+          failureCount++;
+        }
       } catch (err) {
-        logger.error(err, `Failed to process invoice for user ${userId}`);
+        logger.error({ error: err, userId }, `Failed to process invoice for user ${userId}`);
+        failureCount++;
       }
     }
 
-    logger.info('Monthly invoice job completed successfully');
+    logger.info(
+      { processed: processedCount, success: successCount, failed: failureCount },
+      'Monthly invoice job completed'
+    );
   } catch (err) {
-    logger.error(err, 'Monthly invoice job failed');
+    logger.error({ error: err }, 'Monthly invoice job failed');
+    throw err;
   }
 }

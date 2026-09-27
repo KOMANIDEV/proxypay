@@ -406,6 +406,64 @@ export class AirtelService {
   }
 
   /**
+   * Returns a snapshot of the current web session's expiry timestamp (ms since
+   * epoch) and the active operation mode.  Returns `null` when no session is
+   * cached or the provider is not in web/session-based mode.
+   *
+   * Used by the proactive session-refresh job to determine how much time
+   * remains before the session expires without having to trigger a real request.
+   */
+  getSessionInfo(): { expiresAt: number; mode: AirtelMode } | null {
+    if (this.mode !== "web") {
+      return null;
+    }
+    if (!this.session) {
+      return null;
+    }
+    return { expiresAt: this.session.expiresAt, mode: this.mode };
+  }
+
+  /**
+   * Proactively refreshes the web session.  Attempts a session refresh first;
+   * falls back to a full re-login on failure.  Does nothing when the provider
+   * is not in web mode.
+   *
+   * Called by the background session-refresh job when the session is
+   * approaching its expiry window (default: 1 hour before expiry).
+   */
+  async proactivelyRefreshSession(): Promise<{
+    success: boolean;
+    reloggedIn?: boolean;
+    error?: unknown;
+  }> {
+    if (this.mode !== "web") {
+      return { success: true };
+    }
+
+    try {
+      const current = this.session ?? this.loadSession();
+      if (current && !this.isExpired(current)) {
+        // Attempt a lightweight session refresh first.
+        await this.refreshSession(current);
+        return { success: true, reloggedIn: false };
+      }
+
+      // No live session — perform a full login.
+      await this.ensureSession(true);
+      return { success: true, reloggedIn: true };
+    } catch (error) {
+      // Refresh failed — attempt full re-login as fallback.
+      try {
+        this.session = null;
+        await this.ensureSession(true);
+        return { success: true, reloggedIn: true };
+      } catch (loginError) {
+        return { success: false, reloggedIn: true, error: loginError };
+      }
+    }
+  }
+
+  /**
    * Probes whether the configured credentials/session are still accepted by
    * Airtel. In direct mode this fetches a fresh OAuth token; in web mode it
    * ensures a valid session (re-logging in if needed); proxy mode is skipped

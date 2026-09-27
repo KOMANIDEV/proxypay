@@ -41,6 +41,7 @@ import { reportsRoutes } from "./routes/reports";
 import feesRoutes from "./routes/fees";
 import { createKYCRoutes } from "./routes/kycRoutes";
 import { adminRoutes } from "./routes/admin";
+import invoiceRoutes from "./routes/invoices";
 import webhookCircuitBreakerRoutes from "./routes/webhookCircuitBreaker";
 import kycTierUpgradeRoutes from "./routes/kycTierUpgradeRoutes";
 import { userRoutes } from "./routes/users";
@@ -519,6 +520,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/preferences", settingsRoutes);
 app.use("/api/statements", statementsRoutes);
 app.use("/api/subscriptions", subscriptionsRoutes);
+app.use("/api/invoices", invoiceRoutes);
 app.use("/", paymentLinkRoutes);
 
 // GDPR
