@@ -475,6 +475,22 @@ async function processTransaction(
       if (!mobileMoneyResult.success) {
         throw new Error(getProviderFailureMessage(mobileMoneyResult));
       }
+
+      // Issue #643 – persist the provider-issued reference so reconciliation can
+      // map provider confirmations back to ProxyPay transactions bidirectionally.
+      if (mobileMoneyResult.providerReference) {
+        await transactionModel.updateProviderReference(
+          transactionId,
+          mobileMoneyResult.providerReference,
+        ).catch((err: unknown) =>
+          log.warn({ err }, "Failed to store provider reference after payout"),
+        );
+        log.info(
+          { providerReference: mobileMoneyResult.providerReference },
+          "Provider reference stored for withdrawal",
+        );
+      }
+
       await updateProgress(transactionId, 90);
 
       await transactionModel.updateStatus(

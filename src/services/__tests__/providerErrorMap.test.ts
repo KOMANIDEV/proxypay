@@ -72,4 +72,70 @@ describe("ProviderErrorMapService", () => {
       expect(all.some((m) => m.provider === "orange")).toBe(true);
     });
   });
+
+  // #641 - locale fallback and translation gap detection
+  describe("locale fallback", () => {
+    beforeEach(() => {
+      providerErrorMapService.clearTranslationGaps();
+    });
+
+    it("falls back to English when the locale translation is missing", () => {
+      const error = providerErrorMapService.getLocalizedError("mtn", "4001", "sw");
+
+      expect(error.locale).toBe("sw");
+      expect(error.fallbackUsed).toBe(true);
+      expect(error.fallbackLocale).toBe("en");
+      expect(error.message).toBe(
+        "Payment provider authentication failed. Please try again later.",
+      );
+    });
+
+    it("records a translation gap for the missing locale", () => {
+      providerErrorMapService.getLocalizedError("mtn", "4002", "sw");
+
+      expect(providerErrorMapService.getTranslationGaps()).toEqual([
+        expect.objectContaining({
+          locale: "sw",
+          code: "INSUFFICIENT_FUNDS",
+          fallbackLocale: "en",
+        }),
+      ]);
+    });
+
+    it("deduplicates repeated runtime gaps", () => {
+      providerErrorMapService.getLocalizedError("mtn", "4001", "sw");
+      providerErrorMapService.getLocalizedError("mtn", "4001", "sw");
+
+      expect(providerErrorMapService.getTranslationGaps()).toHaveLength(1);
+    });
+
+    it("does not mark fallback when the translation exists", () => {
+      const error = providerErrorMapService.getLocalizedError("mtn", "4001", "fr");
+
+      expect(error.fallbackUsed).toBe(false);
+      expect(error.locale).toBe("fr");
+      expect(providerErrorMapService.getTranslationGaps()).toEqual([]);
+    });
+
+    it("normalizes regional locale codes", () => {
+      const error = providerErrorMapService.getLocalizedError("mtn", "4001", "fr-CM");
+
+      expect(error.locale).toBe("fr");
+      expect(error.fallbackUsed).toBe(false);
+    });
+
+    it("reports static catalog gaps per locale", () => {
+      const gaps = providerErrorMapService.detectTranslationGaps();
+
+      expect(gaps.length).toBeGreaterThan(0);
+      expect(gaps.every((gap) => gap.locale !== "en")).toBe(true);
+      expect(gaps.every((gap) => gap.fallbackLocale === "en")).toBe(true);
+    });
+
+    it("lists locales that have provider error catalogs", () => {
+      expect(providerErrorMapService.getSupportedLocales()).toEqual(
+        expect.arrayContaining(["en", "fr"]),
+      );
+    });
+  });
 });

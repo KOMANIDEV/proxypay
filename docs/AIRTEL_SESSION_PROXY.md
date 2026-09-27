@@ -235,6 +235,34 @@ for (attempt = 1; attempt <= maxAttempts; attempt++) {
 }
 ```
 
+### Concurrent Request Handling
+
+WEB mode shares a single session (cookies + CSRF token) across every
+operation. Issuing several requests at once interleaves cookie/CSRF mutations
+and corrupts the session, so all session-backed requests are funnelled through
+a per-session request queue
+(`src/services/mobilemoney/sessionRequestQueue.ts`):
+
+- **Request queueing** — concurrent callers are queued FIFO per session.
+- **Serialization lock** — only one session request executes at a time.
+- **Session timeout while queued** — a queued request bound to a session that
+  expires while waiting is rejected with `SessionTimeoutError`; the provider
+  then clears the cached session, re-authenticates and retries the request once.
+- **Back-pressure** — queues are bounded (`maxQueueDepth`, default 100);
+  overflowing requests are rejected with `SessionQueueOverflowError`.
+
+Requests for different sessions/providers are unaffected and run concurrently.
+
+```typescript
+const queue = new SessionRequestQueue({ maxQueueDepth: 100 });
+
+await queue.enqueue(
+  `airtel:${mode}:${webBaseUrl}`,
+  () => sendSessionRequest(request),
+  { sessionExpiresAt: session?.expiresAt, operation: "payment" },
+);
+```
+
 ---
 
 ## API Contract
@@ -577,4 +605,3 @@ Session caching in WEB mode significantly reduces latency for consecutive operat
 - [Orange Money Provider](./docs/ORANGE_INTEGRATION.md) - Similar multi-mode implementation
 - [Mobile Money Architecture](./docs/ARCHITECTURE.md) - Provider pattern design
 - [PACT Contract Tests](./tests/pact/airtel.pact.test.ts) - API contract validation
-

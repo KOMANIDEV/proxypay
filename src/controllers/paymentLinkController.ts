@@ -30,6 +30,7 @@ export async function createPaymentLinkHandler(
       redirectSuccessUrl,
       redirectFailUrl,
       expiresIn, // in seconds
+      timezone,  // optional IANA timezone name, e.g. "Africa/Lagos"
     } = req.body;
 
     // Validate inputs
@@ -49,6 +50,24 @@ export async function createPaymentLinkHandler(
         });
     }
 
+    // Issue #644 – validate the timezone string early so the merchant gets a
+    // clear error rather than a silent miscalculation.
+    if (timezone !== undefined && timezone !== null) {
+      if (typeof timezone !== "string" || timezone.trim() === "") {
+        return res.status(400).json({
+          error: "timezone must be a non-empty IANA timezone string (e.g. \"Africa/Lagos\")",
+        });
+      }
+      // Verify the timezone is recognised by the runtime.
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: timezone });
+      } catch {
+        return res.status(400).json({
+          error: `Unknown timezone: "${timezone}". Use a valid IANA timezone name.`,
+        });
+      }
+    }
+
     // Get active merchant ID from the authenticated session
     const merchantId = (req as any).user?.id || req.body.merchantId;
     if (!merchantId) {
@@ -58,9 +77,14 @@ export async function createPaymentLinkHandler(
     // Generate unique random token
     const token = crypto.randomBytes(16).toString("hex");
 
-    const expiresAt = expiresIn
-      ? new Date(Date.now() + Number(expiresIn) * 1000)
-      : undefined;
+    // Issue #644 – calculate expiration in the merchant's timezone when provided.
+    // `expiresIn` is an offset in seconds from "now"; we compute the UTC
+    // timestamp that corresponds to that many seconds later, but also record the
+    // timezone so displays can render it in the correct local time.
+    let expiresAt: Date | undefined;
+    if (expiresIn) {
+      expiresAt = new Date(Date.now() + Number(expiresIn) * 1000);
+    }
 
     const link = await paymentLinkModel.create({
       merchantId,
@@ -73,6 +97,7 @@ export async function createPaymentLinkHandler(
       redirectSuccessUrl,
       redirectFailUrl,
       expiresAt,
+      timezone: timezone ?? undefined,
     });
 
     const protocol = req.protocol;

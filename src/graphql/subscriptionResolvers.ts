@@ -2,6 +2,7 @@ import { withFilter } from "graphql-subscriptions";
 import {
   SubscriptionChannels,
   transactionChannel,
+  connectionLimitManager,
   type TransactionCreatedPayload,
   type TransactionUpdatedPayload,
   type DisputeCreatedPayload,
@@ -91,6 +92,37 @@ function formatBulkImportJobPayload(payload: BulkImportJobUpdatedPayload) {
 // Subscription resolvers factory
 // ---------------------------------------------------------------------------
 
+/**
+ * Wraps a raw AsyncIterableIterator so that the per-user connection slot is
+ * released automatically when the subscription ends (either via return() or
+ * throw()).  This ensures the count is always decremented even if the client
+ * disconnects without an explicit unsubscribe.
+ */
+function withConnectionRelease<T>(
+  iterator: AsyncIterableIterator<T>,
+  release: () => void,
+): AsyncIterableIterator<T> {
+  return {
+    [Symbol.asyncIterator]() { return this; },
+    async next() {
+      try {
+        return await iterator.next();
+      } catch (err) {
+        release();
+        throw err;
+      }
+    },
+    async return(value?: any) {
+      release();
+      return iterator.return ? iterator.return(value) : { value, done: true };
+    },
+    async throw(err?: any) {
+      release();
+      return iterator.throw ? iterator.throw(err) : Promise.reject(err);
+    },
+  };
+}
+
 export function createSubscriptionResolvers(pubsub: TypedPubSub) {
   return {
     Subscription: {
@@ -103,11 +135,14 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
           if (!context?.auth?.authenticated) {
             throw new Error("UNAUTHENTICATED: valid authToken required");
           }
+          // Enforce per-user connection limit (#627)
+          const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
           // Subscribe to the per-transaction channel
           const channel = args.id
             ? transactionChannel(args.id)
             : SubscriptionChannels.TRANSACTION_UPDATED;
-          return pubsub.asyncIterator<TransactionUpdatedPayload>(channel);
+          const iterator = pubsub.asyncIterator<TransactionUpdatedPayload>(channel);
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionUpdatedPayload) =>
           formatTransactionPayload(payload),
@@ -119,9 +154,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
           if (!context?.auth?.authenticated) {
             throw new Error("UNAUTHENTICATED: valid authToken required");
           }
-          return pubsub.asyncIterator<TransactionCreatedPayload>(
+          const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+          const iterator = pubsub.asyncIterator<TransactionCreatedPayload>(
             SubscriptionChannels.TRANSACTION_CREATED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionCreatedPayload) =>
           formatTransactionPayload(payload),
@@ -133,9 +170,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
           if (!context?.auth?.authenticated) {
             throw new Error("UNAUTHENTICATED: valid authToken required");
           }
-          return pubsub.asyncIterator<TransactionUpdatedPayload>(
+          const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+          const iterator = pubsub.asyncIterator<TransactionUpdatedPayload>(
             SubscriptionChannels.TRANSACTION_COMPLETED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionUpdatedPayload) =>
           formatTransactionPayload(payload),
@@ -147,9 +186,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
           if (!context?.auth?.authenticated) {
             throw new Error("UNAUTHENTICATED: valid authToken required");
           }
-          return pubsub.asyncIterator<TransactionUpdatedPayload>(
+          const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+          const iterator = pubsub.asyncIterator<TransactionUpdatedPayload>(
             SubscriptionChannels.TRANSACTION_FAILED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: TransactionUpdatedPayload) =>
           formatTransactionPayload(payload),
@@ -161,9 +202,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
           if (!context?.auth?.authenticated) {
             throw new Error("UNAUTHENTICATED: valid authToken required");
           }
-          return pubsub.asyncIterator<DisputeCreatedPayload>(
+          const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+          const iterator = pubsub.asyncIterator<DisputeCreatedPayload>(
             SubscriptionChannels.DISPUTE_CREATED,
           );
+          return withConnectionRelease(iterator, release);
         },
         resolve: (payload: DisputeCreatedPayload) =>
           formatDisputePayload(payload),
@@ -176,9 +219,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
             if (!context?.auth?.authenticated) {
               throw new Error("UNAUTHENTICATED: valid authToken required");
             }
-            return pubsub.asyncIterator<DisputeUpdatedPayload>(
+            const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+            const iterator = pubsub.asyncIterator<DisputeUpdatedPayload>(
               SubscriptionChannels.DISPUTE_UPDATED,
             );
+            return withConnectionRelease(iterator, release);
           },
           (payload: any, variables: any) => {
             if (!variables?.id) return true;
@@ -196,9 +241,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
             if (!context?.auth?.authenticated) {
               throw new Error("UNAUTHENTICATED: valid authToken required");
             }
-            return pubsub.asyncIterator<DisputeNoteAddedPayload>(
+            const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+            const iterator = pubsub.asyncIterator<DisputeNoteAddedPayload>(
               SubscriptionChannels.DISPUTE_NOTE_ADDED,
             );
+            return withConnectionRelease(iterator, release);
           },
           (payload: any, variables: any) => {
             if (!variables?.disputeId) return true;
@@ -216,9 +263,11 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
             if (!context?.auth?.authenticated) {
               throw new Error("UNAUTHENTICATED: valid authToken required");
             }
-            return pubsub.asyncIterator<BulkImportJobUpdatedPayload>(
+            const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
+            const iterator = pubsub.asyncIterator<BulkImportJobUpdatedPayload>(
               SubscriptionChannels.BULK_IMPORT_JOB_UPDATED,
             );
+            return withConnectionRelease(iterator, release);
           },
           (payload: any, variables: any) =>
             payload?.jobId === variables.jobId,

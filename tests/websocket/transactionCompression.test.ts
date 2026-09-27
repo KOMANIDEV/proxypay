@@ -1,6 +1,10 @@
 import {
   TransactionCompressionService,
   FieldSubscription,
+  applyDelta,
+  validateDelta,
+  TransactionSnapshot,
+  TransactionDelta,
 } from "../../src/websocket/transactionCompression";
 
 describe("TransactionCompressionService (#373)", () => {
@@ -340,6 +344,132 @@ describe("TransactionCompressionService (#373)", () => {
 
       expect(service.getSnapshot("tx-1")).toBeNull();
       expect(service.getBandwidthMetrics().totalPayloadsSent).toBe(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Delta validation (#639)
+  // ---------------------------------------------------------------------------
+
+  describe("delta validation", () => {
+    const base: TransactionSnapshot = {
+      id: "tx-1",
+      status: "pending",
+      amount: "100",
+      provider: "mtn",
+    };
+
+    const target: TransactionSnapshot = {
+      id: "tx-1",
+      status: "completed",
+      amount: "100",
+    };
+
+    const delta: TransactionDelta = {
+      id: "tx-1",
+      changedFields: { status: "completed" },
+      removedFields: ["provider"],
+      sequenceNumber: 1,
+      timestamp: Date.now(),
+    };
+
+    it("applyDelta reconstructs the target snapshot", () => {
+      expect(applyDelta(base, delta)).toEqual(target);
+    });
+
+    it("validateDelta confirms base + delta === target", () => {
+      const result = validateDelta(base, target, delta);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.reconstructed).toEqual(target);
+    });
+
+    it("validateDelta reports field mismatches", () => {
+      const corrupted: TransactionDelta = {
+        ...delta,
+        changedFields: { status: "failed" },
+      };
+
+      const result = validateDelta(base, target, corrupted);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain(
+        "field mismatch after applying delta: status",
+      );
+    });
+
+    it("validateDelta reports fields that were not removed", () => {
+      const result = validateDelta(base, target, {
+        ...delta,
+        removedFields: [],
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => e.includes("provider"))).toBe(true);
+    });
+
+    it("validateDelta reports missing fields", () => {
+      const result = validateDelta(base, target, {
+        ...delta,
+        changedFields: {},
+        removedFields: [],
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain(
+        "field mismatch after applying delta: status",
+      );
+    });
+
+    it("round-trips a computed delta", () => {
+      const previous = service.getSnapshot("tx-round-trip") ?? {
+        id: "tx-round-trip",
+        status: "pending",
+        amount: "50",
+      };
+
+      service.setSnapshot("tx-round-trip", previous);
+      const next: TransactionSnapshot = {
+        ...previous,
+        status: "completed",
+        amount: "75",
+      };
+      const computed = service.computeDelta("tx-round-trip", next);
+
+      expect(computed).not.toBeNull();
+      const result = validateDelta(previous, next, computed!);
+      expect(result.valid).toBe(true);
+    });
+
+    it("logs and counts validation failures", () => {
+      const logger = require("../../src/utils/logger").default;
+      const errorSpy = jest.spyOn(logger, "error").mockImplementation();
+
+      const result = service.validateDelta("tx-1", base, target, {
+        ...delta,
+        changedFields: { status: "failed" },
+      });
+
+      expect(result.valid).toBe(false);
+      expect(service.getDeltaValidationFailureCount()).toBe(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ transactionId: "tx-1" }),
+        "Transaction delta validation failed",
+      );
+
+      errorSpy.mockRestore();
+    });
+
+    it("resets the validation failure count", () => {
+      service.validateDelta("tx-1", base, target, {
+        ...delta,
+        changedFields: { status: "failed" },
+      });
+      expect(service.getDeltaValidationFailureCount()).toBe(1);
+
+      service.reset();
+      expect(service.getDeltaValidationFailureCount()).toBe(0);
     });
   });
 });

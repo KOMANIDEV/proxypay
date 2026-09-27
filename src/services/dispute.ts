@@ -31,6 +31,7 @@ import {
   DisputeStatus,
   DisputePriority,
   ReportFilter,
+  AgentWorkload,
 } from "../models/dispute";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 import logger from "../utils/logger";
@@ -659,5 +660,52 @@ export class DisputeService {
       grouped[cat].push(ev);
     }
     return grouped;
+  }
+
+  // ---------------------------------------------------------------------------
+  // #636 Dispute Workload Balancing
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Automatically assign a dispute to the agent with the lowest active
+   * dispute workload from a provided list of available agents.
+   *
+   * Falls back to the first agent in the list when no workload data exists
+   * (e.g., all agents are new or have no open disputes).
+   *
+   * @param disputeId        UUID of the dispute to assign.
+   * @param availableAgents  Non-empty list of candidate agent identifiers.
+   */
+  async autoAssignToLeastLoadedAgent(
+    disputeId: string,
+    availableAgents: string[],
+  ): Promise<Dispute> {
+    if (availableAgents.length === 0) {
+      throw new Error('availableAgents must not be empty');
+    }
+
+    const dispute = await this.disputeModel.findById(disputeId);
+    if (!dispute) {
+      throw new Error(`Dispute ${disputeId} not found`);
+    }
+
+    if (TERMINAL_STATUSES.includes(dispute.status)) {
+      throw new Error(`Cannot assign a ${dispute.status} dispute`);
+    }
+
+    const bestAgent = await this.disputeModel.findLeastLoadedAgent(availableAgents);
+
+    // Fallback: no workload data at all — use first agent in the list
+    const agentToAssign = bestAgent ?? availableAgents[0];
+
+    return this.assignToAgent(disputeId, agentToAssign);
+  }
+
+  /**
+   * Return current workload metrics for all agents with active disputes.
+   * Useful for monitoring dashboards and operational tooling.
+   */
+  async getWorkloadMetrics(): Promise<AgentWorkload[]> {
+    return this.disputeModel.getAgentWorkload();
   }
 }

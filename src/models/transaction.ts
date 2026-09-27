@@ -9,6 +9,7 @@ import {
   transactionChannel,
   type TransactionUpdatedPayload,
 } from "../graphql/subscriptions";
+import { z } from "zod";
 
 export type AssetType = "native" | "credit_alphanum4" | "credit_alphanum12";
 
@@ -44,6 +45,15 @@ export interface TransactionListFilters {
   tags?: string[];
   referenceNumber?: string;
   statuses?: TransactionStatus[];
+  // #480 – Advanced filtering
+  currency?: string;
+  type?: string;
+  /** Inclusive range on any filterable temporal field (createdAt/updatedAt/completedAt). */
+  dateField?: "createdAt" | "updatedAt";
+  startDateTime?: string;
+  endDateTime?: string;
+  /** Nested AND/OR/NOT filter tree. Takes precedence over the flat fields above. */
+  filter?: FilterNode;
 }
 
 export interface TransactionCursorOptions {
@@ -63,9 +73,96 @@ interface DecodedTransactionCursor {
   id: string;
 }
 
+/**
+ * Whitelist for #480 range filtering on timestamp columns. `transactions` has
+ * no `completed_at`, so completion-time range filtering is not offered rather
+ * than failing at execution time.
+ */
+const DATE_FILTER_COLUMNS: Record<"createdAt" | "updatedAt", string> = {
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+};
+
 const MAX_TAGS = 10;
 const TAG_REGEX = /^[a-z0-9-]+$/;
 const MAX_METADATA_BYTES = 10240;
+
+// ── Metadata schema (#645) ────────────────────────────────────────────────────
+//
+// Transaction metadata must conform to this Zod schema to prevent arbitrary
+// JSON structures from breaking reporting and analytics pipelines.
+//
+// All top-level keys are optional so callers can supply partial metadata.
+// Unknown keys are stripped (`.strip()`) to guard against future field clashes.
+//
+// If you need to add a new first-class metadata field:
+//   1. Add the field definition here (keep it optional).
+//   2. Update the OpenAPI schema in src/openapi/schemas/transactions.ts.
+//   3. Add a test in src/stellar/__tests__/trustlines.test.ts (or relevant file).
+
+export const metadataSchema = z
+  .object({
+    /** Short human-readable note attached to the transaction. */
+    note: z.string().max(500).optional(),
+    /** Merchant-assigned order or invoice identifier. */
+    orderId: z.string().max(128).optional(),
+    /** Customer-facing reference shown on receipts. */
+    customerRef: z.string().max(128).optional(),
+    /** ISO 4217 source currency code (e.g. "XAF", "KES"). */
+    sourceCurrency: z.string().length(3).optional(),
+    /** ISO 4217 destination currency code. */
+    destinationCurrency: z.string().length(3).optional(),
+    /** Sender display name for Travel Rule / receipt purposes. */
+    senderName: z.string().max(256).optional(),
+    /** Sender physical address. */
+    senderAddress: z.string().max(512).optional(),
+    /** Sender date of birth (ISO 8601 date string). */
+    senderDob: z.string().optional(),
+    /** Sender national ID / passport number. */
+    senderIdNumber: z.string().max(64).optional(),
+    /** Receiver display name. */
+    receiverName: z.string().max(256).optional(),
+    /** Receiver physical address. */
+    receiverAddress: z.string().max(512).optional(),
+    /** Arbitrary merchant-defined tags (max 10 entries, each ≤ 64 chars). */
+    tags: z.array(z.string().max(64)).max(10).optional(),
+    /**
+     * Provider-specific diagnostic data written by the worker.
+     * Allowed to carry arbitrary keys so provider integrations can store
+     * whatever they need without schema changes.
+     */
+    stellar: z
+      .object({
+        transactionHash: z.string().optional(),
+        submittedAt: z.string().optional(),
+        feeBumps: z.array(z.unknown()).optional(),
+      })
+      .passthrough()
+      .optional(),
+    /** Internal reconciliation markers (written by the reconciliation job). */
+    reconciliation: z.record(z.string(), z.unknown()).optional(),
+  })
+  .passthrough(); // allow additional keys for forward compatibility
+
+/**
+ * Validate and coerce a raw metadata object against {@link metadataSchema}.
+ *
+ * @throws {Error} with a human-readable Zod error message when the schema
+ *   check fails, so the caller can surface a 400 to the client.
+ */
+export function validateMetadataSchema(
+  metadata: unknown,
+): Record<string, unknown> {
+  const result = metadataSchema.safeParse(metadata);
+  if (!result.success) {
+    const issues = result.error.issues ?? (result.error as any).errors ?? [];
+    const messages = issues
+      .map((e) => `${e.path.join(".") || "metadata"}: ${e.message}`)
+      .join("; ");
+    throw new Error(`Invalid metadata: ${messages}`);
+  }
+  return result.data as Record<string, unknown>;
+}
 
 function phoneSearchTokens(phoneNumber: string): string[] {
   const normalized = phoneNumber.replace(/^\+/, "");
@@ -90,6 +187,7 @@ const TRANSACTION_SELECT_COLUMNS = `
   COALESCE(metadata, '{}') AS metadata,
   location_metadata AS "locationMetadata",
   user_id AS "userId",
+  merchant_id AS "merchantId",
   idempotency_key AS "idempotencyKey",
   idempotency_expires_at AS "idempotencyExpiresAt",
   created_at AS "createdAt",
@@ -109,11 +207,14 @@ function validateMetadata(metadata: unknown): Record<string, unknown> {
   if (typeof metadata !== "object" || Array.isArray(metadata)) {
     throw new Error("Metadata must be a JSON object");
   }
-  const json = JSON.stringify(metadata);
+  // Issue #645 – validate structure before storing to prevent malformed data
+  // from reaching reporting / analytics pipelines.
+  const validated = validateMetadataSchema(metadata);
+  const json = JSON.stringify(validated);
   if (Buffer.byteLength(json, "utf8") > MAX_METADATA_BYTES) {
     throw new Error(`Metadata exceeds ${MAX_METADATA_BYTES / 1024} KB`);
   }
-  return metadata as Record<string, unknown>;
+  return validated;
 }
 
 function decodeTransactionCursor(cursor: string): DecodedTransactionCursor {
@@ -217,6 +318,39 @@ export class TransactionModel {
 
     if (filters.tags?.length) {
       addCondition("tags @> ?::text[]", filters.tags);
+    }
+
+    if (filters.currency) {
+      addCondition("currency = ?", filters.currency);
+    }
+
+    if (filters.type) {
+      addCondition("type = ?", filters.type);
+    }
+
+    // #480 – Range filtering on a chosen timestamp column. Validated against
+    // the whitelist rather than interpolated, so `dateField` is not a
+    // SQL injection vector.
+    if (filters.startDateTime || filters.endDateTime) {
+      const column = DATE_FILTER_COLUMNS[filters.dateField ?? "createdAt"];
+      if (filters.startDateTime) {
+        addCondition(`${column} >= ?`, new Date(filters.startDateTime));
+      }
+      if (filters.endDateTime) {
+        addCondition(`${column} <= ?`, new Date(filters.endDateTime));
+      }
+    }
+
+    // #480 – Advanced filter AST. Compiled last so its placeholders continue
+    // the same parameter numbering as the simple conditions above.
+    if (filters.filter) {
+      const expression =
+        typeof filters.filter === "string"
+          ? parseFilterExpression(JSON.parse(filters.filter))
+          : parseFilterExpression(filters.filter);
+      const compiled = compileFilterExpression(expression, params.length + 1);
+      params.push(...compiled.params);
+      conditions.push(compiled.sql);
     }
 
     return {
@@ -356,6 +490,18 @@ export class TransactionModel {
         console.warn(
           "[cache] Failed to invalidate general stats on transaction update",
           err,
+        );
+      });
+    }
+
+    // ── Release the idempotency key on terminal states ────────────────────
+    // A transaction that timed out and was later recovered must not keep its
+    // key around, otherwise the stale key blocks legitimate retries (#619).
+    if (TERMINAL_IDEMPOTENCY_STATUSES.has(status)) {
+      await this.releaseIdempotencyKey(id).catch((err) => {
+        console.warn(
+          `[idempotency] Failed to release key for transaction ${id}:`,
+          err instanceof Error ? err.message : err,
         );
       });
     }
@@ -765,22 +911,45 @@ export class TransactionModel {
     return result.rows.map(mapTransactionRow).filter((t: any) => t !== null);
   }
 
+  /**
+   * Search transactions by phone number.
+   *
+   * @param phoneNumber          Phone number the client searched for.
+   * @param limit                Page size (clamped to 1..100).
+   * @param offset               Row offset.
+   * @param merchantIds          Optional merchant filter — matches any of the
+   *                             supplied merchant ids (issue #621).
+   */
   async searchByPhoneNumber(
     phoneNumber: string,
     limit = 50,
     offset = 0,
+    merchantIds: string[] = [],
   ): Promise<{ transactions: Transaction[]; total: number }> {
     const capped = Math.min(Math.max(limit, 1), 100);
     const off = Math.max(offset, 0);
 
     const normalized = phoneNumber.replace(/^\+/, "");
+    const params: unknown[] = [hashSearchValue(normalized)];
+
+    let merchantClause = "";
+    if (merchantIds.length > 0) {
+      params.push(merchantIds);
+      merchantClause = `AND merchant_id = ANY($${params.length}::uuid[])`;
+    }
+
+    params.push(capped, off);
+    const limitParam = params.length - 1;
+    const offsetParam = params.length;
+
     const result = await queryRead(
       `SELECT ${TRANSACTION_SELECT_COLUMNS}, COUNT(*) OVER()::int AS "total"
         FROM transactions
         WHERE phone_search_tokens @> ARRAY[$1]::text[]
+          ${merchantClause}
         ORDER BY created_at DESC, id DESC
-        LIMIT $2 OFFSET $3`,
-      [hashSearchValue(normalized), capped, off],
+        LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      params,
     );
 
     const mapped = result.rows
@@ -808,6 +977,24 @@ export class TransactionModel {
     );
 
     return result?.rows?.[0]?.released || 0;
+  }
+
+  /**
+   * Release the idempotency key held by a transaction, e.g. once it reaches a
+   * terminal state. Returns `true` when a key was actually cleared.
+   */
+  async releaseIdempotencyKey(transactionId: string): Promise<boolean> {
+    const result = await queryWrite(
+      `UPDATE transactions
+       SET idempotency_key = NULL,
+           idempotency_expires_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+         AND idempotency_key IS NOT NULL`,
+      [transactionId],
+    );
+
+    return (result?.rowCount ?? 0) > 0;
   }
 
   async releaseExpiredIdempotencyKey(idempotencyKey: string): Promise<void> {
@@ -884,5 +1071,53 @@ export class TransactionModel {
         id,
       ],
     );
+  }
+
+  /**
+   * Store the provider-issued confirmation reference on a transaction.
+   *
+   * Issue #643 – after a withdrawal the mobile-money provider returns a
+   * reference (e.g. MTN `financialTransactionId`).  Persisting it in
+   * `provider_reference` enables bidirectional reconciliation: we can look up
+   * a ProxyPay transaction by the provider's own reference and vice-versa.
+   *
+   * @param id              Internal ProxyPay transaction ID
+   * @param providerReference  Provider-issued confirmation / transaction ID
+   */
+  async updateProviderReference(
+    id: string,
+    providerReference: string,
+  ): Promise<Transaction | null> {
+    const result = await queryWrite(
+      `UPDATE transactions
+       SET provider_reference = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING ${TRANSACTION_SELECT_COLUMNS}`,
+      [providerReference, id],
+    );
+
+    return mapTransactionRow(result.rows[0]);
+  }
+
+  /**
+   * Look up a transaction by the provider-issued reference.
+   *
+   * Enables reconciliation workflows to map a provider confirmation back to
+   * the corresponding internal ProxyPay transaction.
+   *
+   * @param providerReference  Provider-issued confirmation / transaction ID
+   */
+  async findByProviderReference(
+    providerReference: string,
+  ): Promise<Transaction | null> {
+    const result = await queryRead(
+      `SELECT ${TRANSACTION_SELECT_COLUMNS}
+       FROM transactions
+       WHERE provider_reference = $1
+       LIMIT 1`,
+      [providerReference],
+    );
+
+    return mapTransactionRow(result.rows[0]);
   }
 }

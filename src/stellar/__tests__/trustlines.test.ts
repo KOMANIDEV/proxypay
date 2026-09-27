@@ -5,6 +5,9 @@ import {
   createSponsoredTrustline,
   removeTrustline,
   ensureTrustlines,
+  assertSufficientXlmBalance,
+  InsufficientBalanceError,
+  MINIMUM_XLM_FOR_TRUSTLINE,
 } from "../trustlines";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
@@ -55,13 +58,10 @@ function makeAccount(
     } as StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum4">)),
   ];
 
-  return {
-    id: publicKey,
-    account_id: publicKey,
-    balances,
-    sequence: "1",
-    incrementSequenceNumber: () => {},
-  } as unknown as StellarSdk.Horizon.AccountResponse;
+  const account = new StellarSdk.Account(publicKey, "1") as any;
+  account.balances = balances;
+  account.subentry_count = 0;
+  return account as StellarSdk.Horizon.AccountResponse;
 }
 
 const TX_RESULT = { hash: "abc123", ledger: 42 };
@@ -129,7 +129,7 @@ describe("createTrustline", () => {
 
     const tx = mockSubmitTransaction.mock.calls[0][0] as StellarSdk.Transaction;
     const op = tx.operations[0] as StellarSdk.Operation.ChangeTrust;
-    expect(op.limit).toBe("1000");
+    expect(Number(op.limit)).toBe(1000);
   });
 });
 
@@ -182,7 +182,7 @@ describe("removeTrustline", () => {
 
     const tx = mockSubmitTransaction.mock.calls[0][0] as StellarSdk.Transaction;
     const op = tx.operations[0] as StellarSdk.Operation.ChangeTrust;
-    expect(op.limit).toBe("0");
+    expect(Number(op.limit)).toBe(0);
   });
 });
 
@@ -297,5 +297,159 @@ describe("ensureTrustlines", () => {
     expect(result.created).toHaveLength(0);
     expect(result.failed).toHaveLength(0);
     expect(mockLoadAccount).not.toHaveBeenCalled();
+  });
+});
+
+// ── assertSufficientXlmBalance / InsufficientBalanceError (#646) ──────────────
+
+describe("assertSufficientXlmBalance", () => {
+  /** Build a minimal account response with a given native balance and subentry count. */
+  function makeAccountWithBalance(
+    publicKey: string,
+    nativeBalance: string,
+    subentryCount = 0,
+  ): StellarSdk.Horizon.AccountResponse {
+    const account = new StellarSdk.Account(publicKey, "1") as any;
+    account.subentry_count = subentryCount;
+    account.balances = [
+      {
+        asset_type: "native",
+        balance: nativeBalance,
+      } as StellarSdk.Horizon.HorizonApi.BalanceLine<"native">,
+    ];
+    return account as StellarSdk.Horizon.AccountResponse;
+  }
+
+  it("resolves when available balance exceeds the minimum", async () => {
+    // 5 XLM balance, 0 subentries → available = 5 - 1 = 4 XLM (> 1 required)
+    mockLoadAccount.mockResolvedValue(
+      makeAccountWithBalance(userKeypair.publicKey(), "5.0000000"),
+    );
+
+    await expect(
+      assertSufficientXlmBalance(userKeypair.publicKey()),
+    ).resolves.toBeUndefined();
+  });
+
+  it("resolves when available balance equals the minimum exactly", async () => {
+    // 2 XLM balance, 0 subentries → available = 2 - 1 = 1 XLM (== 1 required)
+    mockLoadAccount.mockResolvedValue(
+      makeAccountWithBalance(userKeypair.publicKey(), "2.0000000"),
+    );
+
+    await expect(
+      assertSufficientXlmBalance(userKeypair.publicKey()),
+    ).resolves.toBeUndefined();
+  });
+
+  it("throws InsufficientBalanceError when balance is too low", async () => {
+    // 1.5 XLM balance, 0 subentries → available = 1.5 - 1 = 0.5 XLM (< 1 required)
+    mockLoadAccount.mockResolvedValue(
+      makeAccountWithBalance(userKeypair.publicKey(), "1.5000000"),
+    );
+
+    await expect(
+      assertSufficientXlmBalance(userKeypair.publicKey()),
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
+  });
+
+  it("accounts for existing subentries when calculating available balance", async () => {
+    // 3 XLM, 2 existing trustlines (2 × 0.5 = 1 XLM subentry reserve)
+    // available = 3 - 1 (base) - 1 (subentries) = 1 XLM (== minimum, OK)
+    mockLoadAccount.mockResolvedValue(
+      makeAccountWithBalance(userKeypair.publicKey(), "3.0000000", 2),
+    );
+
+    await expect(
+      assertSufficientXlmBalance(userKeypair.publicKey()),
+    ).resolves.toBeUndefined();
+
+    // With 2.9 XLM → available = 2.9 - 2 = 0.9 XLM (< 1 required)
+    mockLoadAccount.mockResolvedValue(
+      makeAccountWithBalance(userKeypair.publicKey(), "2.9000000", 2),
+    );
+
+    await expect(
+      assertSufficientXlmBalance(userKeypair.publicKey()),
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
+  });
+
+  it("respects a custom minimumXlm parameter", async () => {
+    mockLoadAccount.mockResolvedValue(
+      makeAccountWithBalance(userKeypair.publicKey(), "3.0000000"),
+    );
+
+    // Require 5 XLM available; account only has 2 XLM available → should throw
+    await expect(
+      assertSufficientXlmBalance(userKeypair.publicKey(), 5),
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
+  });
+
+  it("MINIMUM_XLM_FOR_TRUSTLINE constant equals 1", () => {
+    expect(MINIMUM_XLM_FOR_TRUSTLINE).toBe(1);
+  });
+});
+
+describe("createTrustline – balance check integration (#646)", () => {
+  it("throws InsufficientBalanceError before submitting when balance is too low", async () => {
+    // Only 1.2 XLM total, 0 subentries → available = 0.2 XLM (< 1 required)
+    mockLoadAccount.mockResolvedValue(
+      (() => {
+        const acct = makeAccount(userKeypair.publicKey());
+        (acct.balances[0] as any).balance = "1.2000000";
+        (acct as any).subentry_count = 0;
+        return acct;
+      })(),
+    );
+
+    await expect(
+      createTrustline({ accountKeypair: userKeypair, asset: USDC }),
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
+
+    // The transaction must NOT have been submitted
+    expect(mockSubmitTransaction).not.toHaveBeenCalled();
+  });
+
+  it("proceeds and submits when balance is sufficient", async () => {
+    // 5 XLM total → 4 available → passes check
+    const richAccount = makeAccount(userKeypair.publicKey());
+    (richAccount.balances[0] as any).balance = "5.0000000";
+    (richAccount as any).subentry_count = 0;
+
+    // assertSufficientXlmBalance calls loadAccount once, createTrustline calls it again
+    mockLoadAccount.mockResolvedValue(richAccount);
+    mockSubmitTransaction.mockResolvedValue(TX_RESULT);
+
+    const result = await createTrustline({
+      accountKeypair: userKeypair,
+      asset: USDC,
+    });
+
+    expect(result).toEqual(TX_RESULT);
+    expect(mockSubmitTransaction).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createSponsoredTrustline – sponsor balance check (#646)", () => {
+  it("throws InsufficientBalanceError when the sponsor has insufficient XLM", async () => {
+    // Sponsor only has 1.2 XLM → 0.2 available → below 1 XLM minimum
+    mockLoadAccount.mockResolvedValue(
+      (() => {
+        const acct = makeAccount(sponsorKeypair.publicKey());
+        (acct.balances[0] as any).balance = "1.2000000";
+        (acct as any).subentry_count = 0;
+        return acct;
+      })(),
+    );
+
+    await expect(
+      createSponsoredTrustline({
+        accountKeypair: userKeypair,
+        sponsorKeypair,
+        asset: USDC,
+      }),
+    ).rejects.toBeInstanceOf(InsufficientBalanceError);
+
+    expect(mockSubmitTransaction).not.toHaveBeenCalled();
   });
 });

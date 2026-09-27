@@ -34,6 +34,7 @@
 import { pool } from "../config/database";
 import { redisClient } from "../config/redis";
 import logger from "../utils/logger";
+import { feeAuditService } from "./feeAuditService";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types & Interfaces
@@ -607,11 +608,33 @@ export class FeeStrategyEngine {
           },
           validation: validation.validation,
         };
+
+        // Persist audit record (non-fatal)
+        await feeAuditService.logFeeCalculation({
+          userId: ctx.userId,
+          provider: ctx.provider,
+          inputAmount: ctx.amount,
+          calculatedFee: calcResult.fee,
+          totalAmount: calcResult.total,
+          strategyId: strategy.id,
+          strategyName: strategy.name,
+          strategyType: strategy.strategyType,
+          strategyScope: strategy.scope,
+          feePercentage: strategy.feePercentage ?? null,
+          flatAmount: strategy.flatAmount ?? null,
+          feeMinimum: strategy.feeMinimum ?? null,
+          feeMaximum: strategy.feeMaximum ?? null,
+          timeOverrideActive: calcResult.timeOverrideActive,
+          rawFee: calcResult.breakdown.rawFee,
+          clampedFee: calcResult.breakdown.clampedFee,
+        });
+
+        return calcResult;
       }
     }
 
     // No strategy matched — return zero fee as safe default
-    return {
+    const defaultResult: FeeCalculationResult = {
       fee: 0,
       total: ctx.amount,
       strategyUsed: "none",
@@ -703,6 +726,24 @@ export class FeeStrategyEngine {
         warnings,
       },
     };
+
+    // Persist audit record for the default (zero-fee) case as well (non-fatal)
+    await feeAuditService.logFeeCalculation({
+      userId: ctx.userId,
+      provider: ctx.provider,
+      inputAmount: ctx.amount,
+      calculatedFee: 0,
+      totalAmount: ctx.amount,
+      strategyId: "",
+      strategyName: "none",
+      strategyType: "flat",
+      strategyScope: "global",
+      timeOverrideActive: false,
+      rawFee: 0,
+      clampedFee: 0,
+    });
+
+    return defaultResult;
   }
 
   /**
