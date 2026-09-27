@@ -8,8 +8,9 @@
  *   - Timeout resolution (provider did not respond)
  *   - Refund already processed
  *
- * Each rule produces a confidence score (0–1). Disputes are auto-resolved
- * only when confidence exceeds the configurable threshold.
+ * Rules are evaluated in priority order (highest number = highest priority).
+ * The engine stops at the FIRST matching rule that meets the confidence
+ * threshold — later rules are never evaluated once a match is found.
  */
 
 import { pool } from "../config/database";
@@ -32,6 +33,8 @@ export interface DisputeContext {
 
 export interface RuleResult {
   ruleName: string;
+  /** Priority of the rule that produced this result. Higher = evaluated first. */
+  priority: number;
   matched: boolean;
   confidence: number;
   resolution: "resolved" | "rejected" | null;
@@ -48,6 +51,28 @@ export interface AutoResolutionConfig {
   amountMismatchTolerancePct: number;
   /** Timeout threshold in seconds. Default 300 (5 min). */
   timeoutThresholdSeconds: number;
+}
+
+/**
+ * A dispute resolution rule with its priority.
+ *
+ * `priority` is a positive integer. Rules are evaluated in descending order
+ * (highest priority first). When two rules share the same priority value the
+ * order between them is deterministic but unspecified — give every rule a
+ * unique priority to make the ordering explicit.
+ */
+export interface DisputeRule {
+  name: string;
+  /**
+   * Evaluation order. Higher numbers run first.
+   * Built-in defaults (lowest → highest):
+   *   amount_mismatch       10
+   *   provider_timeout      20
+   *   already_refunded      30
+   *   duplicate_transaction 40
+   */
+  priority: number;
+  evaluate: (ctx: DisputeContext, config: AutoResolutionConfig) => Promise<RuleResult>;
 }
 
 const DEFAULT_CONFIG: AutoResolutionConfig = {
@@ -114,189 +139,257 @@ export async function updateConfig(updates: Partial<AutoResolutionConfig>): Prom
 // ─── Rules ────────────────────────────────────────────────────────────────────
 
 /**
- * Rule: Duplicate Transaction
+ * Rule: Duplicate Transaction (priority 40 — highest built-in priority)
  * Checks if another transaction exists with the same amount, phone, and provider
- * within a short time window.
+ * within a short time window. A clear-cut duplicate is the strongest signal, so
+ * this rule runs first and wins immediately if it matches.
  */
-async function ruleDuplicateTransaction(
-  ctx: DisputeContext,
-  config: AutoResolutionConfig,
-): Promise<RuleResult> {
-  try {
-    const { rows } = await pool.query<{ count: string }>(
-      `SELECT COUNT(*) AS count
-       FROM transactions
-       WHERE phone_number = (SELECT phone_number FROM transactions WHERE id = $1)
-         AND amount = $2
-         AND provider = (SELECT provider FROM transactions WHERE id = $1)
-         AND id != $1
-         AND created_at BETWEEN $3 AND $4
-         AND status = 'completed'`,
-      [
-        ctx.transactionId,
-        ctx.transactionAmount,
-        new Date(ctx.transactionCreatedAt.getTime() - 60_000),
-        new Date(ctx.transactionCreatedAt.getTime() + 60_000),
-      ],
-    );
+const ruleDuplicateTransaction: DisputeRule = {
+  name: "duplicate_transaction",
+  priority: 40,
+  async evaluate(ctx, _config) {
+    try {
+      const { rows } = await pool.query<{ count: string }>(
+        `SELECT COUNT(*) AS count
+         FROM transactions
+         WHERE phone_number = (SELECT phone_number FROM transactions WHERE id = $1)
+           AND amount = $2
+           AND provider = (SELECT provider FROM transactions WHERE id = $1)
+           AND id != $1
+           AND created_at BETWEEN $3 AND $4
+           AND status = 'completed'`,
+        [
+          ctx.transactionId,
+          ctx.transactionAmount,
+          new Date(ctx.transactionCreatedAt.getTime() - 60_000),
+          new Date(ctx.transactionCreatedAt.getTime() + 60_000),
+        ],
+      );
 
-    const duplicateCount = parseInt(rows[0]?.count ?? "0", 10);
-    const confidence = duplicateCount > 0 ? 0.95 : 0;
+      const duplicateCount = parseInt(rows[0]?.count ?? "0", 10);
+      const confidence = duplicateCount > 0 ? 0.95 : 0;
 
-    return {
-      ruleName: "duplicate_transaction",
-      matched: duplicateCount > 0,
-      confidence,
-      resolution: duplicateCount > 0 ? "resolved" : null,
-      resolutionReason: duplicateCount > 0
-        ? `Duplicate transaction detected (${duplicateCount} matching transaction(s) found within 1-minute window)`
-        : null,
-      metadata: { duplicateCount },
-    };
-  } catch (error) {
-    logger.error({ error, disputeId: ctx.disputeId }, "ruleDuplicateTransaction failed");
-    return { ruleName: "duplicate_transaction", matched: false, confidence: 0, resolution: null, resolutionReason: null };
-  }
-}
+      return {
+        ruleName: "duplicate_transaction",
+        priority: ruleDuplicateTransaction.priority,
+        matched: duplicateCount > 0,
+        confidence,
+        resolution: duplicateCount > 0 ? "resolved" : null,
+        resolutionReason: duplicateCount > 0
+          ? `Duplicate transaction detected (${duplicateCount} matching transaction(s) found within 1-minute window)`
+          : null,
+        metadata: { duplicateCount },
+      };
+    } catch (error) {
+      logger.error({ error, disputeId: ctx.disputeId }, "ruleDuplicateTransaction failed");
+      return { ruleName: "duplicate_transaction", priority: ruleDuplicateTransaction.priority, matched: false, confidence: 0, resolution: null, resolutionReason: null };
+    }
+  },
+};
 
 /**
- * Rule: Amount Mismatch
- * If the dispute reason mentions amount and the claimed amount is within
- * tolerance of the actual transaction amount, auto-resolve.
+ * Rule: Already Refunded (priority 30)
+ * If a refund or reversal already exists for this transaction, auto-resolve.
+ * Checked before timeout so a dispute on a refunded-but-still-pending
+ * transaction resolves cleanly instead of being mis-labelled a timeout.
  */
-async function ruleAmountMismatch(
-  ctx: DisputeContext,
-  _config: AutoResolutionConfig,
-): Promise<RuleResult> {
-  const reasonLower = ctx.reason.toLowerCase();
-  const mentionsAmount =
-    reasonLower.includes("amount") ||
-    reasonLower.includes("overcharge") ||
-    reasonLower.includes("wrong amount") ||
-    reasonLower.includes("incorrect amount");
+const ruleAlreadyRefunded: DisputeRule = {
+  name: "already_refunded",
+  priority: 30,
+  async evaluate(ctx, _config) {
+    try {
+      const { rows } = await pool.query<{ count: string }>(
+        `SELECT COUNT(*) AS count
+         FROM transactions
+         WHERE reference_id = $1
+           AND status IN ('completed', 'pending')
+           AND type = 'refund'`,
+        [ctx.transactionId],
+      );
 
-  if (!mentionsAmount) {
-    return { ruleName: "amount_mismatch", matched: false, confidence: 0, resolution: null, resolutionReason: null };
-  }
+      const refundCount = parseInt(rows[0]?.count ?? "0", 10);
 
-  // If the transaction completed successfully with the correct amount,
-  // and the dispute is about amount, it's likely a misunderstanding
-  if (ctx.transactionStatus === "completed") {
-    return {
-      ruleName: "amount_mismatch",
-      matched: true,
-      confidence: 0.7,
-      resolution: null,
-      resolutionReason: null,
-      metadata: { note: "Transaction completed successfully — manual review recommended for amount disputes" },
-    };
-  }
-
-  return { ruleName: "amount_mismatch", matched: false, confidence: 0, resolution: null, resolutionReason: null };
-}
+      return {
+        ruleName: "already_refunded",
+        priority: ruleAlreadyRefunded.priority,
+        matched: refundCount > 0,
+        confidence: refundCount > 0 ? 0.95 : 0,
+        resolution: refundCount > 0 ? "resolved" : null,
+        resolutionReason: refundCount > 0
+          ? "A refund has already been processed for this transaction"
+          : null,
+        metadata: { refundCount },
+      };
+    } catch (error) {
+      logger.error({ error, disputeId: ctx.disputeId }, "ruleAlreadyRefunded failed");
+      return { ruleName: "already_refunded", priority: ruleAlreadyRefunded.priority, matched: false, confidence: 0, resolution: null, resolutionReason: null };
+    }
+  },
+};
 
 /**
- * Rule: Provider Timeout
+ * Rule: Provider Timeout (priority 20)
  * If the transaction is stuck in pending and the provider did not respond
  * within the timeout threshold, auto-reject the dispute (refund will be
  * handled by the timeout job).
  */
-async function ruleProviderTimeout(
-  ctx: DisputeContext,
-  config: AutoResolutionConfig,
-): Promise<RuleResult> {
-  if (ctx.transactionStatus !== "pending") {
-    return { ruleName: "provider_timeout", matched: false, confidence: 0, resolution: null, resolutionReason: null };
-  }
+const ruleProviderTimeout: DisputeRule = {
+  name: "provider_timeout",
+  priority: 20,
+  async evaluate(ctx, config) {
+    if (ctx.transactionStatus !== "pending") {
+      return { ruleName: "provider_timeout", priority: ruleProviderTimeout.priority, matched: false, confidence: 0, resolution: null, resolutionReason: null };
+    }
 
-  const ageMs = Date.now() - ctx.transactionCreatedAt.getTime();
-  const ageSeconds = ageMs / 1000;
+    const ageMs = Date.now() - ctx.transactionCreatedAt.getTime();
+    const ageSeconds = ageMs / 1000;
 
-  if (ageSeconds < config.timeoutThresholdSeconds) {
-    return { ruleName: "provider_timeout", matched: false, confidence: 0, resolution: null, resolutionReason: null };
-  }
-
-  return {
-    ruleName: "provider_timeout",
-    matched: true,
-    confidence: 0.9,
-    resolution: "rejected",
-    resolutionReason: `Transaction is pending for ${Math.round(ageSeconds)}s (threshold: ${config.timeoutThresholdSeconds}s). Automatic timeout handling will process the refund.`,
-    metadata: { ageSeconds, threshold: config.timeoutThresholdSeconds },
-  };
-}
-
-/**
- * Rule: Already Refunded
- * If a refund or reversal already exists for this transaction, auto-resolve.
- */
-async function ruleAlreadyRefunded(
-  ctx: DisputeContext,
-  _config: AutoResolutionConfig,
-): Promise<RuleResult> {
-  try {
-    const { rows } = await pool.query<{ count: string }>(
-      `SELECT COUNT(*) AS count
-       FROM transactions
-       WHERE reference_id = $1
-         AND status IN ('completed', 'pending')
-         AND type = 'refund'`,
-      [ctx.transactionId],
-    );
-
-    const refundCount = parseInt(rows[0]?.count ?? "0", 10);
+    if (ageSeconds < config.timeoutThresholdSeconds) {
+      return { ruleName: "provider_timeout", priority: ruleProviderTimeout.priority, matched: false, confidence: 0, resolution: null, resolutionReason: null };
+    }
 
     return {
-      ruleName: "already_refunded",
-      matched: refundCount > 0,
-      confidence: refundCount > 0 ? 0.95 : 0,
-      resolution: refundCount > 0 ? "resolved" : null,
-      resolutionReason: refundCount > 0
-        ? "A refund has already been processed for this transaction"
-        : null,
-      metadata: { refundCount },
+      ruleName: "provider_timeout",
+      priority: ruleProviderTimeout.priority,
+      matched: true,
+      confidence: 0.9,
+      resolution: "rejected",
+      resolutionReason: `Transaction is pending for ${Math.round(ageSeconds)}s (threshold: ${config.timeoutThresholdSeconds}s). Automatic timeout handling will process the refund.`,
+      metadata: { ageSeconds, threshold: config.timeoutThresholdSeconds },
     };
-  } catch (error) {
-    logger.error({ error, disputeId: ctx.disputeId }, "ruleAlreadyRefunded failed");
-    return { ruleName: "already_refunded", matched: false, confidence: 0, resolution: null, resolutionReason: null };
-  }
-}
+  },
+};
+
+/**
+ * Rule: Amount Mismatch (priority 10 — lowest built-in priority)
+ * If the dispute reason mentions amount and the transaction completed
+ * successfully, flag for manual review (confidence below auto-resolve threshold).
+ * This rule runs last because it only produces low-confidence results.
+ */
+const ruleAmountMismatch: DisputeRule = {
+  name: "amount_mismatch",
+  priority: 10,
+  async evaluate(ctx, _config) {
+    const reasonLower = ctx.reason.toLowerCase();
+    const mentionsAmount =
+      reasonLower.includes("amount") ||
+      reasonLower.includes("overcharge") ||
+      reasonLower.includes("wrong amount") ||
+      reasonLower.includes("incorrect amount");
+
+    if (!mentionsAmount) {
+      return { ruleName: "amount_mismatch", priority: ruleAmountMismatch.priority, matched: false, confidence: 0, resolution: null, resolutionReason: null };
+    }
+
+    // If the transaction completed successfully with the correct amount,
+    // and the dispute is about amount, it's likely a misunderstanding
+    if (ctx.transactionStatus === "completed") {
+      return {
+        ruleName: "amount_mismatch",
+        priority: ruleAmountMismatch.priority,
+        matched: true,
+        confidence: 0.7,
+        resolution: null,
+        resolutionReason: null,
+        metadata: { note: "Transaction completed successfully — manual review recommended for amount disputes" },
+      };
+    }
+
+    return { ruleName: "amount_mismatch", priority: ruleAmountMismatch.priority, matched: false, confidence: 0, resolution: null, resolutionReason: null };
+  },
+};
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
-const ALL_RULES = [
+/**
+ * The ordered set of built-in dispute resolution rules.
+ *
+ * Rules are sorted once at module load time (highest priority first) so that
+ * `evaluateDispute` can iterate in the correct order without re-sorting on
+ * every call. Custom rules registered via `registerRule` are merged into this
+ * list in the same sorted order.
+ */
+const BUILT_IN_RULES: DisputeRule[] = [
   ruleDuplicateTransaction,
-  ruleAmountMismatch,
-  ruleProviderTimeout,
   ruleAlreadyRefunded,
+  ruleProviderTimeout,
+  ruleAmountMismatch,
 ];
 
 /**
- * Evaluate all rules against a dispute context.
- * Returns the best matching rule (highest confidence) if it meets the threshold.
+ * Registered rules sorted by priority descending (highest first).
+ * Mutated only by `registerRule` / `unregisterRule`.
+ */
+let registeredRules: DisputeRule[] = [...BUILT_IN_RULES].sort(
+  (a, b) => b.priority - a.priority,
+);
+
+/**
+ * Register an additional rule (or override a built-in by name).
+ * Existing rules with the same name are replaced.
+ */
+export function registerRule(rule: DisputeRule): void {
+  registeredRules = registeredRules.filter((r) => r.name !== rule.name);
+  registeredRules.push(rule);
+  registeredRules.sort((a, b) => b.priority - a.priority);
+}
+
+/**
+ * Remove a previously registered rule by name.
+ */
+export function unregisterRule(name: string): void {
+  registeredRules = registeredRules.filter((r) => r.name !== name);
+}
+
+/**
+ * Return a snapshot of the currently registered rules in evaluation order
+ * (highest priority first).
+ */
+export function getRegisteredRules(): ReadonlyArray<{ name: string; priority: number }> {
+  return registeredRules.map(({ name, priority }) => ({ name, priority }));
+}
+
+/**
+ * Evaluate rules against a dispute context in priority order.
+ *
+ * Rules run sequentially from highest priority to lowest.  The first rule
+ * that both matches AND has a resolution AND meets the confidence threshold
+ * is returned immediately — no further rules are evaluated.
+ *
+ * Returns `null` when no rule qualifies for automatic resolution.
  */
 export async function evaluateDispute(
   ctx: DisputeContext,
 ): Promise<RuleResult | null> {
   const config = await loadConfig();
 
-  const results = await Promise.all(
-    ALL_RULES.map((rule) => rule(ctx, config)),
-  );
+  for (const rule of registeredRules) {
+    const result = await rule.evaluate(ctx, config);
 
-  // Filter to matched rules, sort by confidence descending
-  const matched = results
-    .filter((r) => r.matched && r.resolution !== null)
-    .sort((a, b) => b.confidence - a.confidence);
+    if (!result.matched || result.resolution === null) {
+      // Rule did not match or produced no actionable resolution — try next.
+      continue;
+    }
 
-  if (matched.length === 0) return null;
+    if (result.confidence < config.confidenceThreshold) {
+      // Rule matched but confidence is too low — try next lower-priority rule.
+      continue;
+    }
 
-  const best = matched[0];
-  if (best.confidence < config.confidenceThreshold) {
-    return null;
+    // First qualifying match: return immediately (stop processing).
+    logger.debug(
+      {
+        disputeId: ctx.disputeId,
+        rule: result.ruleName,
+        priority: result.priority,
+        confidence: result.confidence,
+      },
+      "Dispute rule matched — stopping rule evaluation",
+    );
+    return result;
   }
 
-  return best;
+  return null;
 }
 
 /**
@@ -341,17 +434,18 @@ export async function processDispute(ctx: DisputeContext): Promise<{
     [newStatus, result.resolutionReason, ctx.disputeId],
   );
 
-  // Log the auto-resolution
+  // Log the auto-resolution including the rule priority that triggered it
   await pool.query(
-    `INSERT INTO dispute_resolution_log (dispute_id, rule_name, confidence, resolution, auto_resolved)
-     VALUES ($1, $2, $3, $4, true)`,
-    [ctx.disputeId, result.ruleName, result.confidence, result.resolution],
+    `INSERT INTO dispute_resolution_log (dispute_id, rule_name, rule_priority, confidence, resolution, auto_resolved)
+     VALUES ($1, $2, $3, $4, $5, true)`,
+    [ctx.disputeId, result.ruleName, result.priority, result.confidence, result.resolution],
   );
 
   logger.info(
     {
       disputeId: ctx.disputeId,
       rule: result.ruleName,
+      priority: result.priority,
       confidence: result.confidence,
       resolution: result.resolution,
     },

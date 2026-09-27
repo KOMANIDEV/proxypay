@@ -33,18 +33,52 @@ export class PaginationError extends Error {
   }
 }
 
+/** Regex that matches any character that is NOT URL-safe in a base64url string. */
+const UNSAFE_CURSOR_CHARS = /[+/=]/;
+
+/**
+ * Validate that an encoded cursor string is URL-safe (base64url alphabet only).
+ * Throws `PaginationError` when the value contains `+`, `/`, or `=`.
+ *
+ * This guard is called automatically by `encodeCursor` to catch edge cases
+ * where the substitution logic might have been bypassed or overridden.
+ *
+ * @internal
+ */
+export function validateUrlSafeCursor(encoded: string): void {
+  if (UNSAFE_CURSOR_CHARS.test(encoded)) {
+    const unsafe = encoded
+      .split("")
+      .filter((c) => UNSAFE_CURSOR_CHARS.test(c))
+      .filter((c, i, a) => a.indexOf(c) === i) // deduplicate
+      .map((c) => JSON.stringify(c))
+      .join(", ");
+    throw new PaginationError(
+      `Cursor encoding produced unsafe character(s): ${unsafe}. ` +
+        "Expected base64url output with no +, /, or = characters.",
+    );
+  }
+}
+
 /**
  * Encode a cursor payload into an opaque, URL-safe string.
  * The payload is JSON-serialized and base64url-encoded (no padding, so the
  * value is safe to embed in query strings).
+ *
+ * @throws {PaginationError} when the encoded output contains unsafe characters
+ *   (`+`, `/`, or `=`). This is a defensive guard against encoding regressions.
  */
 export function encodeCursor(payload: CursorPayload): string {
   const json = JSON.stringify(payload);
-  return Buffer.from(json, "utf8")
+  const encoded = Buffer.from(json, "utf8")
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
+
+  validateUrlSafeCursor(encoded);
+
+  return encoded;
 }
 
 /**

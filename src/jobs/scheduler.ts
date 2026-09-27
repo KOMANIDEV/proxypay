@@ -44,6 +44,7 @@ import { runRedisKeyExpirationMonitorJob } from "./redisKeyExpirationJob";
 import { runIdempotencyCleanupJob } from "./idempotencyCleanupJob";
 import { runNotificationHealthCheckJob } from "./notificationHealthCheckJob";
 import { runComplianceExpiryAlertJob } from "./complianceExpiryAlertJob";
+import { runProviderSessionRefreshJob } from "./providerSessionRefreshJob";
 import { startNotificationWorker } from "../workers/notificationWorker";
 
 interface JobConfig {
@@ -223,6 +224,13 @@ const JOBS: JobConfig[] = [
     // or have lapsed (#481)
     schedule: process.env.COMPLIANCE_EXPIRY_ALERT_CRON || "0 8 * * *",
     handler: runComplianceExpiryAlertJob,
+  },
+  {
+    name: "provider-session-refresh",
+    // Every 5 minutes — proactively refreshes Airtel/Orange web sessions
+    // 1 hour before expiry so live requests never hit an expired session.
+    schedule: process.env.PROVIDER_SESSION_REFRESH_CRON || "*/5 * * * *",
+    handler: async () => { await runProviderSessionRefreshJob(); },
   },
 ];
 
