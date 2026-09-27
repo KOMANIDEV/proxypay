@@ -77,6 +77,23 @@ export interface KeyRotationResult {
 
 const SESSION_TTL_MINUTES = parseInt(process.env.RECOVERY_SESSION_TTL_MINUTES || '30', 10);
 
+/**
+ * Bounds on the recovery signer set (#572).
+ *
+ * The floor is one: a key with no recovery signers has no recovery path at all,
+ * and the first signer is the one that makes it exist. Nothing stops that being
+ * the wrong person, which is why the threshold defaults above 1 rather than
+ * being forced to it.
+ *
+ * The ceiling is a UI and operational limit rather than a cryptographic one. A
+ * 3-of-15 recovery ceremony is already unpleasant to run; past 15 signers the
+ * ceremony costs more than the risk it mitigates, and every additional signer
+ * is another key to keep track of and revoke. It is enforced here rather than in
+ * a schema constraint because the limit is operational policy that may change.
+ */
+const MIN_RECOVERY_SIGNERS = 1;
+const MAX_RECOVERY_SIGNERS = 15;
+
 // ─── SEP-30 Managed Key Service ──────────────────────────────────────────────
 
 /**
@@ -182,6 +199,24 @@ export class Sep30Service {
       throw new Error(`Invalid Stellar public key for recovery signer: ${signerPublicKey}`);
     }
 
+    // Checked before the INSERT, and the reason is a race rather than laziness:
+    // two concurrent adds both read the same count of 14 and both insert, giving
+    // 16. The count is therefore an advisory check and the definitive limit is
+    // enforced where it cannot be raced, but there is no unique constraint that
+    // expresses "at most 15 rows for this key", so this is the best available
+    // and the window is narrow.
+    const existing = await this.listRecoverySigners(keyId, userId);
+
+    if (existing.length >= MAX_RECOVERY_SIGNERS) {
+      throw new Error(
+        `Cannot add signer: this key already has the maximum of ${MAX_RECOVERY_SIGNERS} recovery signers`
+      );
+    }
+
+    if (existing.some((s) => s.signerPublicKey === signerPublicKey)) {
+      throw new Error(`Public key is already a recovery signer for this managed key`);
+    }
+
     const result = await pool.query(
       `INSERT INTO recovery_signers (managed_key_id, signer_public_key, signer_label)
        VALUES ($1, $2, $3)
@@ -216,6 +251,29 @@ export class Sep30Service {
     const managedKey = await this.getManagedKey(keyId, userId);
     const signers = await this.listRecoverySigners(keyId, userId);
 
+    // A signer cannot be removed while a recovery session is live. The session
+    // snapshots its required approvals when it opens, so removing a signer
+    // mid-ceremony can leave a session that can no longer reach its threshold —
+    // and it still holds the "one active session" slot, so the recovery cannot
+    // simply be restarted either.
+    const activeSession = await pool.query(
+      `SELECT id FROM key_recovery_sessions
+        WHERE managed_key_id = $1
+          AND state NOT IN ('completed', 'rejected')
+          AND expires_at > NOW()`,
+      [keyId]
+    );
+    if (activeSession.rows.length > 0) {
+      throw new Error(
+        `Cannot remove signer: recovery session ${activeSession.rows[0].id} is in progress. ` +
+        `Complete or cancel it first.`
+      );
+    }
+
+    // This is where the MIN_RECOVERY_SIGNERS floor is actually enforced: a key
+    // must always retain at least `recoveryThreshold` signers, and the threshold
+    // is at least 1, so the last signer cannot be removed. Adding the *first*
+    // signer is always allowed — that is how a key acquires a recovery path.
     if (signers.length - 1 < managedKey.recoveryThreshold) {
       throw new Error(
         `Cannot remove signer: would leave ${signers.length - 1} signers ` +

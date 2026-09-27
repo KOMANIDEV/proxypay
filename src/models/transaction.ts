@@ -9,6 +9,11 @@ import {
   transactionChannel,
   type TransactionUpdatedPayload,
 } from "../graphql/subscriptions";
+import {
+  compileFilterExpression,
+  parseFilterExpression,
+  type FilterNode,
+} from "../services/transactionFilterService";
 
 export type AssetType = "native" | "credit_alphanum4" | "credit_alphanum12";
 
@@ -44,6 +49,15 @@ export interface TransactionListFilters {
   tags?: string[];
   referenceNumber?: string;
   statuses?: TransactionStatus[];
+  // #480 – Advanced filtering
+  currency?: string;
+  type?: string;
+  /** Inclusive range on any filterable temporal field (createdAt/updatedAt/completedAt). */
+  dateField?: "createdAt" | "updatedAt";
+  startDateTime?: string;
+  endDateTime?: string;
+  /** Nested AND/OR/NOT filter tree. Takes precedence over the flat fields above. */
+  filter?: FilterNode;
 }
 
 export interface TransactionCursorOptions {
@@ -63,9 +77,32 @@ interface DecodedTransactionCursor {
   id: string;
 }
 
+/**
+ * Whitelist for #480 range filtering on timestamp columns. `transactions` has
+ * no `completed_at`, so completion-time range filtering is not offered rather
+ * than failing at execution time.
+ */
+const DATE_FILTER_COLUMNS: Record<"createdAt" | "updatedAt", string> = {
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+};
+
 const MAX_TAGS = 10;
 const TAG_REGEX = /^[a-z0-9-]+$/;
 const MAX_METADATA_BYTES = 10240;
+
+/**
+ * States a transaction can no longer move out of. Reaching one of them releases
+ * the transaction's idempotency key so a recovered timeout cannot leave a stale
+ * key behind that blocks retries (issue #619).
+ */
+const TERMINAL_IDEMPOTENCY_STATUSES = new Set<TransactionStatus>([
+  TransactionStatus.Completed,
+  TransactionStatus.Failed,
+  TransactionStatus.Cancelled,
+  TransactionStatus.Reversed,
+  TransactionStatus.ClawedBack,
+]);
 
 function phoneSearchTokens(phoneNumber: string): string[] {
   const normalized = phoneNumber.replace(/^\+/, "");
@@ -90,6 +127,7 @@ const TRANSACTION_SELECT_COLUMNS = `
   COALESCE(metadata, '{}') AS metadata,
   location_metadata AS "locationMetadata",
   user_id AS "userId",
+  merchant_id AS "merchantId",
   idempotency_key AS "idempotencyKey",
   idempotency_expires_at AS "idempotencyExpiresAt",
   created_at AS "createdAt",
@@ -217,6 +255,39 @@ export class TransactionModel {
 
     if (filters.tags?.length) {
       addCondition("tags @> ?::text[]", filters.tags);
+    }
+
+    if (filters.currency) {
+      addCondition("currency = ?", filters.currency);
+    }
+
+    if (filters.type) {
+      addCondition("type = ?", filters.type);
+    }
+
+    // #480 – Range filtering on a chosen timestamp column. Validated against
+    // the whitelist rather than interpolated, so `dateField` is not a
+    // SQL injection vector.
+    if (filters.startDateTime || filters.endDateTime) {
+      const column = DATE_FILTER_COLUMNS[filters.dateField ?? "createdAt"];
+      if (filters.startDateTime) {
+        addCondition(`${column} >= ?`, new Date(filters.startDateTime));
+      }
+      if (filters.endDateTime) {
+        addCondition(`${column} <= ?`, new Date(filters.endDateTime));
+      }
+    }
+
+    // #480 – Advanced filter AST. Compiled last so its placeholders continue
+    // the same parameter numbering as the simple conditions above.
+    if (filters.filter) {
+      const expression =
+        typeof filters.filter === "string"
+          ? parseFilterExpression(JSON.parse(filters.filter))
+          : parseFilterExpression(filters.filter);
+      const compiled = compileFilterExpression(expression, params.length + 1);
+      params.push(...compiled.params);
+      conditions.push(compiled.sql);
     }
 
     return {
@@ -356,6 +427,18 @@ export class TransactionModel {
         console.warn(
           "[cache] Failed to invalidate general stats on transaction update",
           err,
+        );
+      });
+    }
+
+    // ── Release the idempotency key on terminal states ────────────────────
+    // A transaction that timed out and was later recovered must not keep its
+    // key around, otherwise the stale key blocks legitimate retries (#619).
+    if (TERMINAL_IDEMPOTENCY_STATUSES.has(status)) {
+      await this.releaseIdempotencyKey(id).catch((err) => {
+        console.warn(
+          `[idempotency] Failed to release key for transaction ${id}:`,
+          err instanceof Error ? err.message : err,
         );
       });
     }
@@ -765,22 +848,45 @@ export class TransactionModel {
     return result.rows.map(mapTransactionRow).filter((t: any) => t !== null);
   }
 
+  /**
+   * Search transactions by phone number.
+   *
+   * @param phoneNumber          Phone number the client searched for.
+   * @param limit                Page size (clamped to 1..100).
+   * @param offset               Row offset.
+   * @param merchantIds          Optional merchant filter — matches any of the
+   *                             supplied merchant ids (issue #621).
+   */
   async searchByPhoneNumber(
     phoneNumber: string,
     limit = 50,
     offset = 0,
+    merchantIds: string[] = [],
   ): Promise<{ transactions: Transaction[]; total: number }> {
     const capped = Math.min(Math.max(limit, 1), 100);
     const off = Math.max(offset, 0);
 
     const normalized = phoneNumber.replace(/^\+/, "");
+    const params: unknown[] = [hashSearchValue(normalized)];
+
+    let merchantClause = "";
+    if (merchantIds.length > 0) {
+      params.push(merchantIds);
+      merchantClause = `AND merchant_id = ANY($${params.length}::uuid[])`;
+    }
+
+    params.push(capped, off);
+    const limitParam = params.length - 1;
+    const offsetParam = params.length;
+
     const result = await queryRead(
       `SELECT ${TRANSACTION_SELECT_COLUMNS}, COUNT(*) OVER()::int AS "total"
         FROM transactions
         WHERE phone_search_tokens @> ARRAY[$1]::text[]
+          ${merchantClause}
         ORDER BY created_at DESC, id DESC
-        LIMIT $2 OFFSET $3`,
-      [hashSearchValue(normalized), capped, off],
+        LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      params,
     );
 
     const mapped = result.rows
@@ -808,6 +914,24 @@ export class TransactionModel {
     );
 
     return result?.rows?.[0]?.released || 0;
+  }
+
+  /**
+   * Release the idempotency key held by a transaction, e.g. once it reaches a
+   * terminal state. Returns `true` when a key was actually cleared.
+   */
+  async releaseIdempotencyKey(transactionId: string): Promise<boolean> {
+    const result = await queryWrite(
+      `UPDATE transactions
+       SET idempotency_key = NULL,
+           idempotency_expires_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+         AND idempotency_key IS NOT NULL`,
+      [transactionId],
+    );
+
+    return (result?.rowCount ?? 0) > 0;
   }
 
   async releaseExpiredIdempotencyKey(idempotencyKey: string): Promise<void> {

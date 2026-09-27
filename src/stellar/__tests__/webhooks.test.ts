@@ -1,6 +1,6 @@
 import request from "supertest";
 import express from "express";
-import { createHmac } from "crypto";
+import { createHmac, randomUUID } from "crypto";
 import { TransactionStatus } from "../../models/transaction";
 
 const mockFindByMetadata = jest.fn();
@@ -33,13 +33,19 @@ jest.mock("../../services/webhook", () => ({
     mockNotifyTransactionWebhook(...args),
 }));
 
-import stellarWebhookRoutes from "../webhooks";
+import stellarWebhookRoutes, {
+  consumeNonce,
+  isTimestampFresh,
+  resetNonceStore,
+  WEBHOOK_NONCE_TTL_MS,
+} from "../webhooks";
 
 describe("Stellar Webhooks", () => {
   let app: express.Application;
 
   beforeEach(() => {
     process.env.STELLAR_WEBHOOK_SECRET = "test-secret";
+    resetNonceStore();
 
     app = express();
     app.use(express.json());
@@ -57,15 +63,27 @@ describe("Stellar Webhooks", () => {
   }
 
   describe("POST /webhook", () => {
-    const validPayload = {
-      transaction_hash: "abc123def456",
-      status: "success",
-      ledger: 12345678,
-      timestamp: "2026-03-26T10:00:00Z",
-      source_account: "GABC123",
-      destination_account: "GDEF456",
-      amount: "100.5000000",
-    };
+    // Payloads carry a fresh timestamp + nonce so replay protection cannot
+    // reject a legitimate test request.
+    function buildValidPayload(overrides: Record<string, unknown> = {}) {
+      return {
+        transaction_hash: "abc123def456",
+        status: "success",
+        ledger: 12345678,
+        timestamp: new Date().toISOString(),
+        nonce: randomUUID(),
+        source_account: "GABC123",
+        destination_account: "GDEF456",
+        amount: "100.5000000",
+        ...overrides,
+      };
+    }
+
+    let validPayload: ReturnType<typeof buildValidPayload>;
+
+    beforeEach(() => {
+      validPayload = buildValidPayload();
+    });
 
     it("should reject webhook when STELLAR_WEBHOOK_SECRET is not configured", async () => {
       delete process.env.STELLAR_WEBHOOK_SECRET;
@@ -630,6 +648,103 @@ describe("Stellar Webhooks", () => {
 
       expect(response.status).toBe(400);
       expect(response.body.error).toBe("Validation failed");
+    });
+
+    it("should reject webhooks with a timestamp outside the replay window", async () => {
+      const stalePayload = buildValidPayload({
+        timestamp: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      });
+
+      const rawPayload = JSON.stringify(stalePayload);
+      const signature = generateSignature(rawPayload, "test-secret");
+
+      const response = await request(app)
+        .post("/webhook")
+        .set("X-Stellar-Signature", signature)
+        .send(stalePayload);
+
+      expect(response.status).toBe(401);
+      expect(response.body.code).toBe("STALE_TIMESTAMP");
+    });
+
+    it("should reject webhooks with a far-future timestamp", async () => {
+      const futurePayload = buildValidPayload({
+        timestamp: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      });
+
+      const rawPayload = JSON.stringify(futurePayload);
+      const signature = generateSignature(rawPayload, "test-secret");
+
+      const response = await request(app)
+        .post("/webhook")
+        .set("X-Stellar-Signature", signature)
+        .send(futurePayload);
+
+      expect(response.status).toBe(401);
+      expect(response.body.code).toBe("STALE_TIMESTAMP");
+    });
+
+    it("should reject webhooks that omit the nonce", async () => {
+      const { nonce, ...payloadWithoutNonce } = validPayload;
+
+      const rawPayload = JSON.stringify(payloadWithoutNonce);
+      const signature = generateSignature(rawPayload, "test-secret");
+
+      const response = await request(app)
+        .post("/webhook")
+        .set("X-Stellar-Signature", signature)
+        .send(payloadWithoutNonce);
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe("Validation failed");
+    });
+
+    it("should detect and reject replayed webhooks", async () => {
+      mockFindByMetadata.mockResolvedValue([]);
+
+      const rawPayload = JSON.stringify(validPayload);
+      const signature = generateSignature(rawPayload, "test-secret");
+
+      const first = await request(app)
+        .post("/webhook")
+        .set("X-Stellar-Signature", signature)
+        .send(validPayload);
+
+      // First delivery is processed (or 404s when no transaction matches) — what
+      // matters is that it is not flagged as a replay.
+      expect(first.status).not.toBe(409);
+      expect(first.body.code).toBeUndefined();
+
+      // Identical delivery replayed immediately — must be rejected.
+      const replay = await request(app)
+        .post("/webhook")
+        .set("X-Stellar-Signature", signature)
+        .send(validPayload);
+
+      expect(replay.status).toBe(409);
+      expect(replay.body.code).toBe("REPLAY_DETECTED");
+    });
+  });
+
+  describe("replay protection primitives", () => {
+    it("accepts timestamps inside the window and rejects stale/future ones", () => {
+      const now = Date.now();
+      expect(isTimestampFresh(new Date(now).toISOString(), now)).toBe(true);
+      expect(isTimestampFresh(new Date(now - 4 * 60 * 1000).toISOString(), now)).toBe(true);
+      expect(isTimestampFresh(new Date(now - 6 * 60 * 1000).toISOString(), now)).toBe(false);
+      expect(isTimestampFresh(new Date(now + 6 * 60 * 1000).toISOString(), now)).toBe(false);
+      expect(isTimestampFresh("not-a-date", now)).toBe(false);
+    });
+
+    it("accepts a nonce once and rejects duplicates until it expires", async () => {
+      const now = Date.now();
+
+      expect((await consumeNonce("nonce-abc-123", now)).accepted).toBe(true);
+      expect((await consumeNonce("nonce-abc-123", now)).accepted).toBe(false);
+
+      // After the replay window elapses the nonce may be reused.
+      const later = now + WEBHOOK_NONCE_TTL_MS + 1;
+      expect((await consumeNonce("nonce-abc-123", later)).accepted).toBe(true);
     });
   });
 });

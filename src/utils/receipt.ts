@@ -316,8 +316,60 @@ export function generatePlainTextReceipt(
 }
 
 /**
+ * Print stylesheet applied to HTML receipts when they are rendered on paper or
+ * exported to PDF (e.g. the browser's "Print" dialog). Kept inline because
+ * receipts are also delivered by email, where external stylesheets are stripped.
+ *
+ * Rules:
+ *  - Removes the screen-only card chrome (shadow, rounded corners, background).
+ *  - Forces a white background / black text so receipts stay legible on
+ *    monochrome printers.
+ *  - Adds row separators and page margins for multi-item receipts.
+ */
+export const RECEIPT_PRINT_STYLES = `
+    @media print {
+      @page { size: A4 portrait; margin: 12mm; }
+      html, body {
+        background: #ffffff !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        color: #000000;
+        font-size: 12pt;
+      }
+      .receipt-wrapper {
+        max-width: 100% !important;
+        margin: 0 !important;
+        border: none !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+      }
+      .receipt-header {
+        background: #ffffff !important;
+        color: #000000 !important;
+        border-bottom: 2px solid #000000;
+        padding: 0 0 12px !important;
+      }
+      .receipt-header img { max-height: 48px !important; }
+      .receipt-title { font-size: 18pt !important; }
+      .receipt-table { width: 100% !important; border-collapse: collapse !important; }
+      .receipt-table td {
+        padding: 6px 0 !important;
+        border-bottom: 1px solid #cbd5e1;
+        color: #000000 !important;
+      }
+      .receipt-footer {
+        border-top: 1px solid #cbd5e1;
+        padding-top: 8px;
+        color: #000000 !important;
+      }
+      a { color: #000000 !important; text-decoration: none !important; }
+    }`;
+
+/**
  * Generates an HTML receipt for email delivery. Supports business branding
  * (logo, business name, primary color) passed through ReceiptOptions.branding.
+ * The markup includes an inline print stylesheet (see RECEIPT_PRINT_STYLES) so
+ * the receipt prints cleanly when a customer saves it as PDF.
  *
  * @example
  * const html = generateReceiptHtml(transaction, { branding: { businessName: "Acme", logoUrl: "...", primaryColor: "#123456" } });
@@ -340,18 +392,25 @@ export function generateReceiptHtml(
 
   return `<!DOCTYPE html>
 <html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(businessName)} — Transaction Receipt</title>
+    <style>${RECEIPT_PRINT_STYLES}
+    </style>
+  </head>
   <body style="margin:0;padding:24px;background:#f5f7fb;font-family:Arial,sans-serif;color:#0f172a;">
-    <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #dbe4f0;border-radius:12px;overflow:hidden;">
-      <div style="padding:24px;background:${primaryColor};color:${headerFg};">
+    <div class="receipt-wrapper" style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #dbe4f0;border-radius:12px;overflow:hidden;">
+      <div class="receipt-header" style="padding:24px;background:${primaryColor};color:${headerFg};">
         ${logo}
         <p style="margin:0 0 8px;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;opacity:0.8;">${escapeHtml(businessName)}</p>
-        <h1 style="margin:0;font-size:24px;">Transaction Receipt</h1>
+        <h1 class="receipt-title" style="margin:0;font-size:24px;">Transaction Receipt</h1>
         <p style="margin:8px 0 0;opacity:0.8;">${escapeHtml(receipt.receiptNumber)}</p>
         <p style="margin:4px 0 0;opacity:0.8;">${escapeHtml(receipt.receiptDate)}</p>
       </div>
       <div style="padding:24px;">
         <h2 style="margin:0 0 12px;font-size:16px;">Transaction Details</h2>
-        <table style="width:100%;border-collapse:collapse;">
+        <table class="receipt-table" style="width:100%;border-collapse:collapse;">
           <tr><td style="padding:8px 0;color:#64748b;">Amount</td><td style="padding:8px 0;text-align:right;">${escapeHtml(receipt.amount)}</td></tr>
           <tr><td style="padding:8px 0;color:#64748b;">Fee</td><td style="padding:8px 0;text-align:right;">${escapeHtml(receipt.fee)}</td></tr>
           <tr><td style="padding:8px 0;color:#64748b;">Total</td><td style="padding:8px 0;text-align:right;">${escapeHtml(receipt.total)}</td></tr>
@@ -371,7 +430,7 @@ export function generateReceiptHtml(
               : ""
           }
         </table>
-        <p style="margin:20px 0 0;color:#64748b;font-size:13px;">${escapeHtml(branding.footerText || "Thank you for using our service!")}</p>
+        <p class="receipt-footer" style="margin:20px 0 0;color:#64748b;font-size:13px;">${escapeHtml(branding.footerText || "Thank you for using our service!")}</p>
       </div>
     </div>
   </body>

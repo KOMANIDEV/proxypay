@@ -3,6 +3,10 @@ import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from "axios";
 import logger from "../../../utils/logger";
 import { maskPII } from "../../../utils/masking";
 import { Browser, BrowserContext, Page, chromium } from "playwright";
+import {
+  SessionRequestQueue,
+  SessionTimeoutError,
+} from "../sessionRequestQueue";
 
 type OrangeOperation = "payment" | "payout";
 type OrangeMode = "web" | "direct" | "proxy";
@@ -74,6 +78,8 @@ export type OrangeProviderOptions = Partial<OrangeProviderConfig> & {
   proxyHttpClient?: OrangeHttpClient;
   directHttpClient?: OrangeHttpClient;
   clock?: () => number;
+  /** Optional shared queue; one is created per provider when omitted. */
+  sessionRequestQueue?: SessionRequestQueue;
 };
 
 const DEFAULT_SESSION_TTL_MS = 20 * 60 * 1000;
@@ -93,11 +99,14 @@ export class OrangeProvider {
   private directAuthPromise: Promise<string> | null = null;
   private prefetchTimer: NodeJS.Timeout | null = null;
   private destroyed = false;
+  private readonly sessionRequestQueue: SessionRequestQueue;
 
   constructor(options: OrangeProviderOptions = {}) {
     this.clock = options.clock ?? Date.now;
     this.config = this.buildConfig(options);
     this.mode = this.resolveMode();
+    this.sessionRequestQueue =
+      options.sessionRequestQueue ?? new SessionRequestQueue();
     this.client =
       options.httpClient ??
       axios.create({
@@ -661,7 +670,43 @@ export class OrangeProvider {
     }
   }
 
+  /**
+   * Serializes session-backed requests through a per-session queue so
+   * concurrent callers cannot corrupt shared cookie/CSRF state (Issue #631).
+   * If the session expires while a request is queued, the cached session is
+   * dropped and the request is retried once with a fresh login.
+   */
   private async requestWithSession(
+    request: AxiosRequestConfig,
+    operation: OrangeOperation,
+  ): Promise<AxiosResponse> {
+    const sessionKey = this.sessionQueueKey();
+
+    for (let guard = 0; guard <= 1; guard++) {
+      try {
+        return await this.sessionRequestQueue.enqueue(
+          sessionKey,
+          () => this.performRequestWithSession(request, operation),
+          { sessionExpiresAt: this.session?.expiresAt, operation },
+        );
+      } catch (error) {
+        if (error instanceof SessionTimeoutError && guard === 0) {
+          // Session died while queued — force a fresh login on the retry.
+          this.session = null;
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error("Orange request failed after session re-authentication");
+  }
+
+  private sessionQueueKey(): string {
+    return `orange:${this.mode}:${this.config.webBaseUrl}`;
+  }
+
+  private async performRequestWithSession(
     request: AxiosRequestConfig,
     operation: OrangeOperation,
   ): Promise<AxiosResponse> {

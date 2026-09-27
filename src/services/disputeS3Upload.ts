@@ -206,6 +206,24 @@ export const uploadDisputeEvidenceToS3 = async (
 ): Promise<DisputeUploadResult> => {
   try {
     const { disputeId, file, uploadedBy, metadata = {} } = options;
+
+    // Security validation: file type, size, and malware/executable extension checks
+    const validation = validateDisputeEvidenceFile(file);
+    if (!validation.valid) {
+      return {
+        success: false,
+        error: validation.error || "File security validation failed",
+      };
+    }
+
+    // Check for dangerous double extensions or executable markers
+    const dangerousPattern = /\.(exe|bat|sh|cmd|msi|vbs|ps1|jar|dll|scr|pif)$/i;
+    if (dangerousPattern.test(file.originalname)) {
+      return {
+        success: false,
+        error: "Executable or potentially harmful file format rejected",
+      };
+    }
     
     // Generate unique filename and S3 key
     const uniqueFilename = generateUniqueFilename(file.originalname);

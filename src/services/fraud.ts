@@ -6,6 +6,10 @@ import { FraudAlertModel, FraudRiskLevel, FraudRecommendedAction } from '../mode
 import { redisClient } from '../config/redis';
 import logger from '../utils/logger';
 import { fraudLoggingService } from './fraudLoggingService';
+import {
+  mlFraudDetectionService,
+  MlFraudVerdict,
+} from './mlFraudDetectionService';
 
 /**
  * Enhanced Fraud Detection Service
@@ -25,6 +29,8 @@ import { fraudLoggingService } from './fraudLoggingService';
  * 10. Account Age Risk: New accounts with high-value transactions
  * 11. KYC Level Risk: Low KYC level with high-value transactions
  * 12. Transaction Frequency Spike: Sudden increase in transaction frequency
+ * 13. ML Model Second Opinion: logistic-regression score blended with the
+ *     heuristic score to catch combinations no rule covers (#485)
  *
  * Fraud Score Threshold: 50 (configurable)
  */
@@ -117,6 +123,10 @@ export interface FraudResult {
   heuristicDetails?: Record<string, unknown>;
   durationMs?: number;
   transactionHistoryCount?: number;
+  /** Rule-engine contribution before the ML blend was applied. */
+  heuristicScore?: number;
+  /** Machine-learning probability in [0,1]; absent when no model is active. */
+  mlScore?: number;
 }
 
 function getDistanceKm(
@@ -591,11 +601,40 @@ export class FraudService {
       }, 'Transaction frequency spike check triggered');
     }
 
-    const isFraud = score >= this.config.fraudScoreThreshold;
-    const riskLevel = this.calculateRiskLevel(score);
-    const recommendedAction = this.getRecommendedAction(score, riskLevel);
-    const durationMs = Date.now() - startTime;
+    // 13. Machine-learning second opinion (#485).
+    //     The heuristic score above is precise about known patterns but blind
+    //     to combinations nobody wrote a rule for. Blend in the statistical
+    //     model so novel patterns are still caught. A missing model, or a
+    //     failure to score, must never block a transaction.
+    const mlVerdict = await this.scoreWithModel(
+      transactionInput,
+      userTransactions,
+      now,
+    );
 
+    let mlScore: number | undefined;
+    if (mlVerdict) {
+      mlScore = mlVerdict.score;
+      heuristicDetails.ml_model = {
+        score: mlVerdict.score,
+        threshold: mlVerdict.threshold,
+        modelVersion: mlVerdict.modelVersion,
+        drivers: mlFraudDetectionService.explain(mlVerdict),
+      };
+
+      if (mlVerdict.isFraud && !heuristicsTriggered.includes('ml_model')) {
+        heuristicsTriggered.push('ml_model');
+        reasons.push(
+          `ML model flagged this transaction (score ${mlVerdict.score.toFixed(2)} >= ${mlVerdict.threshold})`,
+        );
+      }
+    }
+
+    const blendedScore = this.blendScores(score, mlScore);
+    const isFraud = blendedScore >= this.config.fraudScoreThreshold;
+    const riskLevel = this.calculateRiskLevel(blendedScore);
+    const recommendedAction = this.getRecommendedAction(blendedScore, riskLevel);
+    const durationMs = Date.now() - startTime;
     // Log comprehensive fraud detection result
     logger.info({
       transactionId: transactionInput.id,
@@ -629,7 +668,7 @@ export class FraudService {
 
     return {
       isFraud,
-      score,
+      score: blendedScore,
       reasons,
       riskLevel,
       heuristicsTriggered,
@@ -637,7 +676,92 @@ export class FraudService {
       heuristicDetails,
       durationMs,
       transactionHistoryCount: userTransactions.length,
+      heuristicScore: score,
+      mlScore,
     };
+  }
+
+  /**
+   * Run the ML detector with whatever history is already in memory.
+   * Never throws – fraud detection must degrade to the rule engine alone.
+   */
+  private async scoreWithModel(
+    transactionInput: FraudTransactionInput,
+    userTransactions: Transaction[],
+    now: Date,
+  ): Promise<MlFraudVerdict | null> {
+    try {
+      const amounts = userTransactions
+        .map((t) => Number(t.amount))
+        .filter((a) => Number.isFinite(a));
+
+      const avg = amounts.length
+        ? amounts.reduce((a, b) => a + b, 0) / amounts.length
+        : transactionInput.amount;
+      const variance = amounts.length
+        ? amounts.reduce((acc, a) => acc + (a - avg) ** 2, 0) / amounts.length
+        : 0;
+
+      const last24h = userTransactions.filter(
+        (t) => now.getTime() - new Date(t.createdAt).getTime() <= 24 * 60 * 60 * 1000,
+      );
+
+      return await mlFraudDetectionService.score({
+        transactionId: transactionInput.id,
+        userId: transactionInput.userId ?? undefined,
+        amount: transactionInput.amount,
+        userAvgAmount: avg,
+        userStdDevAmount: Math.sqrt(variance),
+        userMaxAmount: amounts.length ? Math.max(...amounts) : undefined,
+        transactionsLastHour: userTransactions.filter(
+          (t) =>
+            now.getTime() - new Date(t.createdAt).getTime() <=
+            this.config.timeWindowMs,
+        ).length,
+        transactionsLast24h: last24h.length,
+        distinctCounterparties: new Set(
+          userTransactions.map((t) => t.phoneNumber),
+        ).size,
+        failedTransactions: userTransactions.filter(
+          (t) => t.status === TransactionStatus.Failed,
+        ).length,
+        totalTransactions: userTransactions.length,
+        providerRisk: this.getProviderRisk(transactionInput.provider),
+        timestamp: now,
+      });
+    } catch (err) {
+      logger.warn(
+        { err: err, transactionId: transactionInput.id },
+        'ML fraud scoring unavailable – falling back to heuristics',
+      );
+      return null;
+    }
+  }
+
+  /** Operator-assigned provider risk, used as an ML feature. */
+  private getProviderRisk(provider: string): number {
+    const risk: Record<string, number> = {
+      mtn: 0.2,
+      airtel: 0.2,
+      orange: 0.25,
+      tigo: 0.3,
+      wave: 0.15,
+    };
+    return risk[String(provider ?? '').toLowerCase()] ?? 0.5;
+  }
+
+  /**
+   * Combine the heuristic and ML scores on a common 0–1 scale.
+   *
+   * The heuristic score is normalised by the configured threshold so a
+   * heuristic near the limit and an ML score near its own threshold are
+   * directly comparable. The model contributes 30% of the final score, which
+   * is enough to tip borderline cases without overriding an explicit rule hit.
+   */
+  private blendScores(heuristicScore: number, mlScore?: number): number {
+    if (mlScore === undefined) return heuristicScore;
+    const threshold = Math.max(this.config.fraudScoreThreshold, 1);
+    return heuristicScore + mlScore * threshold * 0.3;
   }
 
   /**

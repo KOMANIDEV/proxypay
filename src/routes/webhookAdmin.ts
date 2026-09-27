@@ -8,6 +8,8 @@ import {
   deleteRetryPolicy,
   getMerchantRetryMetrics,
   getOrCreateDefaultsForMerchant,
+  getWebhookCircuitBreakerState,
+  resetWebhookCircuitBreaker,
 } from "../controllers/webhookAdminController";
 
 const router = Router();
@@ -34,5 +36,11 @@ router.get("/merchants/:merchantId/metrics", getMerchantRetryMetrics);
 
 // POST /api/admin/webhooks/merchants/:merchantId/defaults
 router.post("/merchants/:merchantId/defaults", getOrCreateDefaultsForMerchant);
+
+// GET /api/admin/webhooks/circuit-breakers?url=... (issue #573)
+router.get("/circuit-breakers", getWebhookCircuitBreakerState);
+
+// POST /api/admin/webhooks/circuit-breakers/reset { url } (issue #573)
+router.post("/circuit-breakers/reset", resetWebhookCircuitBreaker);
 
 export default router;

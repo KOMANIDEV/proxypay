@@ -1,3 +1,6 @@
+import logger from "../utils/logger";
+import { SUPPORTED_LOCALES } from "../utils/i18n";
+
 export type ProviderName = "mtn" | "airtel" | "orange" | "generic";
 
 export interface ProviderErrorMapping {
@@ -16,6 +19,21 @@ export interface LocalizedError {
   message: string;
   recoverySuggestion: string;
   locale: string;
+  /** True when the requested locale had no translation and English was used. */
+  fallbackUsed?: boolean;
+  /** Locale the message was actually rendered from (usually "en"). */
+  fallbackLocale?: string;
+}
+
+/**
+ * A locale/code pair for which no translation exists. Recorded at runtime so
+ * the translation gap detection job can surface keys that need translating.
+ */
+export interface TranslationGap {
+  locale: string;
+  code: string;
+  fallbackLocale: string;
+  detectedAt: string;
 }
 
 const ERROR_MAPPINGS: ProviderErrorMapping[] = [
@@ -118,8 +136,20 @@ const LOCALIZED_MESSAGES: Record<string, Record<string, { message: string; recov
   },
 };
 
+const FALLBACK_LOCALE = "en";
+
+function normalizeLocale(locale: string): string {
+  if (!locale) {
+    return FALLBACK_LOCALE;
+  }
+
+  const normalized = locale.trim().toLowerCase().replace(/_/g, "-");
+  return normalized.split("-")[0] || FALLBACK_LOCALE;
+}
+
 export class ProviderErrorMapService {
   private mappings: Map<string, ProviderErrorMapping> = new Map();
+  private translationGaps: Map<string, TranslationGap> = new Map();
 
   constructor() {
     for (const mapping of ERROR_MAPPINGS) {
@@ -149,7 +179,7 @@ export class ProviderErrorMapService {
     };
   }
 
-  getLocalizedError(provider: ProviderName, providerErrorCode: string, locale = "en"): LocalizedError {
+  getLocalizedError(provider: ProviderName, providerErrorCode: string, locale = FALLBACK_LOCALE): LocalizedError {
     const mapping = this.mapError(provider, providerErrorCode);
     if (!mapping) {
       return {
@@ -157,17 +187,109 @@ export class ProviderErrorMapService {
         message: "An unexpected error occurred. Please try again.",
         recoverySuggestion: "Contact support if the issue persists.",
         locale,
+        fallbackUsed: false,
+        fallbackLocale: locale,
       };
     }
 
-    const localized = LOCALIZED_MESSAGES[locale]?.[mapping.mappedCode] || LOCALIZED_MESSAGES["en"]?.[mapping.mappedCode];
+    const normalizedLocale = normalizeLocale(locale);
+    const english = LOCALIZED_MESSAGES[FALLBACK_LOCALE]?.[mapping.mappedCode];
+    const localized = LOCALIZED_MESSAGES[normalizedLocale]?.[mapping.mappedCode];
+
+    // Requested locale has no entry for this code: fall back to English and
+    // record the gap so it can be translated later.
+    if (!localized) {
+      this.recordTranslationGap(normalizedLocale, mapping.mappedCode);
+
+      logger.warn(
+        {
+          locale: normalizedLocale,
+          code: mapping.mappedCode,
+          fallbackLocale: FALLBACK_LOCALE,
+        },
+        "Missing provider error translation, falling back to English",
+      );
+
+      return {
+        code: mapping.mappedCode,
+        message: english?.message || mapping.userMessage,
+        recoverySuggestion: english?.recovery || mapping.recoverySuggestion,
+        locale: normalizedLocale,
+        fallbackUsed: true,
+        fallbackLocale: FALLBACK_LOCALE,
+      };
+    }
 
     return {
       code: mapping.mappedCode,
-      message: localized?.message || mapping.userMessage,
-      recoverySuggestion: localized?.recovery || mapping.recoverySuggestion,
-      locale,
+      message: localized.message,
+      recoverySuggestion: localized.recovery,
+      locale: normalizedLocale,
+      fallbackUsed: false,
+      fallbackLocale: normalizedLocale,
     };
+  }
+
+  /**
+   * Locales the application supports for provider error messages. Combines the
+   * i18n supported locales with any locale that already has a catalog, so a
+   * locale added to the app is reported as a gap until it is translated.
+   */
+  getSupportedLocales(): string[] {
+    return Array.from(
+      new Set<string>([...SUPPORTED_LOCALES, ...Object.keys(LOCALIZED_MESSAGES)]),
+    );
+  }
+
+  /**
+   * Locale/code pairs observed missing at runtime (deduplicated).
+   */
+  getTranslationGaps(): TranslationGap[] {
+    return [...this.translationGaps.values()];
+  }
+
+  clearTranslationGaps(): void {
+    this.translationGaps.clear();
+  }
+
+  private recordTranslationGap(locale: string, code: string): void {
+    const key = `${locale}:${code}`;
+
+    if (this.translationGaps.has(key)) {
+      return;
+    }
+
+    this.translationGaps.set(key, {
+      locale,
+      code,
+      fallbackLocale: FALLBACK_LOCALE,
+      detectedAt: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Static gap report: every English-mapped code that is missing from any
+   * other known locale. Used by the translation gap detection job and
+   * independent of runtime traffic.
+   */
+  detectTranslationGaps(): TranslationGap[] {
+    const detectedAt = new Date().toISOString();
+    const english = LOCALIZED_MESSAGES[FALLBACK_LOCALE] ?? {};
+    const gaps: TranslationGap[] = [];
+
+    for (const locale of this.getSupportedLocales()) {
+      if (locale === FALLBACK_LOCALE) {
+        continue;
+      }
+
+      for (const code of Object.keys(english)) {
+        if (!LOCALIZED_MESSAGES[locale]?.[code]) {
+          gaps.push({ locale, code, fallbackLocale: FALLBACK_LOCALE, detectedAt });
+        }
+      }
+    }
+
+    return gaps;
   }
 
   getErrorDocumentation(provider: ProviderName): ProviderErrorMapping[] {

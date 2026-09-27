@@ -19,9 +19,16 @@ import {
   recordMerchantReviewDecision,
   getMerchantReviewRecord,
   getPendingMerchantReviews,
-  clearReviewStore,
+  expireStaleMerchantReviews,
+  assertReviewIsFresh,
   AccountMergeDryRunReport,
 } from "../../src/services/accountMergeDryRun";
+import { queryRead, queryWrite } from "../../src/config/database";
+
+// The review store is Postgres-backed as of #570. The rest of this file mocks
+// the Stellar server, so mocking the database here keeps the review tests
+// hermetic and lets them assert on the SQL rather than on a Map.
+jest.mock("../../src/config/database");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -109,7 +116,7 @@ function buildMockServer(options: {
 
 describe("Account Merge Dry-Run Service (Issue #421)", () => {
   beforeEach(() => {
-    clearReviewStore();
+    jest.clearAllMocks();
   });
 
   // -------------------------------------------------------------------------
@@ -427,21 +434,66 @@ describe("Account Merge Dry-Run Service (Issue #421)", () => {
       };
     }
 
-    it("creates a pending review record", () => {
+    // A row shaped like the one the INSERT ... RETURNING produces.
+    const storedRow = (overrides: Record<string, any> = {}) => ({
+      id: "11111111-1111-1111-1111-111111111111",
+      source_public_key: "GAAAA",
+      dry_run_report: {},
+      status: "pending",
+      review_requested_at: new Date(),
+      reviewed_at: null,
+      reviewed_by: null,
+      review_notes: null,
+      reclaimable_xlm: "0",
+      ...overrides,
+    });
+
+    it("creates a pending review record", async () => {
       const report = makeDummyReport(randomKeypair().publicKey());
-      const record = submitForMerchantReview(report);
+      (queryWrite as jest.Mock).mockResolvedValue({
+        rows: [storedRow({ dry_run_report: report, source_public_key: report.sourcePublicKey })],
+      });
+
+      const record = await submitForMerchantReview(report);
 
       expect(record.id).toBeDefined();
       expect(record.approved).toBeNull();
       expect(record.reviewedAt).toBeNull();
-      expect(record.dryRunReport).toBe(report);
+      // Round-tripped through JSONB, so the parsed report is compared by value.
+      expect(record.dryRunReport).toEqual(report);
     });
 
-    it("approves a review record", () => {
+    it("stores the report as JSON and carries the reclaimable amount for the queue", async () => {
       const report = makeDummyReport(randomKeypair().publicKey());
-      const record = submitForMerchantReview(report);
+      (queryWrite as jest.Mock).mockResolvedValue({ rows: [storedRow()] });
 
-      const reviewed = recordMerchantReviewDecision(
+      await submitForMerchantReview(report);
+
+      const [sql, params] = (queryWrite as jest.Mock).mock.calls[0];
+      expect(sql).toContain("INSERT INTO account_merge_reviews");
+      expect(JSON.parse(params[1]).sourcePublicKey).toBe(report.sourcePublicKey);
+      // A denormalised column so the pending queue can be sorted by value
+      // without parsing JSONB on every read.
+      expect(params[3]).toBe(report.reclaimableXLM);
+    });
+
+    it("approves a review record", async () => {
+      const report = makeDummyReport(randomKeypair().publicKey());
+      (queryWrite as jest.Mock)
+        .mockResolvedValueOnce({ rows: [storedRow()] })
+        .mockResolvedValueOnce({
+          rows: [
+            storedRow({
+              status: "approved",
+              reviewed_by: "admin-1",
+              review_notes: "Looks good, proceed",
+              reviewed_at: new Date(),
+            }),
+          ],
+        });
+
+      const record = await submitForMerchantReview(report);
+      const reviewed = await recordMerchantReviewDecision(
         record.id,
         true,
         "admin-1",
@@ -454,50 +506,148 @@ describe("Account Merge Dry-Run Service (Issue #421)", () => {
       expect(reviewed.reviewedAt).toBeInstanceOf(Date);
     });
 
-    it("rejects a review record", () => {
-      const report = makeDummyReport(randomKeypair().publicKey());
-      const record = submitForMerchantReview(report);
+    it("rejects a review record", async () => {
+      (queryWrite as jest.Mock)
+        .mockResolvedValueOnce({ rows: [storedRow()] })
+        .mockResolvedValueOnce({
+          rows: [storedRow({ status: "rejected", reviewed_by: "admin-2", reviewed_at: new Date() })],
+        });
 
-      const reviewed = recordMerchantReviewDecision(
-        record.id,
-        false,
-        "admin-2",
-        "Not safe to merge yet",
-      );
+      const record = await submitForMerchantReview(makeDummyReport(randomKeypair().publicKey()));
+      const reviewed = await recordMerchantReviewDecision(record.id, false, "admin-2");
 
       expect(reviewed.approved).toBe(false);
       expect(reviewed.reviewedBy).toBe("admin-2");
     });
 
-    it("throws when reviewing a non-existent record", () => {
-      expect(() =>
-        recordMerchantReviewDecision("non-existent-id", true, "admin"),
-      ).toThrow("not found");
+    it("decides a review in a single guarded UPDATE", async () => {
+      // The 'pending' guard belongs in the WHERE clause, not in JavaScript, or
+      // two reviewers deciding at once would both see 'pending' and the second
+      // write would silently overwrite the first reviewer.
+      (queryWrite as jest.Mock)
+        .mockResolvedValueOnce({ rows: [storedRow()] })
+        .mockResolvedValueOnce({ rows: [storedRow({ status: "approved" })] });
+
+      const record = await submitForMerchantReview(makeDummyReport(randomKeypair().publicKey()));
+      await recordMerchantReviewDecision(record.id, true, "admin-1");
+
+      const [sql] = (queryWrite as jest.Mock).mock.calls[1];
+      expect(sql).toContain("UPDATE account_merge_reviews");
+      expect(sql).toContain("AND status = 'pending'");
     });
 
-    it("lists pending reviews", () => {
-      const r1 = submitForMerchantReview(makeDummyReport(randomKeypair().publicKey()));
-      const r2 = submitForMerchantReview(makeDummyReport(randomKeypair().publicKey()));
+    it("throws when reviewing a non-existent record", async () => {
+      (queryWrite as jest.Mock).mockResolvedValue({ rows: [] });
+      (queryRead as jest.Mock).mockResolvedValue({ rows: [] });
 
-      // Approve r1
-      recordMerchantReviewDecision(r1.id, true, "admin");
-
-      const pending = getPendingMerchantReviews();
-      expect(pending.some((r) => r.id === r2.id)).toBe(true);
-      expect(pending.some((r) => r.id === r1.id)).toBe(false);
+      await expect(recordMerchantReviewDecision("non-existent-id", true, "admin")).rejects.toThrow(
+        "not found",
+      );
     });
 
-    it("retrieves a review record by ID", () => {
-      const report = makeDummyReport(randomKeypair().publicKey());
-      const record = submitForMerchantReview(report);
+    it("refuses to overwrite a decision that has already been made", async () => {
+      (queryWrite as jest.Mock)
+        .mockResolvedValueOnce({ rows: [storedRow()] })
+        .mockResolvedValueOnce({ rows: [] });
+      (queryRead as jest.Mock).mockResolvedValue({
+        rows: [{ status: "approved", reviewed_by: "admin-1", reviewed_at: new Date() }],
+      });
 
-      const fetched = getMerchantReviewRecord(record.id);
+      const record = await submitForMerchantReview(makeDummyReport(randomKeypair().publicKey()));
+
+      // A conflict, not a silent overwrite: the second reviewer needs to know
+      // that someone else already approved this.
+      await expect(
+        recordMerchantReviewDecision(record.id, false, "admin-2"),
+      ).rejects.toThrow(/already approved by admin-1/);
+    });
+
+    it("rejects a second pending review of the same account", async () => {
+      (queryWrite as jest.Mock).mockRejectedValue(
+        Object.assign(new Error("duplicate key"), { code: "23505" }),
+      );
+
+      await expect(
+        submitForMerchantReview(makeDummyReport(randomKeypair().publicKey())),
+      ).rejects.toThrow(/pending review already exists/);
+    });
+
+    it("lets an unrelated database error through unchanged", async () => {
+      (queryWrite as jest.Mock).mockRejectedValue(new Error("connection terminated"));
+
+      await expect(
+        submitForMerchantReview(makeDummyReport(randomKeypair().publicKey())),
+      ).rejects.toThrow("connection terminated");
+    });
+
+    it("lists pending reviews", async () => {
+      (queryRead as jest.Mock).mockResolvedValue({
+        rows: [
+          storedRow({ id: "r1", status: "pending" }),
+          storedRow({ id: "r2", status: "pending" }),
+        ],
+      });
+
+      const pending = await getPendingMerchantReviews();
+      expect(pending.map((r) => r.id).sort()).toEqual(["r1", "r2"]);
+      expect(pending.every((r) => r.approved === null)).toBe(true);
+    });
+
+    it("only ever queries for pending reviews, newest first", async () => {
+      (queryRead as jest.Mock).mockResolvedValue({ rows: [] });
+
+      await getPendingMerchantReviews();
+
+      const [sql] = (queryRead as jest.Mock).mock.calls[0];
+      expect(sql).toContain("WHERE status = 'pending'");
+      expect(sql).toContain("ORDER BY review_requested_at DESC");
+    });
+
+    it("retrieves a review record by ID", async () => {
+      (queryRead as jest.Mock).mockResolvedValue({ rows: [storedRow({ id: "r1" })] });
+
+      const fetched = await getMerchantReviewRecord("r1");
       expect(fetched).toBeDefined();
-      expect(fetched?.id).toBe(record.id);
+      expect(fetched?.id).toBe("r1");
     });
 
-    it("returns undefined for unknown review ID", () => {
-      expect(getMerchantReviewRecord("unknown")).toBeUndefined();
+    it("returns undefined for unknown review ID", async () => {
+      (queryRead as jest.Mock).mockResolvedValue({ rows: [] });
+
+      expect(await getMerchantReviewRecord("unknown")).toBeUndefined();
+    });
+
+    it("refuses a decision on a review that has expired", async () => {
+      // The UPDATE guards on status, but a review can be pending AND stale if
+      // nobody has run the sweep. This is what stops an approval of week-old
+      // numbers from going through.
+      (queryRead as jest.Mock).mockResolvedValue({
+        rows: [{ review_requested_at: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) }],
+      });
+
+      await expect(assertReviewIsFresh("r1")).rejects.toThrow(/must be re-run/);
+    });
+
+    it("accepts a decision on a review inside its TTL", async () => {
+      (queryRead as jest.Mock).mockResolvedValue({
+        rows: [{ review_requested_at: new Date(Date.now() - 60 * 60 * 1000) }],
+      });
+
+      await expect(assertReviewIsFresh("r1")).resolves.toBeUndefined();
+    });
+
+    it("expires stale reviews without deleting them", async () => {
+      (queryWrite as jest.Mock).mockResolvedValue({ rows: [{ id: "r1" }, { id: "r2" }] });
+
+      const count = await expireStaleMerchantReviews(7);
+
+      expect(count).toBe(2);
+      const [sql] = (queryWrite as jest.Mock).mock.calls[0];
+      expect(sql).toContain("SET status = 'expired'");
+      expect(sql).toContain("AND status = 'pending'");
+      // An expired review is still the record of a review that went stale,
+      // which is not the same as a review that was never made.
+      expect(sql).not.toContain("DELETE");
     });
   });
 });

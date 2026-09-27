@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import { createGunzip, createGzip } from "zlib";
 import { pipeline } from "stream/promises";
 import { Readable, Writable } from "stream";
+import logger from "../utils/logger";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,6 +14,19 @@ export interface TransactionDelta {
   removedFields: string[];
   sequenceNumber: number;
   timestamp: number;
+}
+
+/**
+ * Result of validating that a delta, when applied to its base snapshot,
+ * reconstructs the target snapshot exactly.
+ */
+export interface DeltaValidationResult {
+  /** True when the reconstructed snapshot deep-equals the target snapshot. */
+  valid: boolean;
+  /** Snapshot produced by applying the delta to the base snapshot. */
+  reconstructed: TransactionSnapshot | null;
+  /** Human-readable descriptions of every mismatch that was found. */
+  errors: string[];
 }
 
 export interface CompressedPayload {
@@ -55,6 +69,7 @@ const MAX_CACHE_ENTRIES = 1000;
 export class TransactionCompressionService {
   private snapshots: Map<string, TransactionSnapshot> = new Map();
   private sequenceCounters: Map<string, number> = new Map();
+  private deltaValidationFailures = 0;
   private bandwidthMetrics: BandwidthMetrics = {
     totalPayloadsSent: 0,
     totalBytesUncompressed: 0,
@@ -136,6 +151,47 @@ export class TransactionCompressionService {
   clearSnapshot(transactionId: string): void {
     this.snapshots.delete(transactionId);
     this.sequenceCounters.delete(transactionId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Delta validation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Validate that applying `delta` to `base` reconstructs `target` exactly.
+   *
+   * A mismatch means the delta payload would corrupt client state, so
+   * failures are logged (with the delta sequence number) and counted for
+   * observability instead of being silently accepted.
+   */
+  validateDelta(
+    transactionId: string,
+    base: TransactionSnapshot,
+    target: TransactionSnapshot,
+    delta: TransactionDelta,
+  ): DeltaValidationResult {
+    const result = validateDelta(base, target, delta);
+
+    if (!result.valid) {
+      this.deltaValidationFailures += 1;
+      logger.error(
+        {
+          transactionId,
+          sequenceNumber: delta.sequenceNumber,
+          errors: result.errors,
+        },
+        "Transaction delta validation failed",
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * Number of delta validations that failed since the last reset.
+   */
+  getDeltaValidationFailureCount(): number {
+    return this.deltaValidationFailures;
   }
 
   // -------------------------------------------------------------------------
@@ -293,8 +349,83 @@ export class TransactionCompressionService {
   reset(): void {
     this.snapshots.clear();
     this.sequenceCounters.clear();
+    this.deltaValidationFailures = 0;
     this.resetBandwidthMetrics();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Delta helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply a delta to a base snapshot, producing the reconstructed snapshot.
+ * Changed fields are upserted and removed fields are deleted.
+ */
+export function applyDelta(
+  base: TransactionSnapshot,
+  delta: TransactionDelta,
+): TransactionSnapshot {
+  const reconstructed: TransactionSnapshot = { ...base };
+
+  for (const [key, value] of Object.entries(delta.changedFields)) {
+    reconstructed[key] = value;
+  }
+
+  for (const field of delta.removedFields) {
+    delete reconstructed[field];
+  }
+
+  return reconstructed;
+}
+
+/**
+ * Verify that `base + delta === target`.
+ *
+ * Field-by-field comparison is used (rather than a JSON.stringify equality
+ * check) so that a mismatch reports every offending field instead of only the
+ * first one, which makes production debugging possible.
+ */
+export function validateDelta(
+  base: TransactionSnapshot,
+  target: TransactionSnapshot,
+  delta: TransactionDelta,
+): DeltaValidationResult {
+  const reconstructed = applyDelta(base, delta);
+  const errors: string[] = [];
+
+  for (const [key, value] of Object.entries(target)) {
+    if (key === "id") continue;
+
+    if (!(key in reconstructed)) {
+      errors.push(`field missing after applying delta: ${key}`);
+      continue;
+    }
+
+    if (JSON.stringify(reconstructed[key]) !== JSON.stringify(value)) {
+      errors.push(`field mismatch after applying delta: ${key}`);
+    }
+  }
+
+  for (const key of Object.keys(reconstructed)) {
+    if (key === "id") continue;
+
+    if (!(key in target)) {
+      errors.push(`unexpected field after applying delta: ${key}`);
+    }
+  }
+
+  for (const field of delta.removedFields) {
+    if (field in reconstructed) {
+      errors.push(`field marked removed is still present: ${field}`);
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    reconstructed,
+    errors,
+  };
 }
 
 // ---------------------------------------------------------------------------

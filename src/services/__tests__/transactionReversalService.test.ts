@@ -23,7 +23,10 @@ describe("TransactionReversalService", () => {
         .mockResolvedValueOnce({ ...transaction, status: TransactionStatus.Reversed }),
       updateStatus: jest.fn().mockResolvedValue(undefined),
     };
-    reversalService = new TransactionReversalService(transactionModel as any);
+    // The second argument disables durable reversal tracking so this suite
+    // exercises only the ledger behaviour; persistence is covered by
+    // transactionReversalState.test.ts.
+    reversalService = new TransactionReversalService(transactionModel as any, false);
     jest.spyOn(ledgerService, "postReversal").mockResolvedValue({
       alreadyReversed: false,
       entries: [],

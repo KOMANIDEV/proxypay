@@ -8,6 +8,10 @@ import axios, {
 import logger from "../../../utils/logger";
 import { maskPII } from "../../../utils/masking";
 import { formatPhoneForProvider } from "../../../utils/phoneUtils";
+import {
+  SessionRequestQueue,
+  SessionTimeoutError,
+} from "../sessionRequestQueue";
 
 // ============================================================================
 // TYPES & INTERFACES
@@ -88,6 +92,8 @@ interface AirtelProviderOptions extends Partial<AirtelProviderConfig> {
   proxyHttpClient?: AirtelHttpClient;
   directHttpClient?: AirtelHttpClient;
   clock?: () => number;
+  /** Optional shared queue; one is created per provider when omitted. */
+  sessionRequestQueue?: SessionRequestQueue;
 }
 
 const DEFAULT_SESSION_TTL_MS = 20 * 60 * 1000;
@@ -108,11 +114,14 @@ export class AirtelService {
   private session: AirtelSessionState | null = null;
   private sessionPromise: Promise<AirtelSessionState> | null = null;
   private readonly clock: () => number;
+  private readonly sessionRequestQueue: SessionRequestQueue;
 
   constructor(options: AirtelProviderOptions = {}) {
     this.clock = options.clock ?? Date.now;
     this.config = this.buildConfig(options);
     this.mode = this.resolveMode();
+    this.sessionRequestQueue =
+      options.sessionRequestQueue ?? new SessionRequestQueue();
 
     this.client =
       options.httpClient ??
@@ -783,7 +792,43 @@ export class AirtelService {
     return this.toProviderResult(response, reference);
   }
 
+  /**
+   * Serializes session-backed requests through a per-session queue so
+   * concurrent callers cannot corrupt shared cookie/CSRF state (Issue #631).
+   * If the session expires while a request is queued, the cached session is
+   * dropped and the request is retried once with a fresh login.
+   */
   private async requestWithSessionAndRetry(
+    request: AxiosRequestConfig,
+    operation: "payment" | "payout",
+  ): Promise<AxiosResponse> {
+    const sessionKey = this.sessionQueueKey();
+
+    for (let guard = 0; guard <= 1; guard++) {
+      try {
+        return await this.sessionRequestQueue.enqueue(
+          sessionKey,
+          () => this.performRequestWithSessionAndRetry(request, operation),
+          { sessionExpiresAt: this.session?.expiresAt, operation },
+        );
+      } catch (error) {
+        if (error instanceof SessionTimeoutError && guard === 0) {
+          // Session died while queued — force a fresh login on the retry.
+          this.session = null;
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error("Airtel request failed after session re-authentication");
+  }
+
+  private sessionQueueKey(): string {
+    return `airtel:${this.mode}:${this.config.webBaseUrl}`;
+  }
+
+  private async performRequestWithSessionAndRetry(
     request: AxiosRequestConfig,
     operation: "payment" | "payout",
   ): Promise<AxiosResponse> {

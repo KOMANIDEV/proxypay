@@ -4,13 +4,27 @@ import { gzip } from "zlib";
 import { promisify } from "util";
 import { Transaction, WebhookDeliveryUpdate } from "../models/transaction";
 import {
+  CIRCUIT_HALF_OPEN,
+  CIRCUIT_OPEN,
+  type WebhookCircuitBreaker,
+  getWebhookCircuitBreaker,
+} from "./webhookCircuitBreaker";
+import {
   webhookRetryAttemptsTotal,
   webhookDeliveryDurationSeconds,
   webhookDeliveryRetriesTotal,
   webhookBackoffDelaySeconds,
+  webhookCircuitBreakerSkippedTotal,
 } from "../utils/metrics";
+import {
+  WebhookCircuitBreaker,
+  WebhookCircuitBreakerOptions,
+  WebhookCircuitBreakerRegistry,
+} from "./webhookCircuitBreaker";
 
 const gzipAsync = promisify(gzip);
+
+const WEBHOOK_CIRCUIT_BREAKER_RECOVERY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export type WebhookEvent = "transaction.completed" | "transaction.failed" | "transaction.cancelled" | "transaction.pending";
 export type WebhookDeliveryStatus =
@@ -85,7 +99,7 @@ export interface WebhookDeliveryResult {
   lastError?: string | null;
 }
 
-interface WebhookLogger {
+export interface WebhookLogger {
   log: (...args: unknown[]) => void;
   warn: (...args: unknown[]) => void;
   error: (...args: unknown[]) => void;
@@ -342,6 +356,24 @@ export class WebhookService {
       };
     }
 
+    // Consulted before any network call, which is the entire point: an open
+    // breaker must cost one map lookup, not `maxAttempts` round trips.
+    const circuit = this.circuitBlocksDelivery();
+    if (circuit === "open") {
+      const message = "Circuit breaker is open for this webhook destination";
+      this.logger.warn(
+        `[webhook] delivery suppressed event=${event} transactionId=${transaction.id}: ${message}`,
+      );
+      webhookCircuitBreakerSkippedTotal.inc({ event_type: event });
+      return {
+        status: "skipped",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: message,
+      };
+    }
+
     const payload = this.buildPayload(event, transaction);
     const validation = webhookPayloadSchema.safeParse(payload);
     if (!validation.success) {
@@ -386,6 +418,10 @@ export class WebhookService {
         if (attempt > 1) {
           webhookDeliveryRetriesTotal.inc({ event_type: event, final_status: "delivered" });
         }
+
+        // A delivery that lands closes the breaker, including when it was the
+        // half-open probe: that is the evidence the destination is back.
+        this.circuitBreaker.recordSuccess(this.webhookUrl);
 
         return {
           status: "delivered",
@@ -440,6 +476,12 @@ export class WebhookService {
     const durationSecs = (Date.now() - deliveryStart) / 1000;
     webhookDeliveryDurationSeconds.observe({ event_type: event, status: "failed" }, durationSecs);
     webhookDeliveryRetriesTotal.inc({ event_type: event, final_status: "failed" });
+    this.onDeliveryFailure(lastError);
+
+    // The retries are over, so the whole delivery is one failure as far as the
+    // breaker is concerned. Counting each attempt would trip it on a single
+    // flaky delivery; this is the "that endpoint is broken" signal.
+    this.circuitBreaker.recordFailure(this.webhookUrl, lastError, circuit === "probe");
 
     return {
       status: "failed",
@@ -469,6 +511,23 @@ export class WebhookService {
     if (!this.webhookSecret) {
       const message = "WEBHOOK_SECRET is not configured";
       this.logger.warn(`[webhook] ${message}`);
+      return {
+        status: "skipped",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: message,
+      };
+    }
+
+    // Same breaker check as `sendTransactionEvent`; see the comment there.
+    const circuit = this.circuitBlocksDelivery();
+    if (circuit === "open") {
+      const message = "Circuit breaker is open for this webhook destination";
+      this.logger.warn(
+        `[webhook] flat delivery suppressed event=${event} transactionId=${transaction.id}: ${message}`,
+      );
+      webhookCircuitBreakerSkippedTotal.inc({ event_type: event });
       return {
         status: "skipped",
         attempts: 0,
@@ -519,6 +578,8 @@ export class WebhookService {
         if (attempt > 1) {
           webhookDeliveryRetriesTotal.inc({ event_type: event, final_status: "delivered" });
         }
+
+        this.circuitBreaker.recordSuccess(this.webhookUrl);
 
         return {
           status: "delivered",
@@ -571,6 +632,9 @@ export class WebhookService {
     const durationSecs = (Date.now() - deliveryStart) / 1000;
     webhookDeliveryDurationSeconds.observe({ event_type: event, status: "failed" }, durationSecs);
     webhookDeliveryRetriesTotal.inc({ event_type: event, final_status: "failed" });
+    this.onDeliveryFailure(lastError);
+
+    this.circuitBreaker.recordFailure(this.webhookUrl, lastError, circuit === "probe");
 
     return {
       status: "failed",
@@ -609,6 +673,11 @@ export class WebhookService {
     const entries = await outboxModel.findNextToProcess(batchSize);
     let processed = 0;
     let failures = 0;
+
+    // Issue #573: skip the whole batch while the circuit is open.
+    if (this.circuitGate()) {
+      return { processed: 0, failures: 0 };
+    }
 
     for (const entry of entries) {
       const now = this.now();

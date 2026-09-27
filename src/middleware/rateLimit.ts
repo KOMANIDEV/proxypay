@@ -26,6 +26,23 @@ export const RATE_LIMIT_CONFIG = {
   CANCELLATION_LIMIT: 5,
   CANCELLATION_WINDOW_MS: 60 * 60 * 1000, // 1 hour
 
+  // SEP-30 key recovery (#572): deliberately the tightest limit in this file.
+  // The recovery flow is the one place in the product where an unauthenticated
+  // caller can drive a key rotation, and each approval attempt is a cheap
+  // operation for the attacker and an expensive one for the operator: a
+  // successful recovery locks every legitimate signer out of the key. 5 attempts
+  // per 15 minutes leaves room for a real 3-of-5 ceremony and no room for
+  // guessing.
+  RECOVERY_LIMIT: 5,
+  RECOVERY_WINDOW_MS: 15 * 60 * 1000, // 15 minutes
+
+  // Asset issuance workflow (#571): 10 write operations per hour per admin.
+  // Deliberately low. Every request in this workflow can create a real asset or
+  // move funds once approved, so the thing being limited is a privileged,
+  // irreversible action rather than a query.
+  ASSET_ISSUANCE_LIMIT: 10,
+  ASSET_ISSUANCE_WINDOW_MS: 60 * 60 * 1000, // 1 hour
+
   // List queries: warn when requesting more than 1000 items
   MASSIVE_LIST_THRESHOLD: 1000,
 
@@ -79,6 +96,275 @@ export function createTierRateLimitMiddleware(tier: UserTier) {
 
     next();
   };
+}
+
+/**
+ * Per-endpoint rate limit configuration.
+ *
+ * Endpoints have very different sensitivity: a login attempt is brute-force
+ * sensitive while webhook ingestion is machine traffic. Each entry is keyed by
+ * `"<METHOD> <path>"` and may override the shared window with:
+ *
+ *  - `providerOverrides` — different mobile-money upstreams have different
+ *    throughput characteristics (MTN vs Airtel vs Orange).
+ *  - `tierOverrides`     — VIP customers get a larger allowance than standard.
+ *
+ * Precedence when resolving a request: tier override > provider override >
+ * endpoint default > RATE_LIMIT_CONFIG global default.
+ */
+export type ProviderName = "mtn" | "airtel" | "orange" | "default";
+export type AudienceTier = "standard" | "vip";
+export type EndpointRateLimitKeyBy = "ip" | "user" | "provider";
+
+export interface RateLimitWindow {
+  limit: number;
+  windowMs: number;
+}
+
+export interface EndpointRateLimitConfig extends RateLimitWindow {
+  /** How the bucket key is scoped for this endpoint. Defaults to "ip". */
+  keyBy?: EndpointRateLimitKeyBy;
+  /** Provider-specific overrides (MTN / Airtel / Orange). */
+  providerOverrides?: Partial<Record<ProviderName, RateLimitWindow>>;
+  /** User-tier overrides (VIP vs standard). */
+  tierOverrides?: Partial<Record<AudienceTier, RateLimitWindow>>;
+}
+
+export const RATE_LIMIT_PROVIDERS: readonly ProviderName[] = [
+  "mtn",
+  "airtel",
+  "orange",
+  "default",
+];
+export const RATE_LIMIT_TIERS: readonly AudienceTier[] = ["standard", "vip"];
+export const ENDPOINT_RATE_LIMIT_KEY_BY: readonly EndpointRateLimitKeyBy[] = [
+  "ip",
+  "user",
+  "provider",
+];
+
+export const ENDPOINT_RATE_LIMITS: Record<string, EndpointRateLimitConfig> = {
+  // Brute-force sensitive auth endpoints — keyed per IP.
+  "POST /api/auth/login": { limit: 10, windowMs: 60 * 1000, keyBy: "ip" },
+  "POST /api/auth/2fa/verify": { limit: 10, windowMs: 60 * 1000, keyBy: "ip" },
+
+  // Transaction creation: providers are throttled differently upstream and VIP
+  // customers are allowed a much larger burst.
+  "POST /api/transactions": {
+    limit: 60,
+    windowMs: 60 * 1000,
+    keyBy: "user",
+    providerOverrides: {
+      mtn: { limit: 80, windowMs: 60 * 1000 },
+      airtel: { limit: 50, windowMs: 60 * 1000 },
+      orange: { limit: 40, windowMs: 60 * 1000 },
+    },
+    tierOverrides: {
+      vip: { limit: 300, windowMs: 60 * 1000 },
+    },
+  },
+
+  "GET /api/transactions": {
+    limit: 120,
+    windowMs: 60 * 1000,
+    keyBy: "user",
+    tierOverrides: {
+      vip: { limit: 600, windowMs: 60 * 1000 },
+    },
+  },
+
+  "GET /api/transactions/:id/receipt": {
+    limit: 60,
+    windowMs: 60 * 1000,
+    keyBy: "user",
+  },
+
+  // Inbound provider callbacks: high-volume machine traffic keyed per IP.
+  "POST /api/webhooks": { limit: 600, windowMs: 60 * 1000, keyBy: "ip" },
+
+  // Heavy reporting endpoints keep a slow bucket regardless of tier.
+  "GET /api/reports/export": {
+    limit: 5,
+    windowMs: 60 * 60 * 1000,
+    keyBy: "user",
+  },
+};
+
+const ENDPOINT_KEY_PATTERN = /^(GET|POST|PUT|PATCH|DELETE) \/\S+$/;
+
+export interface RateLimitConfigValidationResult {
+  valid: boolean;
+  errors: string[];
+}
+
+function validateWindow(
+  window: Partial<RateLimitWindow> | undefined,
+  scope: string,
+  errors: string[],
+): void {
+  if (!window) return;
+  if (!Number.isInteger(window.limit) || (window.limit ?? 0) <= 0) {
+    errors.push(`${scope}: limit must be a positive integer.`);
+  }
+  if (!Number.isInteger(window.windowMs) || (window.windowMs ?? 0) < 1000) {
+    errors.push(`${scope}: windowMs must be an integer >= 1000.`);
+  }
+}
+
+/**
+ * Validates a per-endpoint configuration table. Called on module load so a bad
+ * table fails fast at startup instead of at request time.
+ */
+export function validateRateLimitConfig(
+  config: Record<string, EndpointRateLimitConfig> = ENDPOINT_RATE_LIMITS,
+): RateLimitConfigValidationResult {
+  const errors: string[] = [];
+
+  if (
+    !config ||
+    typeof config !== "object" ||
+    Object.keys(config).length === 0
+  ) {
+    return {
+      valid: false,
+      errors: ["Endpoint rate limit configuration is empty."],
+    };
+  }
+
+  for (const [endpoint, rule] of Object.entries(config)) {
+    if (!ENDPOINT_KEY_PATTERN.test(endpoint)) {
+      errors.push(
+        `"${endpoint}": expected "<METHOD> <path>", e.g. "POST /api/transactions".`,
+      );
+    }
+
+    validateWindow(rule, `"${endpoint}"`, errors);
+
+    if (rule.keyBy && !ENDPOINT_RATE_LIMIT_KEY_BY.includes(rule.keyBy)) {
+      errors.push(
+        `"${endpoint}": invalid keyBy "${rule.keyBy}" (expected ${ENDPOINT_RATE_LIMIT_KEY_BY.join(", ")}).`,
+      );
+    }
+
+    for (const [provider, override] of Object.entries(
+      rule.providerOverrides ?? {},
+    )) {
+      if (!RATE_LIMIT_PROVIDERS.includes(provider as ProviderName)) {
+        errors.push(
+          `"${endpoint}": unknown provider override "${provider}" (expected ${RATE_LIMIT_PROVIDERS.join(", ")}).`,
+        );
+      }
+      validateWindow(override, `"${endpoint}" provider "${provider}"`, errors);
+    }
+
+    for (const [tier, override] of Object.entries(rule.tierOverrides ?? {})) {
+      if (!RATE_LIMIT_TIERS.includes(tier as AudienceTier)) {
+        errors.push(
+          `"${endpoint}": unknown tier override "${tier}" (expected ${RATE_LIMIT_TIERS.join(", ")}).`,
+        );
+      }
+      validateWindow(override, `"${endpoint}" tier "${tier}"`, errors);
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/** Throws when the per-endpoint table is invalid. */
+export function assertValidRateLimitConfig(
+  config: Record<string, EndpointRateLimitConfig> = ENDPOINT_RATE_LIMITS,
+): void {
+  const { valid, errors } = validateRateLimitConfig(config);
+  if (!valid) {
+    throw new Error(
+      `Invalid rate limit configuration:\n - ${errors.join("\n - ")}`,
+    );
+  }
+}
+
+// Fail fast on startup — misconfigured limits should not reach production.
+assertValidRateLimitConfig();
+
+export interface ResolvedRateLimit extends RateLimitWindow {
+  endpoint: string;
+  keyBy: EndpointRateLimitKeyBy;
+  provider: ProviderName;
+  tier: AudienceTier;
+  source: "tier-override" | "provider-override" | "endpoint" | "global-default";
+}
+
+/** Normalises free-form provider strings ("MTN MoMo", "mtn-momo") to a name. */
+export function normaliseProvider(provider?: string | null): ProviderName {
+  if (!provider) return "default";
+  const value = provider.trim().toLowerCase().replace(/[\s_]/g, "-");
+  if (value.startsWith("mtn")) return "mtn";
+  if (value.startsWith("airtel")) return "airtel";
+  if (value.startsWith("orange")) return "orange";
+  return "default";
+}
+
+/** Maps a user tier onto the VIP / standard audience used by overrides. */
+export function normaliseTier(tier?: string | null): AudienceTier {
+  if (!tier) return "standard";
+  const value = tier.trim().toLowerCase();
+  return value === "vip" || value === "premium" ? "vip" : "standard";
+}
+
+/**
+ * Resolves the effective limit for an endpoint, applying provider and tier
+ * overrides. Unknown endpoints fall back to the global safety-net limit.
+ */
+export function resolveEndpointRateLimit(
+  endpoint: string,
+  options: { provider?: string | null; tier?: string | null } = {},
+): ResolvedRateLimit {
+  const provider = normaliseProvider(options.provider);
+  const tier = normaliseTier(options.tier);
+  const rule = ENDPOINT_RATE_LIMITS[endpoint];
+
+  if (!rule) {
+    return {
+      endpoint,
+      limit: RATE_LIMIT_CONFIG.GLOBAL_LIMIT,
+      windowMs: RATE_LIMIT_CONFIG.GLOBAL_WINDOW_MS,
+      keyBy: "ip",
+      provider,
+      tier,
+      source: "global-default",
+    };
+  }
+
+  const base: ResolvedRateLimit = {
+    endpoint,
+    limit: rule.limit,
+    windowMs: rule.windowMs,
+    keyBy: rule.keyBy ?? "ip",
+    provider,
+    tier,
+    source: "endpoint",
+  };
+
+  const tierOverride = rule.tierOverrides?.[tier];
+  if (tierOverride) {
+    return {
+      ...base,
+      limit: tierOverride.limit,
+      windowMs: tierOverride.windowMs,
+      source: "tier-override",
+    };
+  }
+
+  const providerOverride = rule.providerOverrides?.[provider];
+  if (provider !== "default" && providerOverride) {
+    return {
+      ...base,
+      limit: providerOverride.limit,
+      windowMs: providerOverride.windowMs,
+      source: "provider-override",
+    };
+  }
+
+  return base;
 }
 
 /**
@@ -172,6 +458,116 @@ const logHighSeverity = (message: string, context: Record<string, unknown>) => {
 const generateRateLimitKey = (userId: string, endpoint: string): string => {
   return `ratelimit:${userId}:${endpoint}`;
 };
+
+export interface EndpointRateLimiterOptions {
+  /** Overrides how the provider is read from the request (defaults to params/query/body/headers). */
+  getProvider?: (req: Request) => string | undefined;
+  /** Overrides how the user tier is read from the request (defaults to req.user / req.jwtUser). */
+  getTier?: (req: Request) => string | undefined;
+}
+
+function defaultProviderSelector(req: Request): string | undefined {
+  const candidate = [
+    req.params?.provider,
+    req.query?.provider,
+    (req.body as Record<string, unknown> | undefined)?.provider,
+    req.headers["x-provider"],
+    req.headers["x-provider-id"],
+  ].find((value) => typeof value === "string" && value.trim().length > 0);
+
+  return typeof candidate === "string" ? candidate : undefined;
+}
+
+function defaultTierSelector(req: Request): string | undefined {
+  const user = (req as any).user ?? (req as any).jwtUser;
+  if (!user) return undefined;
+  if (user.isVip === true || user.vip === true) return "vip";
+  return typeof user.tier === "string" ? user.tier : undefined;
+}
+
+function resolveRateLimitIdentity(
+  req: Request,
+  keyBy: EndpointRateLimitKeyBy,
+  provider: ProviderName,
+): string {
+  if (keyBy === "provider") return provider;
+  if (keyBy === "user") {
+    const user = (req as any).user ?? (req as any).jwtUser;
+    return String(user?.id ?? user?.userId ?? req.ip ?? "anonymous");
+  }
+  return req.ip ?? "unknown";
+}
+
+/**
+ * Factory: creates a rate limit middleware for a single endpoint, honouring the
+ * per-provider and per-tier overrides configured in {@link ENDPOINT_RATE_LIMITS}.
+ *
+ * @param endpoint - Endpoint key in `"<METHOD> <path>"` format.
+ *
+ * @example
+ * router.post("/transactions", createEndpointRateLimiter("POST /api/transactions"), handler);
+ */
+export function createEndpointRateLimiter(
+  endpoint: string,
+  options: EndpointRateLimiterOptions = {},
+) {
+  const getProvider = options.getProvider ?? defaultProviderSelector;
+  const getTier = options.getTier ?? defaultTierSelector;
+
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const provider = normaliseProvider(getProvider(req));
+    const tier = normaliseTier(getTier(req));
+    const resolved = resolveEndpointRateLimit(endpoint, { provider, tier });
+    const identity = resolveRateLimitIdentity(req, resolved.keyBy, provider);
+    const key = `ratelimit:endpoint:${endpoint}:${provider}:${tier}:${identity}`;
+
+    const { allowed, remaining, resetTime } = await checkRateLimit(
+      key,
+      resolved.limit,
+      resolved.windowMs,
+    );
+
+    res.setHeader("X-RateLimit-Limit", resolved.limit);
+    res.setHeader("X-RateLimit-Remaining", remaining);
+    res.setHeader("X-RateLimit-Reset", new Date(resetTime).toISOString());
+    res.setHeader(
+      "X-RateLimit-Policy",
+      `${resolved.limit};w=${Math.ceil(resolved.windowMs / 1000)}`,
+    );
+
+    if (!allowed) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((resetTime - Date.now()) / 1000),
+      );
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+
+      logHighSeverity("Endpoint rate limit exceeded", {
+        endpoint,
+        limit: resolved.limit,
+        windowMs: resolved.windowMs,
+        provider: resolved.provider,
+        tier: resolved.tier,
+        source: resolved.source,
+        path: req.path,
+        method: req.method,
+      });
+
+      return res.status(429).json({
+        error: "Rate limit exceeded",
+        message: `Rate limit exceeded for ${endpoint}`,
+        endpoint,
+        limit: resolved.limit,
+        provider: resolved.provider,
+        tier: resolved.tier,
+        source: resolved.source,
+        retryAfter: retryAfterSeconds,
+      });
+    }
+
+    next();
+  };
+}
 
 /**
  * Global rate limit middleware.
@@ -570,6 +966,123 @@ export const rateLimitListQueries = (
       threshold: RATE_LIMIT_CONFIG.SUSPICIOUS_QUERY_THRESHOLD,
       path: req.path,
       timestamp: new Date().toISOString(),
+    });
+  }
+
+  next();
+};
+
+/**
+ * Middleware: for assetIssuanceRateLimiter (#571)
+ * Limit: 10 write operations per hour per admin
+ *
+ * Applied to the asset issuance workflow's mutating routes: creating a request,
+ * submitting it, approving or rejecting it, and configuring a trustline. Reads
+ * are left alone — a list endpoint is not worth a budget, and rate limiting
+ * reads here would break the approval queue for no security benefit.
+ */
+export const assetIssuanceRateLimiter = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  // `req.jwtUser` is what `requireAuth` actually sets; `req.user` is checked as
+  // a fallback for any mount point that populates it instead. Reading only
+  // `req.user` would rate limit nothing here, because it is never populated in
+  // the normal auth path.
+  const userId = req.jwtUser?.userId || (req as any).user?.id;
+
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const key = generateRateLimitKey(userId, "ASSET_ISSUANCE");
+  const { allowed, remaining, resetTime } = await checkRateLimit(
+    key,
+    RATE_LIMIT_CONFIG.ASSET_ISSUANCE_LIMIT,
+    RATE_LIMIT_CONFIG.ASSET_ISSUANCE_WINDOW_MS,
+  );
+
+  res.setHeader("X-RateLimit-Limit", RATE_LIMIT_CONFIG.ASSET_ISSUANCE_LIMIT);
+  res.setHeader("X-RateLimit-Remaining", remaining);
+  res.setHeader("X-RateLimit-Reset", new Date(resetTime).toISOString());
+
+  if (!allowed) {
+    const retryAfterSeconds = Math.ceil((resetTime - Date.now()) / 1000);
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+
+    logHighSeverity("Asset issuance rate limit exceeded", {
+      userId,
+      limit: RATE_LIMIT_CONFIG.ASSET_ISSUANCE_LIMIT,
+      window: "1 hour",
+      path: req.path,
+      method: req.method,
+    });
+
+    return res.status(429).json({
+      error: "Rate limit exceeded for asset issuance operations",
+      retryAfter: retryAfterSeconds,
+    });
+  }
+
+  next();
+};
+
+/**
+ * Middleware: for sep30RecoveryRateLimiter (#572)
+ * Limit: 5 recovery operations per 15 minutes
+ *
+ * Keyed on the managed key rather than the user, because the thing being
+ * protected is the key. A caller who rotates their identity is still working
+ * against the same key, and a per-user limit would let a single recovery be
+ * attacked from several accounts.
+ *
+ * Unlike `sep24RateLimiter` and friends, a caller with no authenticated identity
+ * is *not* rejected with 401 here. The key id is still rate limited, so an
+ * anonymous flood is bounded, and rejecting anonymous callers outright would
+ * turn a rate limiter into an authentication check — which is the wrong tool and
+ * would change the response code for a case that is already handled downstream.
+ */
+export const sep30RecoveryRateLimiter = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  // Prefer the authenticated user so one operator cannot exhaust another
+  // operator's budget, and fall back to the key id when there is no user.
+  const subject =
+    req.jwtUser?.userId ||
+    (req as any).user?.id ||
+    req.params?.keyId ||
+    req.ip ||
+    "unknown";
+
+  const key = generateRateLimitKey(`sep30-recovery:${subject}`, "SEP30_RECOVERY");
+  const { allowed, remaining, resetTime } = await checkRateLimit(
+    key,
+    RATE_LIMIT_CONFIG.RECOVERY_LIMIT,
+    RATE_LIMIT_CONFIG.RECOVERY_WINDOW_MS,
+  );
+
+  res.setHeader("X-RateLimit-Limit", RATE_LIMIT_CONFIG.RECOVERY_LIMIT);
+  res.setHeader("X-RateLimit-Remaining", remaining);
+  res.setHeader("X-RateLimit-Reset", new Date(resetTime).toISOString());
+
+  if (!allowed) {
+    const retryAfterSeconds = Math.ceil((resetTime - Date.now()) / 1000);
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+
+    logHighSeverity("SEP-30 recovery rate limit exceeded", {
+      subject,
+      limit: RATE_LIMIT_CONFIG.RECOVERY_LIMIT,
+      window: "15 minutes",
+      path: req.path,
+      method: req.method,
+    });
+
+    return res.status(429).json({
+      error: "Rate limit exceeded for key recovery operations",
+      retryAfter: retryAfterSeconds,
     });
   }
 

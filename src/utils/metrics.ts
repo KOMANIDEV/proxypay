@@ -408,6 +408,21 @@ export const transactionClassifierTrainingSamples = new Gauge({
   registers: [register],
 });
 
+// Webhook Circuit Breaker Metrics (#573)
+export const WebhookCircuitBreakerTransitionTotal = new Counter({
+  name: "webhook_circuit_breaker_transition_total",
+  help: "Total number of webhook circuit breaker state transitions",
+  labelNames: ["webhook", "from", "to"],
+  registers: [register],
+});
+
+export const WebhookCircuitBreakerState = new Gauge({
+  name: "webhook_circuit_breaker_state",
+  help: "Current webhook circuit breaker state (0=open, 0.5=half_open, 1=closed)",
+  labelNames: ["state"],
+  registers: [register],
+});
+
 // Webhook Retry Metrics
 export const webhookRetryAttemptsTotal = new Counter({
   name: "webhook_retry_attempts_total",
@@ -436,6 +451,44 @@ export const webhookBackoffDelaySeconds = new Histogram({
   help: "Backoff delay applied between webhook retry attempts in seconds",
   labelNames: ["event_type", "attempt"],
   buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [register],
+});
+
+// Webhook Circuit Breaker Metrics (#573)
+//
+// Transitions are counted rather than merely observable as a gauge: what an
+// operator needs to know is not "the breaker is open" but "this destination
+// opens every few hours", which is the signature of a flaky endpoint that a
+// 24-hour cooldown will never fix.
+export const webhookCircuitBreakerTransitionsTotal = new Counter({
+  name: "webhook_circuit_breaker_transitions_total",
+  help: "Webhook circuit breaker state transitions",
+  labelNames: ["from", "to", "reason"],
+  registers: [register],
+});
+
+// Deliveries that were never attempted because the breaker was open. This is
+// the number that quantifies the savings, and it is also the number that should
+// alarm an operator: it is a count of transaction events a merchant did not
+// hear about, so it is a count of events they will have to reconcile by hand.
+export const webhookCircuitBreakerSkippedTotal = new Counter({
+  name: "webhook_circuit_breaker_skipped_total",
+  help: "Webhook deliveries suppressed because the destination circuit was open",
+  labelNames: ["event_type"],
+  registers: [register],
+});
+
+// Three series, one per state: 1 for the current state and 0 for the other two.
+// All three are written on every change — setting only the active one would leave
+// a stale 1 behind and a dashboard would show open and closed at once. A gauge
+// rather than a counter so a restart resets it and the value is always the present
+// truth instead of a running total. Not labelled by URL: per-destination detail
+// is in the admin circuit-breaker snapshot, which keeps this at a fixed three
+// series regardless of how many destinations the process has seen.
+export const webhookCircuitBreakerState = new Gauge({
+  name: "webhook_circuit_breaker_state",
+  help: "Current webhook circuit breaker state (1 for the active state)",
+  labelNames: ["state"],
   registers: [register],
 });
 
@@ -513,3 +566,34 @@ export const workerUtilizationRatio = new Gauge({
   registers: [register],
 });
 
+/**
+ * #479 – Notification system observability
+ * Exposes whether notifications are actually being delivered, per channel.
+ */
+export const notificationDeliveriesTotal = new Counter({
+  name: "notification_deliveries_total",
+  help: "Notification delivery attempts by channel and outcome",
+  labelNames: ["channel", "status"],
+  registers: [register],
+});
+
+export const notificationDeliveryDurationSeconds = new Histogram({
+  name: "notification_delivery_duration_seconds",
+  help: "Duration of a single notification channel delivery attempt",
+  labelNames: ["channel", "status"],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+  registers: [register],
+});
+
+export const notificationChannelHealthGauge = new Gauge({
+  name: "notification_channel_health",
+  help: "Notification channel health (1 healthy, 0.5 degraded, 0 down)",
+  labelNames: ["channel"],
+  registers: [register],
+});
+
+export const notificationSystemUp = new Gauge({
+  name: "notification_system_up",
+  help: "1 when every notification channel is healthy, 0 otherwise",
+  registers: [register],
+});

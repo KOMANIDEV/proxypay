@@ -11,6 +11,7 @@ import {
   type BalanceForecast,
 } from "../../../src/services/providerBalanceReserve";
 import { getBalanceReserveConfig } from "../../../src/config/balanceReserve";
+import { providerBalanceCache } from "../../../src/services/providerBalanceCache";
 import * as database from "../../../src/config/database";
 import * as loggers from "../../../src/services/loggers";
 
@@ -53,6 +54,9 @@ const makeQueryReadMock = (overrides: Record<string, unknown> = {}) => {
 describe("ProviderBalanceReserveService.runCheck()", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Balances are served through a process-wide cache (Issue #634); clear it so
+    // each test observes only its own mocked DB responses.
+    providerBalanceCache.invalidate();
   });
 
   it("returns a report with snapshots for every configured provider", async () => {

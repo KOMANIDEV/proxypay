@@ -5,6 +5,7 @@ import {
   CreateFeeConfigRequest,
   UpdateFeeConfigRequest,
 } from "../services/feeService";
+import { feeAuditService } from "../services/feeAuditService";
 import { layeredCache } from "../services/layeredCache";
 import { requirePermission } from "../middleware/rbac";
 import { authenticateToken } from "../middleware/auth";
@@ -660,6 +661,65 @@ router.get(
         {
           success: false,
           error: "Failed to fetch cache metrics",
+        },
+      );
+    }
+  },
+);
+
+/**
+ * GET /api/fees/audit
+ * Retrieve paginated fee calculation audit records (admin only).
+ * Query params: transactionId, userId, provider, strategyId, from, to, limit, offset
+ */
+router.get(
+  "/audit",
+  authenticateToken,
+  requirePermission("admin:system"),
+  logFeeAction("GET_FEE_AUDIT"),
+  async (req: Request, res: Response) => {
+    try {
+      const {
+        transactionId,
+        userId,
+        provider,
+        strategyId,
+        from,
+        to,
+        limit,
+        offset,
+      } = req.query as Record<string, string | undefined>;
+
+      const filters = {
+        transactionId: transactionId || undefined,
+        userId: userId || undefined,
+        provider: provider || undefined,
+        strategyId: strategyId || undefined,
+        from: from ? new Date(from) : undefined,
+        to: to ? new Date(to) : undefined,
+        limit: limit ? parseInt(limit, 10) : undefined,
+        offset: offset ? parseInt(offset, 10) : undefined,
+      };
+
+      const { records, total } = await feeAuditService.getAuditRecords(filters);
+
+      res.json({
+        success: true,
+        data: records,
+        pagination: {
+          total,
+          limit: filters.limit ?? 50,
+          offset: filters.offset ?? 0,
+        },
+      });
+    } catch (error: any) {
+      console.error("Fee audit fetch error:", error);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to fetch fee audit records",
+        {
+          success: false,
+          error: "Failed to fetch fee audit records",
         },
       );
     }

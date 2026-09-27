@@ -15,6 +15,7 @@
 
 import * as StellarSdk from "stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../config/stellar";
+import { queryRead, queryWrite } from "../config/database";
 import {
   evaluateAccountMergeCandidate,
   xlmToStroops,
@@ -89,6 +90,9 @@ export interface BatchDryRunResult {
   reports: AccountMergeDryRunReport[];
 }
 
+/** PostgreSQL unique-violation, raised by the one-pending-review-per-account index. */
+const PG_UNIQUE_VIOLATION = "23505";
+
 /** Merchant review record: wraps a dry-run report with approval state. */
 export interface MerchantReviewRecord {
   id: string;
@@ -102,10 +106,188 @@ export interface MerchantReviewRecord {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory merchant review store (replace with DB in production)
+// Persistent merchant review store (#570)
 // ---------------------------------------------------------------------------
 
-const reviewStore = new Map<string, MerchantReviewRecord>();
+/**
+ * Reviews live in `account_merge_reviews` (migration 20260830), not in a Map.
+ *
+ * Everything in this section is async as a consequence, including the four
+ * exported functions, which were synchronous before #570. That is a breaking
+ * change for callers and the existing test file has been updated to await them.
+ * It is not optional: a synchronous API over durable storage is not expressible,
+ * and pretending otherwise is what the Map was.
+ *
+ * Two behaviours the Map could not have provided, and which matter more than
+ * the persistence itself:
+ *
+ *  - One pending review per source account, enforced by a partial unique index.
+ *    The Map happily held fifty open reviews of the same account; a reviewer
+ *    could then approve one of them and nobody would know which was current.
+ *  - Reviews expire. A dry run is a snapshot of a moment, and an approval of a
+ *    report from three weeks ago is approving numbers that have since changed.
+ */
+
+/** How long a pending review stays valid before it needs re-running. */
+const REVIEW_TTL_DAYS = 7;
+
+function mapReviewRow(row: Record<string, any>): MerchantReviewRecord {
+  return {
+    id: row.id,
+    sourcePublicKey: row.source_public_key,
+    dryRunReport: row.dry_run_report,
+    reviewRequestedAt: row.review_requested_at,
+    reviewedAt: row.reviewed_at,
+    reviewedBy: row.reviewed_by,
+    approved: row.status === "approved" ? true : row.status === "rejected" ? false : null,
+    reviewNotes: row.review_notes ?? null,
+  };
+}
+
+export async function submitForMerchantReview(
+  report: AccountMergeDryRunReport,
+): Promise<MerchantReviewRecord> {
+  const record: Omit<MerchantReviewRecord, "id"> = {
+    // Not derived from the key and a timestamp any more. That scheme collided
+    // for two submissions of the same account inside the same millisecond and
+    // leaked the account key into an identifier that ends up in log lines and
+    // URLs.
+    sourcePublicKey: report.sourcePublicKey,
+    dryRunReport: report,
+    reviewRequestedAt: new Date(),
+    reviewedAt: null,
+    reviewedBy: null,
+    approved: null,
+    reviewNotes: null,
+  };
+
+  try {
+    const result = await queryWrite(
+      `INSERT INTO account_merge_reviews
+         (source_public_key, dry_run_report, status, review_requested_at, reclaimable_xlm)
+       VALUES ($1, $2, 'pending', $3, $4)
+       RETURNING *`,
+      [
+        record.sourcePublicKey,
+        JSON.stringify(record.dryRunReport),
+        record.reviewRequestedAt,
+        report.reclaimableXLM,
+      ],
+    );
+    return mapReviewRow(result.rows[0]);
+  } catch (error) {
+    if ((error as { code?: string })?.code === PG_UNIQUE_VIOLATION) {
+      throw new Error(
+        `A pending review already exists for account ${report.sourcePublicKey}`,
+      );
+    }
+    throw error;
+  }
+}
+
+export async function recordMerchantReviewDecision(
+  reviewId: string,
+  approved: boolean,
+  reviewedBy: string,
+  notes?: string,
+): Promise<MerchantReviewRecord> {
+  // The status guard is part of the WHERE clause, not a check in JavaScript.
+  // Two reviewers clicking approve at the same moment is not a hypothetical, and
+  // the second one must be told the review was already decided rather than
+  // overwriting the first decision and the first reviewer's name.
+  const result = await queryWrite(
+    `UPDATE account_merge_reviews
+        SET status        = $2,
+            reviewed_at   = NOW(),
+            reviewed_by   = $3,
+            review_notes  = $4,
+            updated_at    = NOW()
+      WHERE id = $1
+        AND status = 'pending'
+      RETURNING *`,
+    [reviewId, approved ? "approved" : "rejected", reviewedBy, notes ?? null],
+  );
+
+  if (result.rows.length === 0) {
+    // Distinguish "no such review" from "already decided": the first is a bad
+    // request, the second is a conflict, and they warrant different responses.
+    const existing = await queryRead(
+      "SELECT status, reviewed_by, reviewed_at FROM account_merge_reviews WHERE id = $1",
+      [reviewId],
+    );
+    if (existing.rows.length === 0) {
+      throw new Error(`Review record ${reviewId} not found`);
+    }
+    throw new Error(
+      `Review ${reviewId} was already ${existing.rows[0].status}` +
+        (existing.rows[0].reviewed_by ? ` by ${existing.rows[0].reviewed_by}` : ""),
+    );
+  }
+
+  return mapReviewRow(result.rows[0]);
+}
+
+export async function getMerchantReviewRecord(
+  reviewId: string,
+): Promise<MerchantReviewRecord | undefined> {
+  const result = await queryRead("SELECT * FROM account_merge_reviews WHERE id = $1", [reviewId]);
+  return result.rows.length > 0 ? mapReviewRow(result.rows[0]) : undefined;
+}
+
+export async function getPendingMerchantReviews(): Promise<MerchantReviewRecord[]> {
+  const result = await queryRead(
+    `SELECT * FROM account_merge_reviews
+      WHERE status = 'pending'
+      ORDER BY review_requested_at DESC`,
+  );
+  return result.rows.map(mapReviewRow);
+}
+
+/**
+ * Mark pending reviews older than the TTL as expired.
+ *
+ * Expiry is not a delete: the record of a review that went stale is part of the
+ * audit trail, and the `expired` status is what distinguishes "nobody looked at
+ * this" from "somebody looked and said no".
+ */
+export async function expireStaleMerchantReviews(
+  ttlDays: number = REVIEW_TTL_DAYS,
+): Promise<number> {
+  const result = await queryWrite(
+    `UPDATE account_merge_reviews
+        SET status = 'expired', updated_at = NOW()
+      WHERE status = 'pending'
+        AND review_requested_at < NOW() - ($1 || ' days')::interval
+      RETURNING id`,
+    [String(ttlDays)],
+  );
+  return result.rows.length;
+}
+
+/**
+ * Was the review created inside its TTL?
+ *
+ * Checked before recording a decision, because the UPDATE above guards on
+ * `status = 'pending'` but the row can still be pending *and* stale — nothing
+ * runs the expiry sweep continuously. Rejecting a stale decision here is what
+ * stops an approval of three-week-old numbers from going through simply because
+ * nobody has swept the table.
+ */
+export async function assertReviewIsFresh(reviewId: string): Promise<void> {
+  const result = await queryRead(
+    `SELECT review_requested_at FROM account_merge_reviews WHERE id = $1`,
+    [reviewId],
+  );
+  if (result.rows.length === 0) {
+    throw new Error(`Review record ${reviewId} not found`);
+  }
+  const ageMs = Date.now() - new Date(result.rows[0].review_requested_at).getTime();
+  if (ageMs > REVIEW_TTL_DAYS * 24 * 60 * 60 * 1000) {
+    throw new Error(
+      `Review ${reviewId} is older than ${REVIEW_TTL_DAYS} days and must be re-run`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -476,74 +658,4 @@ export async function runBatchDryRun(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Merchant review
-// ---------------------------------------------------------------------------
 
-/**
- * Submit a dry-run report for merchant review.
- * Returns the review record ID that merchants/admins can use to approve/reject.
- */
-export function submitForMerchantReview(
-  report: AccountMergeDryRunReport,
-): MerchantReviewRecord {
-  const id = `review-${report.sourcePublicKey}-${Date.now()}`;
-  const record: MerchantReviewRecord = {
-    id,
-    sourcePublicKey: report.sourcePublicKey,
-    dryRunReport: report,
-    reviewRequestedAt: new Date(),
-    reviewedAt: null,
-    reviewedBy: null,
-    approved: null,
-    reviewNotes: null,
-  };
-  reviewStore.set(id, record);
-  return record;
-}
-
-/**
- * Record a merchant/admin review decision.
- *
- * @param reviewId   The ID returned by `submitForMerchantReview`.
- * @param approved   Whether the merge was approved.
- * @param reviewedBy Identifier of the reviewer.
- * @param notes      Optional review notes.
- */
-export function recordMerchantReviewDecision(
-  reviewId: string,
-  approved: boolean,
-  reviewedBy: string,
-  notes?: string,
-): MerchantReviewRecord {
-  const record = reviewStore.get(reviewId);
-  if (!record) {
-    throw new Error(`Review record ${reviewId} not found`);
-  }
-  record.reviewedAt = new Date();
-  record.reviewedBy = reviewedBy;
-  record.approved = approved;
-  record.reviewNotes = notes ?? null;
-  return record;
-}
-
-/**
- * Retrieve a merchant review record by ID.
- */
-export function getMerchantReviewRecord(
-  reviewId: string,
-): MerchantReviewRecord | undefined {
-  return reviewStore.get(reviewId);
-}
-
-/**
- * Retrieve all pending (not yet reviewed) merchant review records.
- */
-export function getPendingMerchantReviews(): MerchantReviewRecord[] {
-  return Array.from(reviewStore.values()).filter((r) => r.approved === null);
-}
-
-/** Clear the review store (for testing only). */
-export function clearReviewStore(): void {
-  reviewStore.clear();
-}

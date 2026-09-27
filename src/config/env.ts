@@ -64,6 +64,31 @@ export const env = cleanEnv(process.env, {
     default: 30,
     desc: "Bloat percentage that triggers an alert",
   }),
+  DB_OPTIMIZATION_JOB_ENABLED: bool({
+    default: true,
+    desc: "Whether the automatic database optimization job should run",
+  }),
+  DB_OPTIMIZATION_CRON: str({
+    default: "30 3 * * *",
+    desc: "Cron schedule for the automatic database optimization job",
+    example: "30 3 * * *",
+  }),
+  DB_OPTIMIZATION_MIN_INDEX_SIZE_MB: num({
+    default: 1,
+    desc: "Minimum size in MB for an index to be measured for fragmentation",
+  }),
+  DB_OPTIMIZATION_REBUILD_THRESHOLD_PCT: num({
+    default: 40,
+    desc: "Fragmentation percentage at which an index is automatically reorganized",
+  }),
+  DB_OPTIMIZATION_REINDEX_COOLDOWN_HOURS: num({
+    default: 24,
+    desc: "Minimum hours before a reorganized index is eligible again",
+  }),
+  DB_OPTIMIZATION_PLAN_REGRESSION_RATIO: num({
+    default: 1.5,
+    desc: "Cost ratio over the cached plan that marks a query plan as regressed",
+  }),
   LEDGER_INTEGRITY_JOB_ENABLED: bool({
     default: true,
     desc: "Whether the ledger entry integrity validation job should run",
@@ -246,6 +271,12 @@ export const {
   INDEX_BLOAT_MONITOR_CRON,
   INDEX_BLOAT_MIN_SIZE_MB,
   INDEX_BLOAT_ALERT_THRESHOLD_PCT,
+  DB_OPTIMIZATION_JOB_ENABLED,
+  DB_OPTIMIZATION_CRON,
+  DB_OPTIMIZATION_MIN_INDEX_SIZE_MB,
+  DB_OPTIMIZATION_REBUILD_THRESHOLD_PCT,
+  DB_OPTIMIZATION_REINDEX_COOLDOWN_HOURS,
+  DB_OPTIMIZATION_PLAN_REGRESSION_RATIO,
   LEDGER_INTEGRITY_JOB_ENABLED,
   LEDGER_INTEGRITY_CRON,
   QUICKBOOKS_CLIENT_ID,
