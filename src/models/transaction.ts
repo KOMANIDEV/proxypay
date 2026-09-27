@@ -91,6 +91,19 @@ const MAX_TAGS = 10;
 const TAG_REGEX = /^[a-z0-9-]+$/;
 const MAX_METADATA_BYTES = 10240;
 
+/**
+ * States a transaction can no longer move out of. Reaching one of them releases
+ * the transaction's idempotency key so a recovered timeout cannot leave a stale
+ * key behind that blocks retries (issue #619).
+ */
+const TERMINAL_IDEMPOTENCY_STATUSES = new Set<TransactionStatus>([
+  TransactionStatus.Completed,
+  TransactionStatus.Failed,
+  TransactionStatus.Cancelled,
+  TransactionStatus.Reversed,
+  TransactionStatus.ClawedBack,
+]);
+
 function phoneSearchTokens(phoneNumber: string): string[] {
   const normalized = phoneNumber.replace(/^\+/, "");
   return Array.from({ length: normalized.length }, (_, index) =>
@@ -414,6 +427,18 @@ export class TransactionModel {
         console.warn(
           "[cache] Failed to invalidate general stats on transaction update",
           err,
+        );
+      });
+    }
+
+    // ── Release the idempotency key on terminal states ────────────────────
+    // A transaction that timed out and was later recovered must not keep its
+    // key around, otherwise the stale key blocks legitimate retries (#619).
+    if (TERMINAL_IDEMPOTENCY_STATUSES.has(status)) {
+      await this.releaseIdempotencyKey(id).catch((err) => {
+        console.warn(
+          `[idempotency] Failed to release key for transaction ${id}:`,
+          err instanceof Error ? err.message : err,
         );
       });
     }
@@ -889,6 +914,24 @@ export class TransactionModel {
     );
 
     return result?.rows?.[0]?.released || 0;
+  }
+
+  /**
+   * Release the idempotency key held by a transaction, e.g. once it reaches a
+   * terminal state. Returns `true` when a key was actually cleared.
+   */
+  async releaseIdempotencyKey(transactionId: string): Promise<boolean> {
+    const result = await queryWrite(
+      `UPDATE transactions
+       SET idempotency_key = NULL,
+           idempotency_expires_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+         AND idempotency_key IS NOT NULL`,
+      [transactionId],
+    );
+
+    return (result?.rowCount ?? 0) > 0;
   }
 
   async releaseExpiredIdempotencyKey(idempotencyKey: string): Promise<void> {
